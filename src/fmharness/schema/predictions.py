@@ -15,7 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field
 class Prediction(BaseModel):
     """One predicted drug response for one sample by one model on one split."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, protected_namespaces=())
 
     prediction_id: str = Field(min_length=1)
     model_version: str = Field(min_length=1)
