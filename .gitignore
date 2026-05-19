@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# fmharness project-specific
+data/tranches/        # cached tranche artifacts (large)
+reports/              # generated reports
+containers/*.sif      # built Apptainer images
+.fmharness/           # local user secrets/state
+
