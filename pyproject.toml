@@ -1,0 +1,72 @@
+[project]
+name = "fmharness"
+version = "0.1.0.dev0"
+description = "Foundation-model evaluation harness for patient-derived tumor organoid drug response"
+authors = [{ name = "Lucas Gillenwater", email = "lucas.gillenwater@cuanschutz.edu" }]
+license = { text = "BSD-2-Clause-Patent" }
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.7",
+    "pydantic-settings>=2.2",
+    "numpy>=1.26",
+    "pandas>=2.2",
+    "pyarrow>=15.0",
+    "anndata>=0.10",
+    "scanpy>=1.10",
+    "scikit-learn>=1.5",
+    "scipy>=1.13",
+    "joblib>=1.4",
+    "typer>=0.12",
+    "pydeseq2>=0.4",
+]
+
+[project.optional-dependencies]
+ml = [
+    "torch>=2.2",
+    "transformers>=4.40",
+]
+state = [
+    "arc-state>=0.1",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "hypothesis>=6.100",
+    "ruff>=0.4",
+    "pyright>=1.1.360",
+    "pre-commit>=3.7",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fmharness"]
+
+[tool.uv]
+package = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["E501"]
+
+[tool.pyright]
+pythonVersion = "3.11"
+typeCheckingMode = "strict"
+include = ["src", "tests"]
+strictListInference = true
+strictDictionaryInference = true
+strictSetInference = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -q"
