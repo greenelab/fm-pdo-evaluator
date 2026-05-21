@@ -223,3 +223,4 @@ reports/              # generated reports
 containers/*.sif      # built Apptainer images
 .fmharness/           # local user secrets/state
 
+docs/fm-pdo-evaluator-plan.md
