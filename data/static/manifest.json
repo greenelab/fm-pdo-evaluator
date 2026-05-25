@@ -1,0 +1,26 @@
+{
+  "dataset": "fmharness_static_assets",
+  "files": {
+    "drug_xref.parquet": {
+      "bytes": 28487,
+      "cols": 8,
+      "columns": [
+        "input_name",
+        "source",
+        "source_drug_id",
+        "pubchem_cid",
+        "inchikey",
+        "drugbank_id",
+        "resolution_method",
+        "notes"
+      ],
+      "rows": 655,
+      "sha256": "449c7dfccc2286c3c76b9bbfe80df49550ddbd7a0d9d12300e629afd9d29a732",
+      "source_uri": "built://scripts/build/build_drug_xref.py"
+    }
+  },
+  "release": {
+    "asset_set": "drug_xref_v1"
+  },
+  "updated_utc": "2026-05-25T18:14:46+00:00"
+}

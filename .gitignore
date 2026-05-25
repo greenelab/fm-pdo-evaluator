@@ -8,7 +8,7 @@ __pycache__/
 
 # Distribution / packaging
 .Python
-build/
+/build/
 develop-eggs/
 dist/
 downloads/
@@ -219,7 +219,9 @@ __marimo__/
 
 # fmharness project-specific
 # all dataset artifacts (raw, processed, tranches) — never tracked
-data/
+data/*
+# except curated static assets (drug xref, gene-panel maps, etc.) — tracked
+!data/static/
 # generated reports
 reports/
 # built Apptainer images
@@ -228,3 +230,4 @@ containers/*.sif
 .fmharness/
 
 docs/fm-pdo-evaluator-plan.md
+docs/datasets.md
