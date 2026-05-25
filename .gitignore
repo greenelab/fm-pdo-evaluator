@@ -218,9 +218,13 @@ __marimo__/
 .streamlit/secrets.toml
 
 # fmharness project-specific
-data/tranches/        # cached tranche artifacts (large)
-reports/              # generated reports
-containers/*.sif      # built Apptainer images
-.fmharness/           # local user secrets/state
+# all dataset artifacts (raw, processed, tranches) — never tracked
+data/
+# generated reports
+reports/
+# built Apptainer images
+containers/*.sif
+# local user secrets/state
+.fmharness/
 
 docs/fm-pdo-evaluator-plan.md

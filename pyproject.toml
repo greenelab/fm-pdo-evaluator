@@ -19,6 +19,7 @@ dependencies = [
     "joblib>=1.4",
     "typer>=0.12",
     "pydeseq2>=0.4",
+    "openpyxl>=3.1",
 ]
 
 [project.optional-dependencies]
@@ -26,8 +27,8 @@ ml = [
     "torch>=2.2",
     "transformers>=4.40",
 ]
-state = [
-    "arc-state>=0.1",
+stack = [
+    "arc-stack @ git+https://github.com/ArcInstitute/stack.git",
 ]
 dev = [
     "pytest>=8.0",
@@ -41,6 +42,9 @@ dev = [
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/fmharness"]
