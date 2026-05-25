@@ -8,19 +8,21 @@ Auth:   Personal access token in env SYNAPSE_AUTH_TOKEN, or
         `source ~/.fmharness/secrets` before running (chmod 600, gitignored).
 
 Modes:
-    --list             Walk the entity tree and print files (name, syn ID, bytes). No download.
-    --test [--limit N] Download the N smallest non-FASTQ files into data/raw/soragni/_test/.
-                       Default N=3. Used to confirm auth + write path before a full pull.
-    --tables           Fetch the Soragni metadata + drug-screen Synapse Tables (syn61894657,
-                       syn61892224) and write them as parquet under data/raw/soragni/tables/.
-    --verify-only      Re-check sha256 of recorded files in any of _test/, tables/, or root
-                       manifests; no download.
-    (default)          Full sync of syn55180195 into data/raw/soragni/ via syncFromSynapse.
+    --list             Walk the project entity tree and print every file (name, syn ID,
+                       bytes). No download.
+    --verify-only      Re-check sha256 of recorded files in data/raw/soragni/tables/manifest.json;
+                       no download.
+    (default)          Fetch the Soragni metadata + drug-screen + WES + normalized-counts Synapse
+                       Tables (7 entities, ~7 MB) into data/raw/soragni/tables/ as parquet.
 
-A manifest.json (name, sha256, bytes, source_uri) is written alongside downloads in --test,
---tables, and full modes. The manifest schema is shared with download_gdsc2_sarcoma.py via
-scripts/download/_utils.py. --tables and --test skip files whose recorded sha256 matches
-what's on disk; mismatches fail loudly.
+FASTQ-pull modes are intentionally not exposed -- the MVP uses the pre-computed normalized
+gene counts at syn64333318 instead of local quantification. See docs/fm-pdo-evaluator-plan.md
+section 11 (Deferrals). If the deposited counts ever prove unusable, FASTQ fallback per the
+risk register requires reintroducing a FASTQ-pull path here.
+
+The manifest schema is shared with download_gdsc2_sarcoma.py via scripts/download/_utils.py.
+The default mode skips files whose recorded sha256 matches what's on disk; mismatches fail
+loudly so silently changed upstream tables do not slip past unnoticed.
 """
 
 from __future__ import annotations
@@ -40,12 +42,9 @@ from _utils import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-OUTPUT_DIR = REPO_ROOT / "data" / "raw" / "soragni"
-TEST_DIR = OUTPUT_DIR / "_test"
-TABLES_DIR = OUTPUT_DIR / "tables"
+TABLES_DIR = REPO_ROOT / "data" / "raw" / "soragni" / "tables"
 
 SORAGNI_PROJECT_SYN_ID = "syn55180195"
-FASTQ_SUFFIXES = (".fastq", ".fastq.gz", ".fq", ".fq.gz", ".bam", ".cram")
 
 # Synapse Tables under syn55180195 (assay/metadata; separate entities from the FASTQ Files).
 # Discovered 2026-05-25 via syn.getChildren(syn55180195, includeTypes=["table"]).
@@ -64,10 +63,10 @@ def syn_uri(syn_id: str) -> str:
     return f"synapse://{syn_id}"
 
 
-def default_manifest(mode: str) -> dict:
+def default_manifest() -> dict:
     return {
         "dataset": "soragni_pdo_sarcoma_2024",
-        "release": {"project": SORAGNI_PROJECT_SYN_ID, "mode": mode},
+        "release": {"project": SORAGNI_PROJECT_SYN_ID, "mode": "tables"},
         "files": {},
     }
 
@@ -90,103 +89,31 @@ def login():
     return syn
 
 
-def walk_files(syn, parent_id: str):
-    """Yield (path_parts, file_name, syn_id) for every File under parent_id.
-
-    path_parts is a tuple of folder names from the project root down to the file's parent.
-    """
+def cmd_list(syn) -> None:
     import synapseutils
 
+    total = 0
+    total_bytes = 0
     for dirpath, _dirnames, filenames in synapseutils.walk(
-        syn, parent_id, includeTypes=["folder", "file"]
+        syn, SORAGNI_PROJECT_SYN_ID, includeTypes=["folder", "file"]
     ):
         folder_name, _folder_id = dirpath
         path_parts = tuple(p for p in folder_name.split("/") if p)
-        for fname, fid in filenames:
-            yield path_parts, fname, fid
-
-
-def cmd_list(syn) -> None:
-    total = 0
-    total_bytes = 0
-    for path_parts, fname, fid in walk_files(syn, SORAGNI_PROJECT_SYN_ID):
-        entity = syn.get(fid, downloadFile=False)
-        fh = getattr(entity, "_file_handle", None) or {}
-        size = int(fh.get("contentSize") or 0)
         rel = "/".join(path_parts) if path_parts else "."
-        print(f"{fid}\t{size or '?':>12}\t{rel}/{fname}")
-        total += 1
-        total_bytes += int(size or 0)
+        for fname, fid in filenames:
+            entity = syn.get(fid, downloadFile=False)
+            fh = getattr(entity, "_file_handle", None) or {}
+            size = int(fh.get("contentSize") or 0)
+            print(f"{fid}\t{size or '?':>12}\t{rel}/{fname}")
+            total += 1
+            total_bytes += size
     print(f"\n[summary] {total} files, ~{total_bytes / 1e9:.2f} GB")
-
-
-def collect_file_index(syn) -> list[dict]:
-    """Return a list of {syn_id, name, path_parts, content_size, is_fastq} for every file."""
-    index: list[dict] = []
-    for path_parts, fname, fid in walk_files(syn, SORAGNI_PROJECT_SYN_ID):
-        entity = syn.get(fid, downloadFile=False)
-        fh = getattr(entity, "_file_handle", None) or {}
-        size = int(fh.get("contentSize") or 0)
-        is_fastq = fname.lower().endswith(FASTQ_SUFFIXES)
-        index.append(
-            {
-                "syn_id": fid,
-                "name": fname,
-                "path_parts": list(path_parts),
-                "content_size": size,
-                "is_fastq": is_fastq,
-            }
-        )
-    return index
-
-
-def cmd_test(syn, limit: int) -> None:
-    TEST_DIR.mkdir(parents=True, exist_ok=True)
-    manifest_path = TEST_DIR / MANIFEST_NAME
-    manifest = load_manifest(manifest_path, default_manifest("test"))
-
-    print(f"[scan] indexing {SORAGNI_PROJECT_SYN_ID} ...")
-    index = collect_file_index(syn)
-    # Prefer non-FASTQ files for the smoke test (typically small metadata).
-    # Fall back to FASTQ if that's all there is (Soragni syn55180195 is FASTQ-only).
-    non_fastq = [f for f in index if not f["is_fastq"] and f["content_size"] > 0]
-    pool = non_fastq if non_fastq else [f for f in index if f["content_size"] > 0]
-    pool.sort(key=lambda r: r["content_size"])
-    picks = pool[:limit]
-    if not picks:
-        sys.exit("[fail] no candidate files found under the project")
-
-    file_kind = "non-FASTQ" if non_fastq else "FASTQ (no non-FASTQ files in project)"
-    print(f"[pick] {len(picks)} smallest {file_kind} file(s):")
-    for r in picks:
-        rel = "/".join(r["path_parts"])
-        print(f"       {r['syn_id']}  {r['content_size']:>10} B  {rel}/{r['name']}")
-
-    for r in picks:
-        dest = TEST_DIR / r["name"]
-        if skip_or_fail_on_hash(r["name"], dest, manifest["files"]):
-            print(f"[skip] {r['name']} present with matching sha256")
-            continue
-        print(f"[get ] {r['syn_id']} -> {dest.relative_to(REPO_ROOT)}")
-        entity = syn.get(r["syn_id"], downloadLocation=str(TEST_DIR), ifcollision="overwrite.local")
-        local_path = Path(entity.path) if getattr(entity, "path", None) else dest
-        digest = sha256_file(local_path)
-        manifest["files"][r["name"]] = {
-            "sha256": digest,
-            "bytes": local_path.stat().st_size,
-            "source_uri": syn_uri(r["syn_id"]),
-            "path_parts": r["path_parts"],
-        }
-        print(f"       sha256 {digest}  ({local_path.stat().st_size} B)")
-
-    write_manifest(manifest_path, manifest)
-    print(f"[done] manifest written to {manifest_path.relative_to(REPO_ROOT)}")
 
 
 def cmd_tables(syn) -> None:
     TABLES_DIR.mkdir(parents=True, exist_ok=True)
     manifest_path = TABLES_DIR / MANIFEST_NAME
-    manifest = load_manifest(manifest_path, default_manifest("tables"))
+    manifest = load_manifest(manifest_path, default_manifest())
 
     for name, syn_id in SORAGNI_TABLES:
         rel = f"{name}.parquet"
@@ -215,33 +142,8 @@ def cmd_tables(syn) -> None:
     print(f"[done] manifest written to {manifest_path.relative_to(REPO_ROOT)}")
 
 
-def cmd_full(syn) -> None:
-    import synapseutils
-
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    manifest_path = OUTPUT_DIR / MANIFEST_NAME
-    manifest = load_manifest(manifest_path, default_manifest("full"))
-
-    print(f"[sync] {SORAGNI_PROJECT_SYN_ID} -> {OUTPUT_DIR.relative_to(REPO_ROOT)}")
-    entities = synapseutils.syncFromSynapse(syn, SORAGNI_PROJECT_SYN_ID, path=str(OUTPUT_DIR))
-    # syncFromSynapse handles its own incremental sync; we rebuild the manifest fresh.
-    manifest["files"] = {}
-    for e in entities:
-        local_path = Path(e.path)
-        rel = local_path.relative_to(OUTPUT_DIR).as_posix()
-        manifest["files"][rel] = {
-            "sha256": sha256_file(local_path),
-            "bytes": local_path.stat().st_size,
-            "source_uri": syn_uri(e.id),
-        }
-    write_manifest(manifest_path, manifest)
-    print(f"[done] {len(entities)} files; manifest at {manifest_path.relative_to(REPO_ROOT)}")
-
-
 def cmd_verify_only() -> None:
-    errors = 0
-    for parent in (TEST_DIR, TABLES_DIR, OUTPUT_DIR):
-        errors += verify_manifest(parent, parent / MANIFEST_NAME)
+    errors = verify_manifest(TABLES_DIR, TABLES_DIR / MANIFEST_NAME)
     sys.exit(1 if errors else 0)
 
 
@@ -250,20 +152,13 @@ def main() -> None:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     g = parser.add_mutually_exclusive_group()
-    g.add_argument("--list", action="store_true", help="walk and print files; no download")
     g.add_argument(
-        "--test", action="store_true", help="download N smallest non-FASTQ files for a smoke test"
-    )
-    g.add_argument(
-        "--tables", action="store_true", help="fetch metadata + drug-screen Synapse Tables"
+        "--list", action="store_true", help="walk and print all project files; no download"
     )
     g.add_argument(
         "--verify-only",
         action="store_true",
-        help="re-check sha256 of recorded files in _test/, tables/, and full manifests",
-    )
-    parser.add_argument(
-        "--limit", type=int, default=3, help="files to pull in --test mode (default 3)"
+        help="re-check sha256 of recorded files in tables/manifest.json",
     )
     args = parser.parse_args()
 
@@ -274,12 +169,8 @@ def main() -> None:
     syn = login()
     if args.list:
         cmd_list(syn)
-    elif args.test:
-        cmd_test(syn, limit=args.limit)
-    elif args.tables:
-        cmd_tables(syn)
     else:
-        cmd_full(syn)
+        cmd_tables(syn)
 
 
 if __name__ == "__main__":
