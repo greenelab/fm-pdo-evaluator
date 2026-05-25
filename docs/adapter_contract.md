@@ -1,8 +1,8 @@
 # Adapter contract
 
-How a model joins the harness. Every model — linear baseline, Tahoe-x1, STATE, and any future addition — implements the same `ModelAdapter` Protocol so the rest of the pipeline (splits, probe, metrics, registry, leakage scan) is model-agnostic.
+How a model joins the harness. Every model — linear baseline, Tahoe-x1, STACK, and any future addition — implements the same `ModelAdapter` Protocol so the rest of the pipeline (splits, probe, metrics, registry, leakage scan) is model-agnostic.
 
-The contract has three required surfaces (`embed`, `metadata`, `version`) and one optional surface (`predict_native`). Day 7 implements the Protocol and the `linear_baseline` and `MockAdapter` reference implementations; later days add `tahoe_x1` (Day 8) and `state` (Day 11) against the same contract.
+The contract has three required surfaces (`embed`, `metadata`, `version`) and one optional surface (`predict_native`). Day 7 implements the Protocol and the `linear_baseline` and `MockAdapter` reference implementations; later days add `tahoe_x1` (Day 8) and `stack` (Day 11) against the same contract.
 
 ## 1. The interface
 
@@ -50,7 +50,7 @@ class ModelAdapter(Protocol):
 
 ## 2. The probe-based prediction pipeline (default path)
 
-All four matrix rows (linear baseline, Tahoe-x1, STATE, plus the metadata-only control) share an identical probe so the comparison isolates "what the encoder captures":
+All four matrix rows (linear baseline, Tahoe-x1, STACK, plus the metadata-only control) share an identical probe so the comparison isolates "what the encoder captures":
 
 ```
   sample (RNA-seq)  --[ encoder ]-->  embedding  --[ concat drug feat ]-->  [ probe ]  --> P(responder)
@@ -59,7 +59,7 @@ All four matrix rows (linear baseline, Tahoe-x1, STATE, plus the metadata-only c
                                                                        trained per split-fold
 ```
 
-- **Encoder** is model-specific. For the linear baseline the encoder is `StandardScaler` (a passthrough; "embedding" == scaled expression). For Tahoe-x1 / STATE it is the pretrained transformer encoder.
+- **Encoder** is model-specific. For the linear baseline the encoder is `StandardScaler` (a passthrough; "embedding" == scaled expression). For Tahoe-x1 / STACK it is the pretrained transformer encoder.
 - **Drug feature** is a one-hot over the drug crosswalk's canonical IDs at MVP; richer drug descriptors (Morgan fingerprint, ATC class) are a deferred extension.
 - **Probe** is a fixed architecture across all models: `StandardScaler → ElasticNetCV` (continuous response) or `LogisticRegressionCV` (binary responder). Declared once in `src/fmharness/probe/linear.py`. The harness — not the adapter — owns the probe.
 
@@ -70,7 +70,7 @@ The adapter's only job is to produce a faithful embedding. Probe training and in
 Foundation models with a drug-aware head can return a prediction directly:
 
 - Tahoe-x1: trained on perturbation-response prediction; may expose a `predict(baseline_state, drug) → post_state` or scalar head.
-- STATE: the ST (state transition) component is exactly this.
+- STACK: `predict_in_context()` consumes a prompt set of cells defining a biological condition and predicts the effect on a target population — no per-task fine-tuning. This is STACK's native zero-shot path.
 
 When `predict_native` returns a value, the harness records it as a separate row in the registry tagged `prediction_mode="native"`. The probe-based row (`prediction_mode="probe"`) is always produced for fair comparison; the native row is supplementary.
 

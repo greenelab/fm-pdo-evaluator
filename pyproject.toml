@@ -27,8 +27,8 @@ ml = [
     "torch>=2.2",
     "transformers>=4.40",
 ]
-state = [
-    "arc-state>=0.1",
+stack = [
+    "stack @ git+https://github.com/ArcInstitute/stack.git",
 ]
 dev = [
     "pytest>=8.0",

@@ -15,9 +15,9 @@ Foundation-model inference runs inside Apptainer images pinned by digest in
 |---|---|---|---|
 | `fmharness` | `containers/fmharness.def` | Day 1+2 (skeleton); rebuilt Day 8 | core Python deps |
 | `tahoe` | `containers/tahoe.def` | Day 8 | Tahoe-x1 + torch + CUDA |
-| `state` | `containers/state.def` (built only if needed) | Day 11 | STATE + torch + CUDA |
+| `stack` | `containers/stack.def` (built only if needed) | Day 11 | STACK + torch + CUDA |
 
-STATE reuses the Tahoe container unless torch/CUDA conflicts force a split;
+STACK reuses the Tahoe container unless torch/CUDA conflicts force a split;
 the decision (and the reason) is recorded on Day 11 in this document.
 
 Every `PredictionRecord` carries `EnvironmentSnapshot.container_digest`. A
