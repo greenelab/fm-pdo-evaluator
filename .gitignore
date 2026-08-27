@@ -225,3 +225,6 @@ reports/              # generated reports
 containers/*.sif      # built Apptainer images
 .fmharness/           # local user secrets/state
 
+# Local agent configuration and worktrees. Never publishable: settings.json holds
+# machine-specific permission rules, and worktrees/ contains entire other branches.
+.claude/
