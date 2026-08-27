@@ -2,7 +2,7 @@
 
 How a model joins the harness. Every model — linear baseline, Tahoe-x1, STATE, and any future addition — implements the same `ModelAdapter` Protocol so the rest of the pipeline (splits, probe, metrics, registry, leakage scan) is model-agnostic.
 
-The contract has three required surfaces (`embed`, `metadata`, `version`) and one optional surface (`predict_native`). Day 7 implements the Protocol and the `linear_baseline` and `MockAdapter` reference implementations; later days add `tahoe_x1` (Day 8) and `state` (Day 11) against the same contract.
+The contract has three required surfaces (`embed`, `metadata`, `version`) and one optional surface (`predict_native`). Each model arrives as its own task — the Protocol and its `linear_baseline` and `MockAdapter` reference implementations first, then `tahoe_x1` and `state` against the same contract.
 
 ## 1. The interface
 
@@ -80,11 +80,11 @@ Adapters that do not expose a native head return `None` and only the probe path 
 
 Every adapter must:
 
-1. **Be deterministic.** Calling `embed` twice on the same input must produce identical output bits-for-bits when `fmharness.utils.determinism.fix_seeds(seed)` has been called. The determinism check on Day 14 will fail loud otherwise.
+1. **Be deterministic.** Calling `embed` twice on the same input must produce identical output bits-for-bits when `fmharness.utils.determinism.fix_seeds(seed)` has been called. The determinism check fails loud otherwise.
 2. **Not reorder rows.** `adata.obs_names[i]` must correspond to `embedding[i]`.
 3. **Declare its container.** GPU adapters run inside the Apptainer image whose digest is returned by `metadata().container_digest`. The harness refuses to record a `PredictionRecord` whose `EnvironmentSnapshot.container_digest` does not match.
 4. **Cache by content.** Embedding caches under `data/tranches/{tranche_id}/embeddings/{model_version}/` are keyed by sha256 of the input AnnData bytes plus `model_version`. Adapters should call into `fmharness.utils.cache` rather than rolling their own.
-5. **Gracefully refuse mismatched inputs.** If the input gene panel does not match the adapter's expected reference, raise `GenePanelMismatch` rather than silently aligning — gene-panel reconciliation is the loader's responsibility (Day 4), not the adapter's.
+5. **Gracefully refuse mismatched inputs.** If the input gene panel does not match the adapter's expected reference, raise `GenePanelMismatch` rather than silently aligning — gene-panel reconciliation is the loader's responsibility, not the adapter's.
 
 ## 5. Adding a new model
 

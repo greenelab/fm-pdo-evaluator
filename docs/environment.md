@@ -8,17 +8,13 @@ drift and the leakage scan can't be tied to a specific code/data state.
 
 ## 1. Containers
 
-Foundation-model inference runs inside Apptainer images pinned by digest in
-`containers/digests.json`:
-
-| Image | Definition | Built on | Wraps |
-|---|---|---|---|
-| `fmharness` | `containers/fmharness.def` | Day 1+2 (skeleton); rebuilt Day 8 | core Python deps |
-| `tahoe` | `containers/tahoe.def` | Day 8 | Tahoe-x1 + torch + CUDA |
-| `state` | `containers/state.def` (built only if needed) | Day 11 | STATE + torch + CUDA |
-
-STATE reuses the Tahoe container unless torch/CUDA conflicts force a split;
-the decision (and the reason) is recorded on Day 11 in this document.
+Foundation-model inference runs inside Apptainer images pinned by digest.
+`containers/fmharness.def` builds the core Python environment and is the only
+image in the repository today; an image per model family — one wrapping
+torch and CUDA for the foundation models — arrives with the task that first
+needs it, along with the `containers/digests.json` that pins them. Whether
+two model families share one image is a decision recorded here when it is
+made, with its reason.
 
 Every `PredictionRecord` carries `EnvironmentSnapshot.container_digest`. A
 prediction made outside a pinned container fails determinism check #6.
@@ -51,13 +47,16 @@ Two secrets the harness needs are kept out of the repo:
 Layout:
 
 - Local dev: copy `.env.example` to `.env`, fill in values. `.env` is
-  gitignored. Loaded by `pydantic-settings` from the repo root.
+  gitignored. **Intended** to be loaded by `pydantic-settings` from the repo
+  root; no loader exists yet, so the dependency is not declared and callers
+  read the environment directly. The loader and the dependency arrive
+  together with the first task that needs a token.
 - Alpine: `~/.fmharness/secrets` with `chmod 600`. Slurm sbatch headers
   source it explicitly: `source ~/.fmharness/secrets`.
 
 `.env` and any path containing `secrets` are caught by the pre-commit
 `detect-private-key` hook and a project-specific token-pattern check
-(added Day 13 when secrets handling is fully exercised).
+(added when secrets handling is first exercised).
 
 ## 4. Static asset versioning
 

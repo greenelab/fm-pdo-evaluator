@@ -1,9 +1,42 @@
-# fm-pdo-evaluator
+# fm-pm-evaluator
 
-Foundation-model evaluation harness for patient-derived tumor organoid (PDTO) drug-response prediction. Realizing the benefits of foundation models requires careful evaluations that map the boundaries of generalization.
+Foundation models trained on cell-line transcriptomic data claim generalization to
+out-of-distribution tasks. This repository builds the infrastructure to find the boundary of
+those claims: whether a model's prediction survives the move to an unseen cell line, across
+platforms, into a new modality, and onto patient-derived tumour organoids.
 
-The harness produces a registry-backed report comparing models against three out-of-distribution split strategies on PDTO datasets, with negative/positive controls, bootstrap confidence intervals, and a pretraining-leakage exposure profile per result.
+The evaluation is a **ladder**. Each rung adds exactly one boundary to the rung below it, so a
+score that falls off says *which* boundary it fell on rather than that something, somewhere, went
+wrong.
 
+| Rung | Question it settles |
+|---|---|
+| 0 | Is the target reproducible? |
+| 1 | Can a model predict an unseen cell line, in-distribution? |
+| 2 | Can a bulk sample be read by a single-cell model? |
+| 3 | What does crossing a measurement platform cost? |
+| 4 | Does the representation predict drug response, not just expression? |
+| 5 | Does it transfer to patient-derived organoids? |
+| 6 | Does it hold when the prediction comes first? |
+
+Rungs are built one at a time, and a rung's spec arrives with its implementation, so the design
+of a measurement and the code producing it are reviewed together.
+
+## The documents
+
+Three documents carry the project, and they answer different questions. Read them in this order.
+
+- **[docs/SPEC.md](docs/SPEC.md)** — what the project asks and what every result must obey: the
+  question, the ladder rung by rung, and the project rules.
+- **[docs/PROCESS.md](docs/PROCESS.md)** — how work moves from a question to a promoted result:
+  the lifecycle, the task folders, the compute boundary, what "done" requires.
+- **[docs/STATE.md](docs/STATE.md)** — where each rung stands right now, and what stands in the
+  way.
+
+This README summarises those three. When a task changes what the project asks, how work is done,
+or where a rung stands, it updates the README in the same change — see `PROCESS.md` §5.
+
+## Status
 
 ## Quickstart
 
@@ -11,18 +44,17 @@ The harness produces a registry-backed report comparing models against three out
 # Install uv (Python package manager) if you don't already have it
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Sync dependencies (creates .venv and uv.lock)
+# Sync dependencies (creates .venv)
 uv sync --extra dev
 
-# Run the tests
+# Run the tests, including the project-rule checks
 uv run pytest
 ```
 
-## Test Dataset
+Dependencies are declared as the code that imports them arrives, so the manifest describes what
+the project runs on rather than what it might run on later.
 
-- **Soragni 2024** sarcoma PDTOs ([Synapse PDTOSarcoma](https://www.synapse.org/PDTOSarcoma))
-
-
+## Datasets
 
 ## License
 
