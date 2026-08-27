@@ -1,4 +1,4 @@
-# fm-pdo-evaluator
+# fm-pm-evaluator
 
 Foundation models trained on cell-line transcriptomic data claim generalization to
 out-of-distribution tasks. This repository builds the infrastructure to find the boundary of

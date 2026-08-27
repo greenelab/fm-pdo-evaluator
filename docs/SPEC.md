@@ -1,4 +1,4 @@
-# fm-pdo-evaluator — project spec
+# fm-pm-evaluator — project spec
 
 **As of** 2026-08-27.
 
