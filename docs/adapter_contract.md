@@ -2,7 +2,7 @@
 
 How a model joins the harness. Every model — linear baseline, Tahoe-x1, STATE, and any future addition — implements the same `ModelAdapter` Protocol so the rest of the pipeline (splits, probe, metrics, registry, leakage scan) is model-agnostic.
 
-The contract has three required surfaces (`embed`, `metadata`, `version`) and one optional surface (`predict_native`). Each model arrives as its own task — the Protocol and its `linear_baseline` and `MockAdapter` reference implementations first, then `tahoe_x1` and `state` against the same contract.
+The contract has four required surfaces — `version`, `metadata`, `embed` and `predict_native`. Every adapter implements all four to satisfy the Protocol; what is optional is the *capability*, and an adapter without a native drug-aware head returns `None` from `predict_native`. Each model arrives as its own task — the Protocol and its `linear_baseline` and `MockAdapter` reference implementations first, then `tahoe_x1` and `state` against the same contract.
 
 ## 1. The interface
 

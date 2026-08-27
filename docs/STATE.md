@@ -7,7 +7,7 @@ It carries no history: a rung's result belongs here, how it came to be belongs i
 **As of** 2026-08-27.
 
 A number not carried here with its provenance record is not evidence.
-Promotion means a result in `results/<task-slug>/` with a `.provenance.json` beside it recording the commit, job and inputs that produced it — project rule 1.
+Promotion means a result in `results/<task-slug>/` with a `<result>.provenance.json` beside it recording the commit, job and inputs that produced it — project rule 1.
 No `results/` directory exists yet, so nothing in this repository is evidence of anything.
 
 ---
@@ -37,7 +37,7 @@ A rung closes when its result is promoted with provenance, this table records it
 
 ## Where things live
 
-- **Results** `results/<task-slug>/*.csv` with a matching `.provenance.json`. No provenance record, no evidence.
+- **Results** `results/<task-slug>/<result>.csv` with `<result>.provenance.json` beside it. No provenance record, no evidence.
 - **Figures** produced by a run, pointed at from that task's `verification.md`; a figure the project cites is promoted alongside its table.
 - **Rung and task specs** `docs/tasks/<slug>/design.md`, one folder per task, arriving with the work it specifies.
 - **Decisions** dated and appended to the bottom of the task's own `design.md` and `plan.md`, so a reversal travels with the document it reverses.

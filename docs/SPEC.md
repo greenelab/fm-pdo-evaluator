@@ -73,7 +73,7 @@ The project rules below bind to steps, which is why they hold for every rung wit
 
 **Question** How much predictive signal survives when the mapping is fitted on one transcriptomic platform and tested on another?
 **Adds** One boundary on top of rung 2: the platform (fit on L1000, test on Tahoe), with the resolution cost already priced below.
-**Measure** The retained fraction of rung 1's in-platform score, per method, against a scrambled-line control.
+**Measure** The retained fraction of rung 2's score, per method, against a scrambled-line control. Measuring against rung 1 instead would fold the resolution cost into the platform number, which is the confusion rung 2 exists to remove.
 **Passing means** Retention clearly separable from the scrambled control — the platform shift costs something quantifiable rather than everything.
 **How it contextualises the rest** The organoid comparison contains a platform change bundled with the substrate change. This rung prices the platform part on its own, so rung 5's shortfall is not silently attributed to biology.
 
@@ -89,9 +89,9 @@ The project rules below bind to steps, which is why they hold for every rung wit
 ### Rung 5 — does it transfer to patient-derived organoids?
 
 **Question** Does a model trained on cell-line drug response predict drug response in patient-derived tumour organoids?
-**Adds** The final shifts: substrate, patients, and assay.
+**Adds** Three boundaries at once — substrate, patients, and assay — and this is the one rung that cannot hold to one. No available data separates them: an organoid is patient-derived by definition, and it is screened on a different assay than a cell-line panel. The ladder's discipline breaks here, deliberately and visibly, rather than by an unstated bundling.
 **Measure** The same interaction statistic as rung 4, fitted on cell lines and evaluated on the frozen organoid screen, reported as a fraction of both rung 4 and rung 0.
-**Passing means** Either transfer holds at a measurable fraction, or it does not and the ladder below localises the loss to the substrate rather than leaving it unexplained.
+**Passing means** Either transfer holds at a measurable fraction, or it does not — and because the rungs below have priced resolution, platform and readout, what remains here is the substrate, the patients and the assay together, not an unexplained shortfall. Attributing it further needs data that does not exist: cell lines screened on the organoid assay would separate assay from substrate.
 **Constraint** A frozen holdout under embargo, and rung 2's bridge is calibrated on cell lines but assumed here. The rung's spec states that assumption, what survives it, and the residual-structure alarm that can break it.
 
 ---

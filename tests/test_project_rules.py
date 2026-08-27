@@ -178,7 +178,12 @@ def test_rule_02_edge_non_additive_task_edits_carry_a_dated_entry() -> None:
         if not removed:
             continue  # purely additive: nothing was reversed
         before = _git("show", f"{base}:{doc}") or ""
-        after = (REPO / doc).read_text() if (REPO / doc).exists() else ""
+        # the diff above compares commits, so the "after" side must come from HEAD too — reading
+        # the working tree would let an uncommitted entry satisfy a check on committed work,
+        # and would report a false offender for a file deleted only in the working tree
+        after = _git("show", f"HEAD:{doc}")
+        if after is None:
+            continue  # removed at HEAD; there is no document left to carry an entry
         new_dates = set(DATED_ENTRY.findall(after)) - set(DATED_ENTRY.findall(before))
         if not new_dates:
             offenders.append(doc)
@@ -210,7 +215,8 @@ def test_rule_03_readme_links_to_the_project_documents() -> None:
     broken = [
         target
         for target in re.findall(r"\]\(([^)]+)\)", readme)
-        if not target.startswith(("http", "#", "mailto")) and not (REPO / target).exists()
+        if not target.startswith(("http", "#", "mailto"))
+        and not (REPO / target.split("#")[0].split("?")[0]).exists()
     ]
     assert not broken, f"README links that do not resolve: {broken}"
 

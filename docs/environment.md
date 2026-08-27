@@ -46,17 +46,21 @@ Two secrets the harness needs are kept out of the repo:
 
 Layout:
 
-- Local dev: copy `.env.example` to `.env`, fill in values. `.env` is
-  gitignored. **Intended** to be loaded by `pydantic-settings` from the repo
-  root; no loader exists yet, so the dependency is not declared and callers
-  read the environment directly. The loader and the dependency arrive
-  together with the first task that needs a token.
+- Local dev: copy `.env.example` to `.env` and fill in values; `.env` is
+  gitignored. No loader exists yet, so copying the file does not populate the
+  process environment — export the values, or `set -a; source .env; set +a`,
+  before running anything that needs them. Loading `.env` automatically via
+  `pydantic-settings` is the intent; the loader and its dependency arrive with
+  the first task that needs a token.
 - Alpine: `~/.fmharness/secrets` with `chmod 600`. Slurm sbatch headers
   source it explicitly: `source ~/.fmharness/secrets`.
 
-`.env` and any path containing `secrets` are caught by the pre-commit
-`detect-private-key` hook and a project-specific token-pattern check
-(added when secrets handling is first exercised).
+What actually protects these today is `.gitignore`: `.env` is ignored, so it is
+not staged by accident. The pre-commit `detect-private-key` hook scans file
+*contents* for private-key markers — it does not recognise `.env` or a path
+containing `secrets` by name, and it does not match API tokens. A
+token-pattern hook is not configured; it arrives with the first task that
+handles a token.
 
 ## 4. Static asset versioning
 

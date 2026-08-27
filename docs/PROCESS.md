@@ -34,7 +34,7 @@ Dates live in git and in each document's own header line.
 | Execute | code changes | `superpowers:executing-plans` or `superpowers:subagent-driven-development`, with `superpowers:test-driven-development` and `superpowers:systematic-debugging` as needed |
 | Review | `docs/tasks/<task-slug>/review.md` — each finding and what was done about it | `superpowers:requesting-code-review` / `receiving-code-review` |
 | Verify | `docs/tasks/<task-slug>/verification.md` — the commands run, their output, and pointers to everything the run produced: tables, figures, logs | `superpowers:verification-before-completion` — evidence before "done," always |
-| Promote | `results/<task-slug>/*.csv` + a `results/<task-slug>/.provenance.json` provenance record — only the subset the project will cite, copied out of the task folder and made citable. The record carries the result's own checksum, and promotion refuses when the two copies differ | `scripts/promote_result.py` |
+| Promote | `results/<task-slug>/<result>.csv` + a `<result>.provenance.json` record beside it — only the subset the project will cite, copied out of the task folder and made citable. The record carries the result's own checksum, and promotion refuses when the two copies differ | `scripts/promote_result.py` |
 | Close out | branch merge/PR | `superpowers:finishing-a-development-branch` |
 
 Three rules keep the task folder from becoming an orphan:

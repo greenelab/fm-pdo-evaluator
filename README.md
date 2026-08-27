@@ -1,4 +1,4 @@
-# fm-pm-evaluator
+# fm-pdo-evaluator
 
 Foundation models trained on cell-line transcriptomic data claim generalization to
 out-of-distribution tasks. This repository builds the infrastructure to find the boundary of
@@ -38,6 +38,9 @@ or where a rung stands, it updates the README in the same change — see `PROCES
 
 ## Status
 
+No rung has landed yet; rung 0 is next. `results/` does not exist, so nothing here is evidence
+of anything. [`docs/STATE.md`](docs/STATE.md) is authoritative.
+
 ## Quickstart
 
 ```bash
@@ -55,6 +58,9 @@ Dependencies are declared as the code that imports them arrives, so the manifest
 the project runs on rather than what it might run on later.
 
 ## Datasets
+
+- **Soragni 2024** sarcoma PDTOs ([Synapse PDTOSarcoma](https://www.synapse.org/PDTOSarcoma)) —
+  the organoid cohort rung 5 evaluates against, held as a frozen embargoed holdout.
 
 ## License
 
