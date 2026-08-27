@@ -1,0 +1,44 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: en-US
+early_access: false
+
+reviews:
+  profile: chill
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+  auto_review:
+    enabled: true
+    base_branches:
+      - main
+  path_filters:
+    - "!archive/**"
+    - "!docs/figures/**"
+    - "!**/*.h5ad"
+    - "!**/*.csv"
+    - "!**/*.zip"
+    - "!**/*.pptx"
+  path_instructions:
+    - path: "src/fmharness/**"
+      instructions: >
+        This is the core evaluation-harness library: data loaders, model
+        adapters, splitters, evaluation metrics. Apply strict scrutiny to
+        correctness — train/test leakage across splits, off-by-one
+        indexing into biological identifiers (drug/sample IDs), silent
+        NaN propagation, and statistical methodology (permutation nulls,
+        cross-validation folds).
+    - path: "scripts/**"
+      instructions: >
+        One-off analysis/pipeline scripts, not library code. Favor
+        correctness and reproducibility (fixed random seeds, documented
+        inputs/outputs). Do not flag lack of abstraction or code reuse —
+        that is expected here.
+    - path: "tests/**"
+      instructions: >
+        Check that tests assert on actual values or behavior, not just
+        "runs without error." Flag missing edge cases for data loaders
+        (empty input, mismatched IDs, all-NaN columns).
+
+chat:
+  auto_reply: true
