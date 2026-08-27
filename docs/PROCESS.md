@@ -14,7 +14,7 @@ The practice is written down first so those tools get built to it, rather than t
    Extend that task's `docs/tasks/<task-slug>/design.md` or explicitly supersede it; don't open a second task on the same subject.
 2. Read `docs/STATE.md` — is the thing you're about to fix already fixed, already known broken with a reason, or already being worked in a session?
 3. Check `git log --oneline -20` on the branch you're on.
-   Multiple sessions (this machine and teh HPC (in this case Alpine), sometimes concurrently) touch this repo; the two documents above are the coordination mechanism, not tribal memory of who's doing what.
+   Multiple sessions (this machine and the HPC (in this case Alpine), sometimes concurrently) touch this repo; the two documents above are the coordination mechanism, not tribal memory of who's doing what.
 
 
 ## 1. The work lifecycle

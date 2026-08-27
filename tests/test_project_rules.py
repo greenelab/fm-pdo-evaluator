@@ -131,12 +131,18 @@ def test_rule_02_every_task_is_named_in_the_spec_tree() -> None:
         pytest.skip("no task folders yet; nothing for this rule to check")
 
     spec = (REPO / "docs" / "SPEC.md").read_text()
-    unindexed = [f"docs/tasks/{d.name}/" for d in folders if d.name not in spec]
+    unindexed = [
+        f"docs/tasks/{d.name}/design.md" for d in folders if f"docs/tasks/{d.name}/design.md" not in spec
+    ]
     assert not unindexed, f"present in the repository, absent from the spec tree: {unindexed}"
 
 
 def _merge_base() -> str | None:
-    """The commit this branch diverged from, trying the upstream then the fork default."""
+    """The commit this branch diverged from, trying a PR merge-parent then the upstream/fork default."""
+    parents = (_git("rev-list", "--parents", "-n", "1", "HEAD") or "").split()
+    if len(parents) >= 3:
+        return parents[1]
+
     for ref in ("upstream/main", "origin/main", "main"):
         base = _git("merge-base", ref, "HEAD")
         if base and base.strip():
@@ -209,15 +215,15 @@ def test_rule_03_readme_links_to_the_project_documents() -> None:
     ladder that changed last month. That is the edge case below.
     """
     readme = README.read_text()
-    missing = [doc for doc in PROJECT_DOCUMENTS if doc not in readme]
-    assert not missing, f"README does not point at {missing}"
-
-    broken = [
-        target
+    link_targets = [
+        target.split("#")[0].split("?")[0]
         for target in re.findall(r"\]\(([^)]+)\)", readme)
         if not target.startswith(("http", "#", "mailto"))
-        and not (REPO / target.split("#")[0].split("?")[0]).exists()
     ]
+    missing = [doc for doc in PROJECT_DOCUMENTS if doc not in link_targets]
+    assert not missing, f"README does not link to {missing}"
+
+    broken = [target for target in link_targets if not (REPO / target).exists()]
     assert not broken, f"README links that do not resolve: {broken}"
 
 
