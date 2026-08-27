@@ -132,7 +132,9 @@ def test_rule_02_every_task_is_named_in_the_spec_tree() -> None:
 
     spec = (REPO / "docs" / "SPEC.md").read_text()
     unindexed = [
-        f"docs/tasks/{d.name}/design.md" for d in folders if f"docs/tasks/{d.name}/design.md" not in spec
+        f"docs/tasks/{d.name}/design.md"
+        for d in folders
+        if f"docs/tasks/{d.name}/design.md" not in spec
     ]
     assert not unindexed, f"present in the repository, absent from the spec tree: {unindexed}"
 
