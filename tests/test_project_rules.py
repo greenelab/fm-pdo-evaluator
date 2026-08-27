@@ -194,8 +194,8 @@ def test_rule_02_edge_non_additive_task_edits_carry_a_dated_entry() -> None:
         if not new_dates:
             offenders.append(doc)
     assert not offenders, (
-        "these task documents rewrote existing lines without recording the change, dated, at "
-        f"the foot of the document: {offenders}"
+        "these task documents rewrote existing lines without recording the change, dated, at"
+        f" the foot of the document: {offenders}"
     )
 
 
