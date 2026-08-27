@@ -1,4 +1,4 @@
-"""Provenance models: ``LeakageProfile`` and ``EnvironmentSnapshot``."""
+"""Provenance models: ``LeakageProfile``, ``EnvironmentSnapshot`` and ``PromotedResult``."""
 
 from __future__ import annotations
 
@@ -51,3 +51,34 @@ class EnvironmentSnapshot(BaseModel):
     torch_version: str | None = None
     cuda_version: str | None = None
     model_weights_hash: str | None = None
+
+
+class PromotedResult(BaseModel):
+    """The record written beside a promoted result, saying how it was produced.
+
+    A prediction carries its provenance inside ``PredictionRecord``; a promoted *artifact* —
+    the table a write-up cites — needs the same account at file granularity, which is what this
+    model is. It embeds ``EnvironmentSnapshot`` rather than restating it, so a commit is a
+    ``code_commit`` and a seed is a ``seed`` wherever provenance is written in this project.
+
+    Three fields exist because they cannot be reconstructed afterwards. ``clean_tree`` records
+    whether the working tree carried uncommitted changes at promotion, which no later inspection
+    can recover. ``result_sha256`` pins the artifact so an edit made after promotion is
+    detectable rather than silent. ``job_id`` is optional because a result computed locally has
+    no scheduler to name.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    result: str = Field(min_length=1)
+    result_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    task: str = Field(min_length=1)
+    script: str = Field(min_length=1)
+    args: dict[str, str] = Field(default_factory=dict)
+    inputs: dict[str, str] = Field(min_length=1)
+    log: str | None = None
+    log_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    job_id: str | None = None
+    clean_tree: bool
+    environment: EnvironmentSnapshot
+    promoted_at: datetime

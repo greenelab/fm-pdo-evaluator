@@ -218,8 +218,13 @@ __marimo__/
 .streamlit/secrets.toml
 
 # fmharness project-specific
-data/tranches/        # cached tranche artifacts (large)
+# Cached tranche artifacts (large). `.gitignore` has no inline comments — a trailing `# ...`
+# becomes part of the pattern, so this rule stands on its own line to match anything.
+data/tranches/
 reports/              # generated reports
 containers/*.sif      # built Apptainer images
 .fmharness/           # local user secrets/state
 
+# Local agent configuration and worktrees. Never publishable: settings.json holds
+# machine-specific permission rules, and worktrees/ contains entire other branches.
+.claude/

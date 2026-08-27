@@ -8,17 +8,13 @@ drift and the leakage scan can't be tied to a specific code/data state.
 
 ## 1. Containers
 
-Foundation-model inference runs inside Apptainer images pinned by digest in
-`containers/digests.json`:
-
-| Image | Definition | Built on | Wraps |
-|---|---|---|---|
-| `fmharness` | `containers/fmharness.def` | Day 1+2 (skeleton); rebuilt Day 8 | core Python deps |
-| `tahoe` | `containers/tahoe.def` | Day 8 | Tahoe-x1 + torch + CUDA |
-| `state` | `containers/state.def` (built only if needed) | Day 11 | STATE + torch + CUDA |
-
-STATE reuses the Tahoe container unless torch/CUDA conflicts force a split;
-the decision (and the reason) is recorded on Day 11 in this document.
+Foundation-model inference runs inside Apptainer images pinned by digest.
+`containers/fmharness.def` builds the core Python environment and is the only
+image in the repository today; an image per model family — one wrapping
+torch and CUDA for the foundation models — arrives with the task that first
+needs it, along with the `containers/digests.json` that pins them. Whether
+two model families share one image is a decision recorded here when it is
+made, with its reason.
 
 Every `PredictionRecord` carries `EnvironmentSnapshot.container_digest`. A
 prediction made outside a pinned container fails determinism check #6.
@@ -50,14 +46,21 @@ Two secrets the harness needs are kept out of the repo:
 
 Layout:
 
-- Local dev: copy `.env.example` to `.env`, fill in values. `.env` is
-  gitignored. Loaded by `pydantic-settings` from the repo root.
+- Local dev: copy `.env.example` to `.env` and fill in values; `.env` is
+  gitignored. No loader exists yet, so copying the file does not populate the
+  process environment — export the values, or `set -a; source .env; set +a`,
+  before running anything that needs them. Loading `.env` automatically via
+  `pydantic-settings` is the intent; the loader and its dependency arrive with
+  the first task that needs a token.
 - Alpine: `~/.fmharness/secrets` with `chmod 600`. Slurm sbatch headers
   source it explicitly: `source ~/.fmharness/secrets`.
 
-`.env` and any path containing `secrets` are caught by the pre-commit
-`detect-private-key` hook and a project-specific token-pattern check
-(added Day 13 when secrets handling is fully exercised).
+What actually protects these today is `.gitignore`: `.env` is ignored, so it is
+not staged by accident. The pre-commit `detect-private-key` hook scans file
+*contents* for private-key markers — it does not recognise `.env` or a path
+containing `secrets` by name, and it does not match API tokens. A
+token-pattern hook is not configured; it arrives with the first task that
+handles a token.
 
 ## 4. Static asset versioning
 
