@@ -46,8 +46,16 @@ export HF_TOKEN="${HF_TOKEN:-$(cat "${XDG_CACHE_HOME:-$HOME/.cache}/huggingface/
 # Alpine) is a declared follow-up, not done here.
 python -c "import duckdb" 2>/dev/null || pip install -q "duckdb>=1.0,<2"
 
-python scripts/permutation_null.py \
-    --local-dir "/scratch/alpine/$USER/tahoe_pseudobulk_de" \
-    --drugs-cid-file data/static/tahoe_target_cids.txt \
-    --panel-file "${PANEL_FILE:-results/rung1_panel/common_panel.txt}" \
-    --out-dir rung0_outputs
+# Run once per gene set. Rung 0 promotes two reliabilities, and the permutation check measures
+# the dependence the bootstrap ignores for each of them -- a design effect established on the
+# all-gene statistic says nothing about the responder one, whose draws reuse a different and
+# smaller set of genes per condition. No drug list and no panel, for the reason given in
+# delta_reproducibility.sbatch.
+OUT_DIR="${OUT_DIR:-docs/tasks/rung0-assay-reliability}"
+for GENE_SET in all responder; do
+    echo "=== permutation null, gene set: $GENE_SET ==="
+    python scripts/permutation_null.py \
+        --local-dir "/scratch/alpine/$USER/tahoe_pseudobulk_de" \
+        --gene-set "$GENE_SET" \
+        --out-dir "$OUT_DIR"
+done

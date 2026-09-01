@@ -46,9 +46,15 @@ python -c "import duckdb, matplotlib" 2>/dev/null || pip install -q "duckdb>=1.0
 # takes about a minute. Caching the built frame on scratch, keyed by a hash of its inputs, means
 # a rerun that only adds an output or changes a figure skips the scan. Delete the cache dir to
 # force a rebuild from the shards.
+#
+# NO --drugs-cid-file and NO --panel-file. Rung 0 measures the reliability of the assay at its
+# full extent: every gene the table carries, every drug with plates enough to split, doses
+# pooled. The superseded rung passed a 32-compound list and a 14,121-gene panel derived from
+# inputs that are on no landed branch and cannot be rebuilt; passing either here would make this
+# ceiling a measurement of a subset nobody at rung 0 can justify. A later rung that scores a
+# subset computes its own restriction and supplies its own files.
+OUT_DIR="${OUT_DIR:-docs/tasks/rung0-assay-reliability}"
 python scripts/delta_reproducibility.py \
     --local-dir "/scratch/alpine/$USER/tahoe_pseudobulk_de" \
-    --drugs-cid-file data/static/tahoe_target_cids.txt \
-    --panel-file "${PANEL_FILE:-results/rung1_panel/common_panel.txt}" \
     --frame-cache "/scratch/alpine/$USER/rung0_frame_cache" \
-    --out-dir rung0_outputs
+    --out-dir "$OUT_DIR"
