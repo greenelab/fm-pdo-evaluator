@@ -361,3 +361,45 @@ def test_rule_04_edge_promoted_tasks_have_known_answer_tests() -> None:
         "results are promoted but no test file carries pytest.mark.known_answer; rule 4 "
         "requires the declared controls to be implemented before a number becomes evidence"
     )
+
+
+# ======================================================================================
+# Notebooks are committed without outputs (PROCESS section 3)
+# ======================================================================================
+
+
+@pytest.mark.step_document
+def test_committed_notebooks_carry_no_outputs() -> None:
+    """A committed notebook must hold no execution outputs.
+
+    PROCESS section 3: the figures and numbers a reviewer sees are the ones their OWN
+    execution produced. A notebook committed with outputs shows them someone else's run, which
+    is exactly the transcribed-number problem the executable-verification rule exists to
+    remove -- and stale outputs look identical to fresh ones in a diff.
+
+    This is a mechanical check by script rather than by a reader, per docs/audit.md: it caught a
+    verify notebook that reached a commit with fourteen outputs still in it, after being
+    executed for testing and committed in the same window.
+    """
+    import json
+    import subprocess
+
+    repo = Path(__file__).resolve().parents[1]
+    tracked = subprocess.run(
+        ["git", "ls-files", "*.ipynb"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()
+    if not tracked:
+        pytest.skip("no notebooks tracked yet; nothing for this rule to check")
+    offenders: list[str] = []
+    for rel in tracked:
+        nb = json.loads((repo / rel).read_text())
+        n = sum(
+            len(c.get("outputs", [])) for c in nb.get("cells", []) if c.get("cell_type") == "code"
+        )
+        if n:
+            offenders.append(f"{rel} ({n} outputs)")
+    assert not offenders, "notebooks committed with outputs: " + ", ".join(offenders)
