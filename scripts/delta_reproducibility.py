@@ -53,9 +53,12 @@ def resolve_drug_names(repo: Path, args: argparse.Namespace) -> list[str] | None
         return sorted(
             {ln.strip() for ln in Path(args.drug_names_file).read_text().splitlines() if ln.strip()}
         )
-    cid_file = Path(getattr(args, "drugs_cid_file", "") or "")
-    if not str(cid_file):
+    # Checked as a string before it becomes a Path: Path("") is PosixPath("."), whose str() is
+    # "." and is truthy, so testing the Path would send an empty default down the lookup path.
+    raw = str(getattr(args, "drugs_cid_file", "") or "").strip()
+    if not raw:
         return None
+    cid_file = Path(raw)
     cid_file = cid_file if cid_file.is_absolute() else repo / cid_file
     if not cid_file.exists():
         return None
@@ -748,18 +751,19 @@ def _write_params_sidecar(result_path, args_ns, extra=None) -> None:
     print(f"wrote {side}")
 
 
-def frame_cache_key(paths: list[str], names: list[str], replicate_col: str | None) -> str:
+def frame_cache_key(paths: list[str], names: list[str] | None, replicate_col: str | None) -> str:
     """Content key for a built split-half frame: the inputs that determine it, hashed.
 
     Naming the cache after its inputs is what makes it safe -- a different pool, drug set or
     replicate column resolves to a different file rather than silently reusing the wrong frame.
     """
-    payload = "\n".join([*sorted(paths), "--", *sorted(names), "--", str(replicate_col)])
+    drug_key = ["<all drugs>"] if not names else sorted(names)
+    payload = "\n".join([*sorted(paths), "--", *drug_key, "--", str(replicate_col)])
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
 def _build_or_load_frame(
-    paths: list[str], names: list[str], args: argparse.Namespace, local: Path
+    paths: list[str], names: list[str] | None, args: argparse.Namespace, local: Path
 ) -> tuple[pd.DataFrame, str]:
     """The split-half frame, from cache when one matches these inputs.
 
@@ -789,10 +793,151 @@ def _build_or_load_frame(
     return de, repl
 
 
+def effect_size_tercile_table(
+    piv0: pd.DataFrame, piv1: pd.DataFrame, r: np.ndarray, n_boot: int = 2000, seed: int = 0
+) -> pd.DataFrame:
+    """The empirical control as a table, with an interval on each tercile mean.
+
+    ``effect_size_terciles`` returns three bare numbers, which cannot say whether a rise across
+    them is real or within noise. This carries the same three means with a bootstrap interval
+    and a count, so the figure can show the rise with its uncertainty and a reader can tell the
+    two cases apart.
+    """
+    a, b = piv0.to_numpy(dtype=float), piv1.to_numpy(dtype=float)
+    ok = np.isfinite(a) & np.isfinite(b)
+    mean_abs = np.where(ok, np.abs(a + b) / 2.0, 0.0).sum(axis=1) / np.maximum(ok.sum(axis=1), 1)
+    finite = np.isfinite(r)
+    edges = np.quantile(mean_abs[finite], [1 / 3, 2 / 3])
+    rng = np.random.default_rng(seed)
+    rows = []
+    for t in (1, 2, 3):
+        lo = -np.inf if t == 1 else edges[t - 2]
+        hi = np.inf if t == 3 else edges[t - 1]
+        sel = finite & (mean_abs > lo) & (mean_abs <= hi)
+        vals = r[sel]
+        boot = np.array(
+            [np.mean(rng.choice(vals, size=vals.size, replace=True)) for _ in range(n_boot)]
+        )
+        rows.append(
+            {
+                "tercile": t,
+                "n": int(vals.size),
+                "mean_r": round(float(np.mean(vals)), 4),
+                "ci_lo": round(float(np.quantile(boot, 0.025)), 4),
+                "ci_hi": round(float(np.quantile(boot, 0.975)), 4),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def mde_curve_table(
+    r_all: np.ndarray,
+    r_resp: np.ndarray,
+    nulls_all: dict[str, np.ndarray],
+    nulls_resp: dict[str, np.ndarray],
+    seed: int = 0,
+) -> pd.DataFrame:
+    """Minimum detectable effect against condition count, for both gene sets.
+
+    A single MDE says whether this screen was powered; the curve says how much of that power is
+    the screen's size rather than the effect's, which is the question the organoid rung will ask
+    with a tenth of the conditions.
+    """
+    from fmharness.statistics import minimum_detectable_aggregate
+
+    rows = []
+    for gene_set, r, nulls in (("all", r_all, nulls_all), ("responder", r_resp, nulls_resp)):
+        r = r[np.isfinite(r)]
+        if r.size < 2:
+            continue
+        nl = nulls["diff_drug"] if nulls["diff_drug"].size else nulls["any_pair"]
+        grid = sorted({*np.unique(np.geomspace(10, max(r.size, 11), 12).astype(int)), r.size})
+        for n in grid:
+            rows.append(
+                {
+                    "gene_set": gene_set,
+                    "n_pairs": int(n),
+                    "mde": round(minimum_detectable_aggregate(r, nl, int(n), seed=seed), 4),
+                    "observed": bool(n == r.size),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def leakage_table(min_genes: int, seed: int = 0) -> pd.DataFrame:
+    """The one-sided rule beside the pooled one, on a pool with no signal at all.
+
+    The design forbids selecting on the pooled data because it inflates the correlation by
+    winner's curse: writing the halves as a and b, their sum and difference are independent, so
+    selecting on a large |a + b| inflates var(a + b) alone and cov(a, b) = (var(a+b) -
+    var(a-b))/4 goes positive with nothing generating it. Computed at run time on a signal-free
+    pool so the figure shows the size of the effect being avoided rather than asserting it.
+    """
+    from fmharness.synthetic import planted_split_half_frame
+
+    pool = planted_split_half_frame(
+        n_lines=8, n_drugs=4, n_genes=2000, signal_sd=0.0, noise_sd=1.0, seed=seed
+    )
+    panel = set(pool["gene_name"].unique())
+    _, piv0, piv1 = score_split_half(pool, panel, min_genes=min_genes)
+    a, b = piv0.to_numpy(dtype=float), piv1.to_numpy(dtype=float)
+    one = responder_mask(padj_pivot(pool, panel).reindex(columns=piv0.columns).loc[piv0.index])
+    k = max(int(one.sum(axis=1).mean()), min_genes)
+    order = np.argsort(-np.abs(a + b), axis=1)
+    pooled = np.zeros_like(one)
+    np.put_along_axis(pooled, order[:, :k], True, axis=1)
+    return pd.DataFrame(
+        [
+            {
+                "rule": "one-sided",
+                "mean_r": round(
+                    float(np.nanmean(masked_rowwise_pearson(a, b, min_genes, select=one))), 4
+                ),
+                "genes_per_condition": int(one.sum(axis=1).mean()),
+            },
+            {
+                "rule": "pooled",
+                "mean_r": round(
+                    float(np.nanmean(masked_rowwise_pearson(a, b, min_genes, select=pooled))), 4
+                ),
+                "genes_per_condition": int(pooled.sum(axis=1).mean()),
+            },
+        ]
+    )
+
+
+AUDIT_SUMS = "audit_checksums.json"
+
+
+def write_audit_checksums(out_dir: Path) -> Path:
+    """The sha256 of every table this run wrote, for the audit to cite and promotion to check.
+
+    The audit reads these artifacts in the working tree, before they are committed (PROCESS
+    section 1). Recording each one's checksum is what closes the window between what was audited
+    and what gets committed: promotion refuses when a checksum has moved since.
+    """
+    import hashlib as _h
+
+    sums = {
+        p.name: _h.sha256(p.read_bytes()).hexdigest()
+        for p in sorted(out_dir.rglob("*"))
+        if p.is_file() and p.suffix in {".csv", ".gz", ".png", ".json"} and p.name != AUDIT_SUMS
+    }
+    path = out_dir / AUDIT_SUMS
+    path.write_text(json.dumps(sums, indent=2, sort_keys=True) + "\n")
+    print(f"wrote {path} ({len(sums)} artifacts)")
+    return path
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--local-dir", required=True, help="dir with the Tahoe DE parquet (on scratch)")
-    ap.add_argument("--drugs-cid-file", default="data/static/tahoe_target_cids.txt")
+    ap.add_argument(
+        "--drugs-cid-file",
+        default="",
+        help="optional PubChem CID list. Rung 0 measures at the assay's full extent, so the "
+        "default is empty and every splittable drug is admitted.",
+    )
     ap.add_argument(
         "--drug-names-file",
         default=None,
@@ -800,18 +945,13 @@ def main() -> None:
         "and offline runs need no `datasets` import.",
     )
     ap.add_argument("--replicate-col", default=None, help="plate/replicate column (auto-detected)")
-    ap.add_argument(
-        "--n-hvg",
-        type=int,
-        default=2000,
-        help="top HVGs by variance, used only without --panel-file",
-    )
     ap.add_argument("--min-genes", type=int, default=50, help="min shared genes to score a pair")
+    ap.add_argument("--padj-threshold", type=float, default=0.05, help="responder selection alpha")
     ap.add_argument(
         "--panel-file",
         default=None,
-        help="one gene per line; pins the ceiling to the SAME panel it will be a denominator "
-        "for. Without it the ceiling is top-HVG and not comparable to a panel-scored rung.",
+        help="one gene per line. Rung 0 scores every gene the table carries and passes none; a "
+        "later rung computing a restriction of this ceiling supplies its own.",
     )
     ap.add_argument("--n-perm", type=int, default=500, help="mismatched-pair null draws")
     ap.add_argument("--seed", type=int, default=0)
@@ -823,6 +963,11 @@ def main() -> None:
         "The build scans every DE shard and dominates the run; with a cache, adding an output "
         "or changing a figure reruns in about a minute instead of repeating the scan.",
     )
+    ap.add_argument(
+        "--skip-noise",
+        action="store_true",
+        help="skip the noise decomposition's second full scan (local smoke runs only)",
+    )
     args = ap.parse_args()
     repo = Path(__file__).resolve().parent.parent
 
@@ -831,100 +976,207 @@ def main() -> None:
     paths = sorted(str(p) for p in local.rglob("*.parquet") if DE in str(p))
     if not paths:
         raise SystemExit(f"no {DE} parquet under {local}")
-    if args.drug_names_file:
-        names = sorted(
-            {ln.strip() for ln in Path(args.drug_names_file).read_text().splitlines() if ln.strip()}
-        )
-    else:
-        cid_file = Path(args.drugs_cid_file)
-        cid_file = cid_file if cid_file.is_absolute() else repo / cid_file
-        names = _target_names(repo, cid_file)
-    print(f"{len(names)} target drugs; reading {len(paths)} DE parquet files ...")
+    names = resolve_drug_names(repo, args)
+    scope = "all drugs (no drug list given)" if names is None else f"{len(names)} target drugs"
+    print(f"{scope}; reading {len(paths)} DE parquet files ...")
 
     out_dir = Path(args.out_dir) if Path(args.out_dir).is_absolute() else repo / args.out_dir
-    out_dir.mkdir(parents=True, exist_ok=True)
+    fig_dir = out_dir / "figures"
+    fig_dir.mkdir(parents=True, exist_ok=True)
 
     de, repl = _build_or_load_frame(paths, names, args, local)
+    n_rows_built = len(de)
     de = de.dropna(subset=["lfc0", "lfc1"])
     if de.empty:
         raise SystemExit("no (line, drug, gene) had both plate halves -- too few plates per pair?")
-    de["mean"] = (de["lfc0"].to_numpy() + de["lfc1"].to_numpy()) / 2.0
+    print(f"built {n_rows_built:,} rows; {len(de):,} have both plate halves")
 
-    # The gene set has to match whatever this ceiling will be a DENOMINATOR for. Scoring the
-    # ceiling on top-2000 HVG while rung 1 scores on the 14,121-gene common panel makes
-    # "fraction of achievable" a ratio between two different measurements -- the same class of
-    # error as the panel bug itself. --panel-file pins it to the panel actually used.
+    # Rung 0 scores every gene the table carries. --panel-file exists for a later rung asking
+    # for a restriction of this ceiling; it is not passed here, and there is deliberately no
+    # top-variance fallback -- silently scoring 2,000 genes when the design says "every gene"
+    # is the class of error this task exists to undo.
     if args.panel_file:
-        panel = {ln.strip() for ln in Path(args.panel_file).read_text().splitlines() if ln.strip()}
-        hvg = panel & set(de["gene_name"].unique())
-        print(
-            f"scoring the ceiling on the supplied panel: {len(hvg)} of {len(panel)} genes present"
-        )
+        declared = {
+            ln.strip() for ln in Path(args.panel_file).read_text().splitlines() if ln.strip()
+        }
+        panel = declared & set(de["gene_name"].unique())
+        print(f"restricted to a supplied panel: {len(panel)} of {len(declared)} genes present")
     else:
-        gene_var = de.groupby("gene_name")["mean"].var()
-        hvg = set(gene_var.sort_values(ascending=False).index[: args.n_hvg])
-        print(f"scoring the ceiling on top-{args.n_hvg} HVG (no --panel-file given)")
+        panel = set(de["gene_name"].unique())
+        print(f"scoring every gene the table carries: {len(panel)}")
 
-    # per (line, drug): split-half Pearson r between the two plate halves over the HVG genes.
-    # `r` stays aligned with piv0/piv1's rows (NaNs and all) -- Task 4's tercile/per-gene
-    # diagnostics need that alignment; `r_fin` is the finite-only view for aggregate stats.
-    r, piv0, piv1 = score_split_half(de, hvg, min_genes=args.min_genes)
-    r_fin = r[np.isfinite(r)]
-    if r_fin.size == 0:
-        raise SystemExit("no (line, drug) pair had enough shared HVG genes to score")
+    # --- score, both gene sets -------------------------------------------------------------
+    r_all, piv0, piv1 = score_split_half(de, panel, min_genes=args.min_genes)
+    if not np.any(np.isfinite(r_all)):
+        raise SystemExit("no (line, drug) pair had enough shared genes to score")
+    padj = padj_pivot(de, panel).reindex(columns=piv0.columns).loc[piv0.index]
+    select = responder_mask(padj, alpha=args.padj_threshold)
+    r_resp = masked_rowwise_pearson(
+        piv0.to_numpy(dtype=float), piv1.to_numpy(dtype=float), args.min_genes, select=select
+    )
+    print(
+        f"all-gene: {int(np.isfinite(r_all).sum())} conditions scored; "
+        f"responder: {int(np.isfinite(r_resp).sum())} conditions, "
+        f"{float(select.sum(axis=1).mean()):.0f} genes each on average"
+    )
 
-    # NEGATIVE CONTROL, STRATIFIED. A split-half correlation has a nonzero floor because genes
-    # share structure whether or not two halves come from the same perturbation. But a single
-    # "mismatched pair" null conflates two very different floors, and the first run showed why:
-    # it drew two random pairs, so whenever they happened to share a DRUG the correlation was
-    # high -- drug effects dominate the delta -- and the null came back at median 0.139 with 23%
-    # of draws exceeding the observed 0.299. That null is inflated by same-drug matches and
-    # cannot be read as a floor for reproducibility.
-    #
-    # Three strata, the same distinction design.md's "Why three null strata" draws:
-    #   any_pair      two random pairs. Mixed; reported only for continuity with the first run.
-    #   diff_drug     different line AND different drug -- the floor from generic gene structure.
-    #                 This is the one the CEILING must clear to be a ceiling at all.
-    #   same_drug     same drug, different line -- the floor for LINE specificity. A split-half
-    #                 above this says the pair's delta is reproducible beyond its drug's effect.
-    nulls = stratified_null_draws(
+    # --- pool composition, and the equal-halves subset ---------------------------------------
+    pool = pool_description(paths, names, repl, local.parent / "duckdb_tmp")
+    even_by_key = dict(
+        zip(zip(pool["patient"], pool["drug"], strict=True), pool["n_plates_even"], strict=True)
+    )
+    even_mask = np.array([bool(even_by_key.get((p, d), False)) for p, d in piv0.index], dtype=bool)
+    print(f"{int(even_mask.sum())} of {even_mask.size} conditions split into equal halves")
+
+    # --- nulls, both gene sets ---------------------------------------------------------------
+    nulls_all = stratified_null_draws(
         piv0, piv1, n_perm=args.n_perm, seed=args.seed, min_genes=args.min_genes
     )
-    for k, v in nulls.items():
-        med_k = float(np.median(v)) if v.size else float("nan")
-        print(f"null[{k:<10}] median r = {med_k:+.3f} over {v.size} draws")
+    nulls_resp = stratified_null_draws(
+        piv0, piv1, n_perm=args.n_perm, seed=args.seed, min_genes=args.min_genes, select=select
+    )
+    for label, nulls in (("all", nulls_all), ("responder", nulls_resp)):
+        for k, v in nulls.items():
+            med = float(np.median(v)) if v.size else float("nan")
+            print(f"null[{label:<9} {k:<10}] median r = {med:+.3f} over {v.size} draws")
 
     summary = {
         "replicate_col": repl,
-        "n_genes": len(hvg),
-        **summarize(r, nulls, args.seed),
-        **effect_size_terciles(piv0, piv1, r),
+        "n_genes": len(panel),
+        "padj_threshold": args.padj_threshold,
+        **summarize(r_all, nulls_all, args.seed, label="all", even_mask=even_mask),
+        **summarize(r_resp, nulls_resp, args.seed, label="responder", even_mask=even_mask),
     }
-    summary_path = out_dir / "rung0_delta_reproducibility.csv"
+    summary_path = out_dir / "rung0_reliability.csv"
     pd.DataFrame([summary]).to_csv(summary_path, index=False)
-    _write_params_sidecar(summary_path, args, extra={"n_pairs": summary["n_pairs"]})
+    _write_params_sidecar(
+        summary_path,
+        args,
+        extra={
+            "all_n_pairs": summary["all_n_pairs"],
+            "responder_n_pairs": summary["responder_n_pairs"],
+            "selection_rule": "padj < threshold in at least one of the first plate group's rows",
+            "gene_inclusion": "every gene the table carries",
+            "drug_inclusion": "every drug with at least two distinct plates",
+            "dose_handling": "pooled for the reliabilities, held fixed for the decomposition",
+        },
+    )
 
-    per_pair_table(piv0, piv1, r).to_csv(out_dir / "rung0_per_pair_r.csv", index=False)
-    null_draw_table(nulls).to_csv(out_dir / "rung0_null_draws.csv", index=False)
-    profiles, profile_index = example_pair_profiles(piv0, piv1, r)
-    # gzipped: every shared gene, ~700 KB instead of ~2.4 MB; pandas reads it by extension
+    # --- evidence tables ---------------------------------------------------------------------
+    per_pair = per_pair_table(piv0, piv1, r_all, r_responder=r_resp, select=select)
+    per_pair["n_plates_even"] = even_mask
+    per_pair.to_csv(out_dir / "rung0_per_pair_r.csv", index=False)
+
+    null_rows = [
+        null_draw_table(nulls_all).assign(gene_set="all"),
+        null_draw_table(nulls_resp).assign(gene_set="responder"),
+    ]
+    pd.concat(null_rows, ignore_index=True).to_csv(out_dir / "rung0_null_draws.csv", index=False)
+
+    profiles, profile_index = example_pair_profiles(piv0, piv1, r_all)
     profiles.to_csv(out_dir / "rung0_example_pair_profiles.csv.gz", index=False)
     profile_index.to_csv(out_dir / "rung0_example_pair_index.csv", index=False)
 
+    terciles = effect_size_tercile_table(piv0, piv1, r_all, seed=args.seed)
+    terciles.to_csv(out_dir / "rung0_effect_terciles.csv", index=False)
+
+    mde_curve = mde_curve_table(r_all, r_resp, nulls_all, nulls_resp, seed=args.seed)
+    mde_curve.to_csv(out_dir / "rung0_mde_curve.csv", index=False)
+
+    leakage = leakage_table(args.min_genes, seed=args.seed)
+    leakage.to_csv(out_dir / "rung0_leakage_control.csv", index=False)
+    print(f"leakage control: {leakage.to_dict(orient='records')}")
+
     per_gene = per_gene_reliability(piv0, piv1)
     per_gene.to_csv(out_dir / "rung0_per_gene_reliability.csv", index=False)
-    write_per_gene_figure(per_gene, out_dir / "rung0_per_gene_reliability.png")
-    pool_description(paths, names, repl, local.parent / "duckdb_tmp").to_csv(
-        out_dir / "rung0_pool_description.csv", index=False
-    )
-    write_figure(r, nulls, out_dir / "rung0_ceiling.png")
+    pool.to_csv(out_dir / "rung0_pool_description.csv", index=False)
 
-    print("\n=== delta reproducibility ceiling (real Tahoe delta, plate split-half) ===")
+    padj_sample = pd.DataFrame({"padj0": padj.to_numpy(dtype=float).ravel()}).dropna()
+    padj_sample = padj_sample.sample(min(200_000, len(padj_sample)), random_state=args.seed)
+    padj_sample.to_csv(out_dir / "rung0_padj_sample.csv.gz", index=False)
+
+    # --- the noise decomposition -------------------------------------------------------------
+    noise_summary: dict[str, float] = {}
+    if args.skip_noise:
+        print("skipping the noise decomposition (--skip-noise)")
+        noise = pd.DataFrame()
+    else:
+        noise = decompose_noise(
+            build_noise_frame(paths, names, args.replicate_col, local.parent / "duckdb_tmp")
+        )
+        frac = noise["between_plate_fraction"].to_numpy(dtype=float)
+        frac = frac[np.isfinite(frac)]
+        noise_summary = {
+            "n_gene_conditions": len(noise),
+            "between_plate_fraction_mean": round(float(np.mean(frac)), 4),
+            "between_plate_fraction_median": round(float(np.median(frac)), 4),
+            "sigma2_plate_mean": round(
+                float(np.mean(noise["sigma2_plate"].to_numpy(dtype=float))), 5
+            ),
+            "mean_se2_mean": round(float(np.mean(noise["mean_se2"].to_numpy(dtype=float))), 5),
+            "frac_plate_dominated": round(float(np.mean(frac > 0.5)), 4),
+        }
+        noise_path = out_dir / "rung0_noise_decomposition.csv"
+        pd.DataFrame([noise_summary]).to_csv(noise_path, index=False)
+        _write_params_sidecar(noise_path, args, extra=noise_summary)
+        # The per-gene rows are large; committed compressed, and the summary above is what a
+        # promoted claim is read from.
+        noise.to_csv(out_dir / "rung0_noise_per_gene.csv.gz", index=False)
+        print(f"noise: {noise_summary}")
+
+    # --- figures -------------------------------------------------------------------------------
+    from fmharness import figures as fg
+    from fmharness.synthetic import (
+        noise_sd_for_reliability,
+        planted_noise_frame,
+        planted_split_half_frame,
+    )
+
+    pos = planted_split_half_frame(
+        n_genes=2000, noise_sd=noise_sd_for_reliability(0.5, 4), n_responders=400, seed=args.seed
+    )
+    neg = planted_split_half_frame(n_genes=2000, signal_sd=0.0, noise_sd=1.0, seed=args.seed + 1)
+    ctrl_rows = []
+    for label, frame in (("positive (planted r = 0.5)", pos), ("negative (no signal)", neg)):
+        cpanel = set(frame["gene_name"].unique())
+        cr, cp0, cp1 = score_split_half(frame, cpanel, min_genes=args.min_genes)
+        ctrl_rows.append(per_pair_table(cp0, cp1, cr).assign(control=label))
+    control_per_pair = pd.concat(ctrl_rows, ignore_index=True)
+    control_per_pair.to_csv(out_dir / "rung0_control_per_pair.csv", index=False)
+
+    delta_real = pd.DataFrame(
+        {"log2FoldChange": de["lfc0"].to_numpy(dtype=float)[:: max(1, len(de) // 200_000)]}
+    )
+    delta_syn = pd.DataFrame({"log2FoldChange": pos["lfc0"].to_numpy(dtype=float)})
+
+    fg.fig_build(pool, delta_real, delta_syn, fig_dir / "01_build.png")
+    fg.fig_split(pool, per_pair, fig_dir / "02_split.png")
+    fg.fig_select(per_pair, padj_sample, leakage, fig_dir / "03_select.png")
+    fg.fig_score(
+        profiles, profile_index, per_pair, control_per_pair, summary, fig_dir / "04_score.png"
+    )
+    if not noise.empty:
+        control_noise = decompose_noise(planted_noise_frame(seed=args.seed))
+        control_noise.to_csv(out_dir / "rung0_control_noise.csv.gz", index=False)
+        fg.fig_decompose(noise, control_noise, fig_dir / "05_decompose.png")
+    fg.fig_null(per_pair, pd.concat(null_rows, ignore_index=True), fig_dir / "06_null.png")
+    fg.fig_terciles(terciles, fig_dir / "07_terciles.png")
+    fg.fig_power(mde_curve, fig_dir / "08_power.png")
+    write_per_gene_figure(per_gene, fig_dir / "09_per_gene_reliability.png")
+
+    write_audit_checksums(out_dir)
+
+    print("\n=== rung 0: the reliability of the assay ===")
     for k, v in summary.items():
-        print(f"  {k:22s} {v}")
+        print(f"  {k:42s} {v}")
     print(
-        f"\nrung-0 ceiling: split-half mean r = {summary['splithalf_mean_r']:.3f}, "
-        f"Spearman-Brown full-data = {summary['spearman_brown_full']:.3f}.\nwrote {summary_path}"
+        f"\nall-gene    r = {summary['all_splithalf_mean_r']:.3f} "
+        f"(Spearman-Brown {summary['all_spearman_brown_full']:.3f}) "
+        f"over {summary['all_n_pairs']} conditions"
+        f"\nresponder   r = {summary['responder_splithalf_mean_r']:.3f} "
+        f"(Spearman-Brown {summary['responder_spearman_brown_full']:.3f}) "
+        f"over {summary['responder_n_pairs']} conditions"
+        f"\nwrote {summary_path}"
     )
 
 

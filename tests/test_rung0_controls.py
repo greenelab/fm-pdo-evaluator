@@ -1017,3 +1017,94 @@ def test_summarize_headlines_the_mean_and_reports_both_mdes() -> None:
     assert 0 < s["mde_80_vs_diff_drug"] < s["splithalf_mean_r"], "trivially powered here"
     assert 0 < s["mde_80_vs_same_drug"] < s["splithalf_mean_r"]
     assert s["splithalf_median_r"] is not None  # descriptive column retained
+
+
+@pytest.mark.step_document
+def test_main_writes_every_declared_artifact_on_a_synthetic_pool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PROCESS section 3: prove the whole run on synthetic data before spending cluster time.
+
+    Runs the REAL ``main`` end to end on a fixture pool and requires the exact set of artifacts
+    the design declares. A missing table or figure fails by name here, in seconds, rather than
+    at the end of a forty-minute cluster job.
+    """
+    path = _write_fixture_pool(
+        tmp_path,
+        n_lines=6,
+        n_drugs=4,
+        n_genes=400,
+        n_responders=120,
+        doses=(0.01, 0.1),
+        plates=("P1", "P2", "P3", "P4", "P5", "P6"),
+        plate_offset_sd=0.3,
+        seed=41,
+    )
+    out = tmp_path / "out"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "delta_reproducibility.py",
+            "--local-dir",
+            str(path.parent.parent),
+            "--out-dir",
+            str(out),
+            "--min-genes",
+            "20",
+            "--n-perm",
+            "40",
+        ],
+    )
+    dr.main()
+
+    expected = {
+        "rung0_reliability.csv",
+        "rung0_reliability.params.json",
+        "rung0_per_pair_r.csv",
+        "rung0_null_draws.csv",
+        "rung0_example_pair_profiles.csv.gz",
+        "rung0_example_pair_index.csv",
+        "rung0_effect_terciles.csv",
+        "rung0_mde_curve.csv",
+        "rung0_leakage_control.csv",
+        "rung0_per_gene_reliability.csv",
+        "rung0_pool_description.csv",
+        "rung0_padj_sample.csv.gz",
+        "rung0_noise_decomposition.csv",
+        "rung0_noise_decomposition.params.json",
+        "rung0_noise_per_gene.csv.gz",
+        "rung0_control_per_pair.csv",
+        "rung0_control_noise.csv.gz",
+        "audit_checksums.json",
+    }
+    got = {p.name for p in out.glob("*") if p.is_file()}
+    assert expected <= got, f"missing artifacts: {sorted(expected - got)}"
+
+    figures = {p.name for p in (out / "figures").glob("*.png")}
+    expected_figures = {
+        "01_build.png",
+        "02_split.png",
+        "03_select.png",
+        "04_score.png",
+        "05_decompose.png",
+        "06_null.png",
+        "07_terciles.png",
+        "08_power.png",
+        "09_per_gene_reliability.png",
+    }
+    assert expected_figures <= figures, f"missing figures: {sorted(expected_figures - figures)}"
+
+    summary = pd.read_csv(out / "rung0_reliability.csv").iloc[0]
+    assert summary["all_n_pairs"] > 0 and summary["responder_n_pairs"] > 0
+    assert summary["n_genes"] == 400, "every gene the table carries, no panel and no HVG fallback"
+
+    # The checksum record must cover the artifacts, since the audit cites it and promotion
+    # checks against it.
+    import hashlib
+    import json as _json
+
+    sums = _json.loads((out / "audit_checksums.json").read_text())
+    assert expected - {"audit_checksums.json"} <= set(sums)
+    name = "rung0_reliability.csv"
+    assert sums[name] == hashlib.sha256((out / name).read_bytes()).hexdigest()
