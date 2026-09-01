@@ -4,11 +4,12 @@
 The spec says what each rung must establish and what a passing result means; this document says where each one stands.
 It carries no history: a rung's result belongs here, how it came to be belongs in git and in that rung's spec.
 
-**As of** 2026-08-27.
+**As of** 2026-09-01.
 
 A number not carried here with its provenance record is not evidence.
 Promotion means a result in `results/<task-slug>/` with a `<result>.provenance.json` beside it recording the commit, job and inputs that produced it — project rule 1.
 No `results/` directory exists yet, so nothing in this repository is evidence of anything.
+Rung 0's measurement is running; its outputs stay in the task folder and out of the git record until the summary has been read and the result promoted (PROCESS section 1).
 
 ---
 
@@ -16,7 +17,7 @@ No `results/` directory exists yet, so nothing in this repository is evidence of
 
 | Rung | What the spec requires | Status |
 |---|---|---|
-| 0 — assay reliability | Two reproducibility ceilings clearing their nulls at the assay's full extent — all genes, and each condition's responders — with replicate noise decomposed into plate and cell-sampling parts | Not started |
+| 0 — assay reliability | Two reproducibility ceilings clearing their nulls at the assay's full extent — all genes, and each condition's responders — with replicate noise decomposed into plate and cell-sampling parts | **In progress.** Design approved and the apparatus landed on branch `rung0-assay-reliability` ([design](tasks/rung0-assay-reliability/design.md), [plan](tasks/rung0-assay-reliability/plan.md)); the measurement is running on Alpine. **Nothing promoted** — promotion follows the summary review, so no number here is evidence yet |
 | 1 — held-out line | Prediction beating a floor and recovering a planted signal, as a fraction of rung 0 | Not started |
 | 2 — bulk read by a single-cell model | A synthesised population landing near the same material's real single cells, clearing a mismatched-line null | Not started |
 | 3 — cross-platform | Retention separable from a scrambled-line control | Not started |
