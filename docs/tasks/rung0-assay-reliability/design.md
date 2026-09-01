@@ -20,9 +20,11 @@ One tranche: the Tahoe-100M pseudobulk differential-expression table, registered
 (`data/tranches/`; described in [docs/DATA.md](../../DATA.md)). Per cell line, drug, dose, and
 plate it carries each gene's log2 fold change against plate-matched solvent controls. 
 
-Each row is one DESeq2 result, and this rung reads five of its columns: `log2FoldChange`, its
-standard error `lfcSE`, the Benjamini-Hochberg adjusted p-value `padj`, `baseMean`, and the keys
-(`gene_name`, `plate`, `concentration`, `Cell_ID_DepMap`, `drug`).
+Each row is one DESeq2 result. This rung reads four of its statistics — `log2FoldChange`, its
+standard error `lfcSE`, the Benjamini-Hochberg adjusted p-value `padj`, and `baseMean` — keyed by
+`gene_name`, `plate`, `concentration`, `Cell_ID_DepMap` and `drug`. Nine columns of the sixteen;
+`stat`, `pvalue`, `n_cells_trt`, `n_cells_ctrl` and the two alternative cell-line identifiers are
+not read.
 
 ## What is measured
 
@@ -65,7 +67,10 @@ response size.
   genes qualify.
 - *Responder Genes* in addition to having a finite value in each group, the first group also called it differentially expressed (padj < .05). A condition is scored when at least 50
   genes qualify. 
-- *Drugs.* Every drug for which a condition has at least two distinct plates, so a split exists.
+- *Drugs.* Every drug for which a condition has a plate in **each** hash group, which is what
+  makes a split exist. Two distinct plates are necessary but not sufficient — both can hash to
+  the same group — so the rule is stated as the engine applies it, not as the count it is often
+  mistaken for.
 - *Cell lines.* Every key in the table, including the one whose DepMap identifier is missing
   and appears as the literal string `NA` — it is a real line's data and carries a consistent key
   throughout. Measured, not asserted: 45 keys (this clause read "all fifty" until the screen was
@@ -238,7 +243,7 @@ that exercise it.
 
 | Path | Role |
 |---|---|
-| `scripts/delta_reproducibility.py` | the measurement: build, split, select, score, decompose, null, reporting, evidence exports, figures, build cache. The select and decompose steps and the figures are new to this task and are the only additions to a carried-over file |
+| `scripts/delta_reproducibility.py` | the measurement: build, split, select, score, decompose, null, reporting, evidence exports, figures, build cache. The select and decompose steps and the figures are new to this task, along with the supporting tables each figure is drawn from, the engine-side noise aggregation, and the scatter-based pivot that replaced `pivot_table` at this screen's scale — the additions are listed in `decisions.md` rather than claimed to be three |
 | `scripts/permutation_null.py` | the permutation check of the dependence assumption. Ported from `scripts/derangement_null.py`; "derangement" is the mathematical name for a permutation that leaves nothing in place, and it is renamed to permutation throughout — file, sbatch script, test, and output names |
 | `src/fmharness/statistics.py` | significance, power, Spearman-Brown |
 | `scripts/register_tranche.py`, `scripts/promote_result.py`, `src/fmharness/schema/` | provenance machinery |
