@@ -242,6 +242,170 @@ def test_build_leaves_untestable_genes_null(tmp_path: Path) -> None:
     assert de.dropna(subset=["lfc0", "lfc1"])["gene_name"].nunique() == 299, "G7 drops out"
 
 
+def _first_group_plates(path: Path) -> set[str]:
+    """Which plates the build's own ``hash(plate) % 2`` puts in the first group.
+
+    Read off DuckDB rather than reimplemented: Python's ``hash`` is salted per process and is
+    not DuckDB's hash, so a test that computed the split itself would be testing a different
+    split from the one the measurement uses.
+    """
+    import duckdb
+
+    rows = (
+        duckdb.connect()
+        .execute(
+            "SELECT DISTINCT plate FROM read_parquet(?) WHERE hash(plate) % 2 = 0", [str(path)]
+        )
+        .df()["plate"]
+    )
+    return {str(p) for p in rows}
+
+
+def _scored(path: Path, tmp: Path, min_genes: int = 50):
+    """Build, drop unpaired rows, and score both gene sets on the real code path.
+
+    Returns ``(r_all, r_resp, piv0, piv1, mask)`` -- what every selection control needs, from
+    the shipped functions rather than a reimplementation of them.
+    """
+    de, _ = dr.build_split_half_frame([str(path)], None, None, tmp / "duck", "2GB")
+    de = de.dropna(subset=["lfc0", "lfc1"])
+    panel = set(de["gene_name"].unique())
+    r_all, piv0, piv1 = dr.score_split_half(de, panel, min_genes=min_genes)
+    mask = dr.responder_mask(dr.padj_pivot(de, panel).reindex(columns=piv0.columns).loc[piv0.index])
+    r_resp, _, _ = dr.score_split_half(de, panel, min_genes=min_genes, select=mask)
+    return r_all, r_resp, piv0, piv1, mask
+
+
+@pytest.mark.step_select
+def test_selection_recovers_the_planted_responder_set(tmp_path: Path) -> None:
+    """Positive control for select: responders planted in a known gene subset, with padj
+    planted to match, come back as exactly that subset -- read from the first group alone."""
+    path = _write_fixture_pool(tmp_path, n_genes=300, n_responders=80)
+    _, _, piv0, _, mask = _scored(path, tmp_path)
+    responders = {f"G{k}" for k in range(80)}
+    for row in range(mask.shape[0]):
+        got = {str(g) for g, keep in zip(piv0.columns, mask[row], strict=True) if keep}
+        assert got == responders, f"row {row} selected {len(got)} genes, planted 80"
+
+
+@pytest.mark.step_select
+def test_responder_reliability_exceeds_all_gene_reliability_on_a_planted_pool(
+    tmp_path: Path,
+) -> None:
+    """The responders carry the response; the rest carry noise around zero. Scoring only the
+    responders must therefore read higher than scoring everything, on a pool where that is
+    true by construction."""
+    # Responders get a real per-condition signal; non-responders get none (signal_sd applies to
+    # all genes, so plant the difference through padj AND through the signal by zeroing it).
+    path = _write_fixture_pool(tmp_path, n_genes=300, n_responders=80, seed=3)
+    df = pd.read_parquet(path)
+    non = df["gene_name"].isin([f"G{k}" for k in range(80, 300)])
+    rng = np.random.default_rng(11)
+    n_non = int(non.to_numpy().sum())
+    df.loc[non, "log2FoldChange"] = rng.normal(0.0, 1.0, n_non)
+    df.to_parquet(path, index=False)
+
+    r_all, r_resp, _, _, _ = _scored(path, tmp_path)
+    mean_all = float(np.nanmean(r_all))
+    mean_resp = float(np.nanmean(r_resp))
+    assert mean_resp > mean_all + 0.05, (
+        f"responder r {mean_resp:.3f} must clear all-gene r {mean_all:.3f} on a pool where only "
+        "the responders carry reproducible signal"
+    )
+
+
+@pytest.mark.step_select
+def test_selection_admits_no_more_than_the_nominal_rate_on_signal_free_data(
+    tmp_path: Path,
+) -> None:
+    """Negative control for select, and the known answer for the rule's own multiplicity.
+
+    The rule is "significant in AT LEAST ONE of the first group's rows", so under the null a
+    gene is admitted when the smallest of its k adjusted p-values falls below alpha:
+
+        P(selected | no signal) = 1 - (1 - alpha) ** k
+
+    not alpha. With four first-group plates that is 0.185, not 0.05. This is a property of the
+    declared rule rather than a defect -- and it does not bias the responder reliability, since
+    the mismatched-pair nulls apply the same rule to the same first group. What it does mean is
+    that the responder set under the null is a fifth of the genes rather than a twentieth, so
+    the responder statistic is diluted toward the all-gene one rather than inflated away from
+    it. Pinned here so the day someone changes the aggregate, the rate moves and this fails.
+    """
+    path = _write_fixture_pool(
+        tmp_path, n_genes=2000, signal_sd=0.0, noise_sd=1.0, n_responders=None, seed=5
+    )
+    n_first_group_rows = len(_first_group_plates(path))  # one dose in this fixture
+    expected = 1.0 - (1.0 - 0.05) ** n_first_group_rows
+    _, r_resp, _, _, mask = _scored(path, tmp_path, min_genes=10)
+    rate = float(mask.mean())
+    # 2000 genes x 12 conditions; four binomial standard deviations at this rate is under 0.02.
+    assert rate == pytest.approx(expected, abs=0.02), (
+        f"selected {rate:.3f} of genes; the at-least-one-row rule over {n_first_group_rows} "
+        f"first-group rows predicts {expected:.3f}"
+    )
+    assert abs(float(np.nanmean(r_resp))) < 0.15, "signal-free responder r must sit near zero"
+
+
+@pytest.mark.step_select
+def test_pooled_selection_inflates_a_signal_free_correlation(tmp_path: Path) -> None:
+    """The leakage check the one-sided rule exists to prevent, on data with no signal at all.
+
+    The inflating variant is selection on the POOLED data -- the natural mistake of calling
+    differential expression on every plate at once and then correlating the halves over those
+    genes. Write the two halves as ``a`` and ``b``; their sum and difference are independent.
+    Selecting on a large ``|a + b|`` inflates the variance of the sum while leaving the
+    difference alone, and since ``cov(a, b) = (var(a + b) - var(a - b)) / 4``, the covariance
+    within the selected genes is positive even when nothing generated it. That is the whole of
+    the winner's curse here, and it is why the design forbids the pooled and two-sided variants
+    rather than treating them as a defensible alternative.
+
+    Selecting on each half's magnitude SEPARATELY is not the same thing and does not inflate:
+    truncating ``|a|`` and ``|b|`` independently leaves their signs independent. The distinction
+    matters, so the test states which variant it is demonstrating.
+    """
+    path = _write_fixture_pool(
+        tmp_path, n_genes=2000, signal_sd=0.0, noise_sd=1.0, n_responders=None, seed=7
+    )
+    de, _ = dr.build_split_half_frame([str(path)], None, None, tmp_path / "duck", "2GB")
+    de = de.dropna(subset=["lfc0", "lfc1"])
+    panel = set(de["gene_name"].unique())
+    _, piv0, piv1 = dr.score_split_half(de, panel, min_genes=10)
+    padj = dr.padj_pivot(de, panel).reindex(columns=piv0.columns).loc[piv0.index]
+    one_sided = dr.responder_mask(padj)
+
+    # The forbidden variant, written HERE and never in the shipped code, at the same gene count
+    # as the one-sided rule admits, so the comparison is of selection rules and not of set size.
+    a, b = piv0.to_numpy(dtype=float), piv1.to_numpy(dtype=float)
+    k = max(int(one_sided.sum(axis=1).mean()), 10)
+    pooled = np.zeros_like(one_sided)
+    strength = np.abs(a + b)
+    for row in range(strength.shape[0]):
+        pooled[row, np.argsort(-strength[row])[:k]] = True
+
+    r_one = float(np.nanmean(dr.masked_rowwise_pearson(a, b, 10, select=one_sided)))
+    r_pooled = float(np.nanmean(dr.masked_rowwise_pearson(a, b, 10, select=pooled)))
+    assert r_pooled > r_one + 0.2, (
+        f"pooled selection read {r_pooled:.3f} against one-sided {r_one:.3f} on signal-free "
+        "data; the gap is the winner's curse the one-sided rule avoids"
+    )
+    assert abs(r_one) < 0.1, f"the shipped one-sided rule must stay near zero, read {r_one:.3f}"
+
+
+@pytest.mark.step_select
+def test_select_none_reproduces_the_unselected_scorer_exactly(tmp_path: Path) -> None:
+    """The selection keyword must be inert when absent -- otherwise the all-gene reliability
+    silently changes meaning the day the responder statistic arrives."""
+    path = _write_fixture_pool(tmp_path)
+    de, _ = dr.build_split_half_frame([str(path)], None, None, tmp_path / "duck", "2GB")
+    de = de.dropna(subset=["lfc0", "lfc1"])
+    panel = set(de["gene_name"].unique())
+    r_a, piv0, piv1 = dr.score_split_half(de, panel)
+    a, b = piv0.to_numpy(dtype=float), piv1.to_numpy(dtype=float)
+    r_b = dr.masked_rowwise_pearson(a, b, 50, select=np.ones(a.shape, dtype=bool))
+    np.testing.assert_allclose(r_a, r_b, equal_nan=True)
+
+
 def test_score_positive_planted_reliability_is_recovered(tmp_path: Path) -> None:
     # signal_sd = noise_sd = 1, 8 plates -> 4 per half; half-mean noise sd^2 = 1/4.
     # Expected r = 1 / (1 + 0.25) = 0.8.

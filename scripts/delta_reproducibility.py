@@ -119,13 +119,24 @@ def build_split_half_frame(
     return de, chosen
 
 
-def masked_rowwise_pearson(a: np.ndarray, b: np.ndarray, min_genes: int) -> np.ndarray:
+def masked_rowwise_pearson(
+    a: np.ndarray, b: np.ndarray, min_genes: int, *, select: np.ndarray | None = None
+) -> np.ndarray:
     """Pearson r per row between ``a`` and ``b``, over entries finite in both.
 
     Vectorized across rows; rows with fewer than ``min_genes`` shared finite entries or
     zero variance come back NaN.
+
+    ``select`` is an optional boolean array of the same shape restricting each row to its own
+    subset of columns -- rung 0's responder gene set. A false entry is treated exactly as a
+    non-finite one, so every moment below (the count, both means, the covariance and both
+    variances) is taken over the selected genes alone. Centring after masking is the part that
+    matters: subtracting a mean computed over all genes would leave the selected columns
+    off-centre and the correlation would not be the correlation of what was scored.
     """
     ok = np.isfinite(a) & np.isfinite(b)
+    if select is not None:
+        ok &= select
     n = ok.sum(axis=1)
     a0 = np.where(ok, a, 0.0)
     b0 = np.where(ok, b, 0.0)
@@ -143,9 +154,18 @@ def masked_rowwise_pearson(a: np.ndarray, b: np.ndarray, min_genes: int) -> np.n
 
 
 def score_split_half(
-    de: pd.DataFrame, panel: set[str], min_genes: int = 50
+    de: pd.DataFrame,
+    panel: set[str],
+    min_genes: int = 50,
+    *,
+    select: np.ndarray | None = None,
 ) -> tuple[np.ndarray, pd.DataFrame, pd.DataFrame]:
-    """Per-(line, drug) split-half Pearson over the panel genes, plus the half pivots."""
+    """Per-(line, drug) split-half Pearson over the panel genes, plus the half pivots.
+
+    ``select`` restricts each condition to its own responder genes; it must be aligned to the
+    pivots this function returns, which is what ``padj_pivot`` exists to guarantee. Passing
+    ``None`` reproduces the unselected statistic exactly.
+    """
     d = de[de["gene_name"].isin(panel)]
     piv0 = d.pivot_table(index=["patient", "drug"], columns="gene_name", values="lfc0")
     piv1 = d.pivot_table(index=["patient", "drug"], columns="gene_name", values="lfc1")
@@ -156,8 +176,35 @@ def score_split_half(
     # otherwise silently correlate misaligned genes whenever the column COUNTS happen to match.
     cols = piv0.columns.intersection(piv1.columns)
     piv0, piv1 = piv0[cols], piv1[cols]
-    r = masked_rowwise_pearson(piv0.to_numpy(dtype=float), piv1.to_numpy(dtype=float), min_genes)
+    r = masked_rowwise_pearson(
+        piv0.to_numpy(dtype=float), piv1.to_numpy(dtype=float), min_genes, select=select
+    )
     return r, piv0, piv1
+
+
+def padj_pivot(de: pd.DataFrame, panel: set[str]) -> pd.DataFrame:
+    """The first group's adjusted p-values, pivoted to the shape ``score_split_half`` returns.
+
+    A separate function rather than a fourth return value so the three-tuple signature every
+    existing caller unpacks -- including ``scripts/permutation_null.py`` -- keeps working. The
+    caller reindexes it onto the scored pivots' rows and columns, which is the alignment step
+    that guarantees a mask entry refers to the gene it appears to refer to.
+    """
+    d = de[de["gene_name"].isin(panel)]
+    return d.pivot_table(index=["patient", "drug"], columns="gene_name", values="padj0")
+
+
+def responder_mask(piv_padj0: pd.DataFrame, alpha: float = 0.05) -> np.ndarray:
+    """True where the FIRST plate group called that gene differentially expressed.
+
+    One-sided by construction: the only input is ``padj0``, which the build aggregates over the
+    first group's rows alone. There is deliberately no parameter here that could admit the
+    second group -- a gene chosen using the half it is then scored against is chosen partly for
+    noise that agreed by chance, and the correlation reports that agreement as reproducibility.
+    A null adjusted p-value (a gene DESeq2 could not test) is not a responder.
+    """
+    v = piv_padj0.to_numpy(dtype=float)
+    return np.isfinite(v) & (v < alpha)
 
 
 def per_pair_table(piv0: pd.DataFrame, piv1: pd.DataFrame, r: np.ndarray) -> pd.DataFrame:
