@@ -119,6 +119,88 @@ def build_split_half_frame(
     return de, chosen
 
 
+def build_noise_frame(
+    paths: list[str],
+    target_names: list[str] | None,
+    repl_col: str | None,
+    tmp: Path,
+    memory_limit: str = "36GB",
+) -> pd.DataFrame:
+    """Per (line, drug, dose, gene) with at least two plates: the ingredients of the noise split.
+
+    ``lfcSE`` is the standard error of ONE plate's treated-versus-control contrast -- cell
+    sampling at that row's cell counts. It cannot see plate-to-plate variation, which is the
+    noise a model trained on other material actually meets and the noise the split-half
+    measures. Under plate offsets plus independent sampling error, the sample variance of
+    ``log2FoldChange`` across a condition's plates has expectation ``sigma2_plate +
+    mean(lfcSE^2)`` -- exactly, for any set of per-plate standard errors -- so those two
+    quantities are what this returns and ``decompose_noise`` subtracts.
+
+    **Dose is a grouping key here, not pooled.** The reliabilities pool over dose because a
+    condition means "this drug at this screen's dose design"; this aggregation cannot, because a
+    dose effect pooled into the across-plate variance would be reported as plate noise, and the
+    claim the decomposition exists to make would be wrong.
+    """
+    con = _connect(tmp, memory_limit)
+    cols = list(
+        con.execute("DESCRIBE SELECT * FROM read_parquet(?) LIMIT 0", [paths]).df()["column_name"]
+    )
+    candidates = ([repl_col] if repl_col else []) + list(REPL_CANDIDATES)
+    repl = next((c for c in candidates if c in cols), None)
+    if repl is None:
+        raise SystemExit(f"no replicate column in {cols}; pass --replicate-col")
+    if "lfcSE" not in cols:
+        raise SystemExit("the pool carries no lfcSE column; the noise decomposition needs it")
+    dose = next((c for c in DOSE_CANDIDATES if c in cols), None)
+    if dose is None:
+        print(
+            "WARNING: no dose column in the pool. Grouping by (line, drug, gene) only, so a dose "
+            "effect would be charged to plate noise -- the decomposition is not interpretable."
+        )
+    dose_sel = f"{dose} AS dose," if dose else "CAST(NULL AS DOUBLE) AS dose,"
+    dose_grp = f", {dose}" if dose else ""
+    base = "avg(baseMean)" if "baseMean" in cols else "CAST(NULL AS DOUBLE)"
+    where, drug_params = _drug_predicate(target_names)
+    return con.execute(
+        f"""SELECT Cell_ID_DepMap AS patient, drug, {dose_sel} gene_name,
+                   var_samp(log2FoldChange) AS var_lfc,
+                   avg(lfcSE * lfcSE) AS mean_se2,
+                   count(DISTINCT {repl}) AS n_plates,
+                   {base} AS base_mean,
+                   avg(log2FoldChange) AS mean_lfc
+            FROM read_parquet(?)
+            WHERE {repl} IS NOT NULL{where}
+            GROUP BY Cell_ID_DepMap, drug{dose_grp}, gene_name
+            HAVING count(DISTINCT {repl}) >= 2""",
+        [paths, *drug_params],
+    ).df()
+
+
+def decompose_noise(noise: pd.DataFrame) -> pd.DataFrame:
+    """Split each delta's variance into its between-plate and within-plate parts.
+
+        sigma2_plate = var_samp(log2FoldChange across plates) - mean(lfcSE^2), floored at zero
+
+    The floor is what makes the result a variance rather than a difference: the estimator is
+    unbiased, so on data with no plate effect it lands either side of zero and half its values
+    would be negative unaided.
+
+    ``between_plate_fraction`` is ``sigma2_plate / var_lfc`` -- the share of a delta's
+    replicate variance that plate effects account for. Null where ``var_lfc`` is zero or
+    missing, rather than an arbitrary zero or one, since a delta with no variance at all has no
+    share to report.
+    """
+    out = noise.copy()
+    var = out["var_lfc"].to_numpy(dtype=float)
+    se2 = out["mean_se2"].to_numpy(dtype=float)
+    sigma2 = np.maximum(var - se2, 0.0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        frac = np.where(var > 0, sigma2 / var, np.nan)
+    out["sigma2_plate"] = sigma2
+    out["between_plate_fraction"] = frac
+    return out
+
+
 def masked_rowwise_pearson(
     a: np.ndarray, b: np.ndarray, min_genes: int, *, select: np.ndarray | None = None
 ) -> np.ndarray:

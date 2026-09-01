@@ -406,6 +406,104 @@ def test_select_none_reproduces_the_unselected_scorer_exactly(tmp_path: Path) ->
     np.testing.assert_allclose(r_a, r_b, equal_nan=True)
 
 
+def _decomposed(path: Path, tmp: Path) -> pd.DataFrame:
+    """The noise decomposition off the real code path."""
+    noise = dr.build_noise_frame([str(path)], None, None, tmp / "duck", "2GB")
+    return dr.decompose_noise(noise)
+
+
+@pytest.mark.step_decompose
+def test_decompose_recovers_a_planted_plate_variance(tmp_path: Path) -> None:
+    """Positive control for decompose.
+
+    Plate offsets of known variance are planted on top of sampling noise of known lfcSE. The
+    sample variance of log2FoldChange across plates has expectation sigma2_plate + mean(lfcSE^2)
+    exactly -- for any set of per-plate standard errors, not only equal ones -- so subtracting
+    the mean squared standard error must return the planted plate variance.
+    """
+    plate_sd, noise_sd = 0.6, 0.4
+    path = _write_fixture_pool(
+        tmp_path,
+        n_genes=400,
+        signal_sd=0.0,
+        noise_sd=noise_sd,
+        plate_offset_sd=plate_sd,
+        plates=tuple(f"P{i}" for i in range(24)),
+        seed=13,
+    )
+    d = _decomposed(path, tmp_path)
+    got = float(np.mean(d["sigma2_plate"].to_numpy(dtype=float)))
+    # The planted offsets are one draw of 24 values at sd 0.6, so the realised variance is not
+    # exactly 0.36; compare against what was actually drawn, recovered from the pool itself.
+    raw = pd.read_parquet(path)
+    codes, _ = pd.factorize(raw["plate"])
+    lfc = raw["log2FoldChange"].to_numpy(dtype=float)
+    plate_means = np.bincount(codes, weights=lfc) / np.bincount(codes)
+    realised = float(np.var(plate_means, ddof=1))
+    assert got == pytest.approx(realised, abs=0.05), (
+        f"recovered plate variance {got:.3f} against the realised planted {realised:.3f}"
+    )
+    frac = float(np.nanmean(d["between_plate_fraction"].to_numpy(dtype=float)))
+    expected_frac = realised / (realised + noise_sd**2)
+    assert frac == pytest.approx(expected_frac, abs=0.06), (
+        f"between-plate fraction {frac:.3f} against planted {expected_frac:.3f}"
+    )
+
+
+@pytest.mark.step_decompose
+def test_decompose_floors_at_zero_without_going_negative(tmp_path: Path) -> None:
+    """Negative control for decompose: plates differing only by the planted sampling noise
+    carry no plate effect. The estimator is a difference of two noisy quantities, so it would
+    go negative about half the time unaided; the floor is what makes it a variance, and this
+    test is what keeps the floor from being quietly removed."""
+    path = _write_fixture_pool(
+        tmp_path,
+        n_genes=400,
+        signal_sd=0.0,
+        noise_sd=0.5,
+        plate_offset_sd=0.0,
+        plates=tuple(f"P{i}" for i in range(24)),
+        seed=17,
+    )
+    d = _decomposed(path, tmp_path)
+    sigma2 = d["sigma2_plate"].to_numpy(dtype=float)
+    assert (sigma2 >= 0).all(), "the plate component is a variance and cannot be negative"
+    assert float(np.mean(sigma2)) < 0.03, (
+        f"no plate effect was planted; recovered {float(np.mean(sigma2)):.4f}"
+    )
+
+
+@pytest.mark.step_decompose
+def test_decompose_does_not_charge_a_dose_effect_to_plate_noise(tmp_path: Path) -> None:
+    """Dose is a grouping key, not pooled. If the decomposition pooled over dose, a screen
+    where each dose has a different mean response would report that dose effect as plate
+    noise -- and the design's claim about what the ceiling is made of would be wrong."""
+    path = _write_fixture_pool(
+        tmp_path,
+        n_genes=400,
+        signal_sd=0.0,
+        noise_sd=0.0,  # plates within a dose are identical
+        plate_offset_sd=0.0,
+        doses=(0.01, 0.1, 1.0),
+        plates=("P1", "P2", "P3", "P4"),
+        se=0.0,
+        seed=19,
+    )
+    df = pd.read_parquet(path)
+    # A large, dose-specific shift shared by every plate at that dose. Vectorized through a
+    # lookup on the sorted dose levels rather than a dict map, which pandas-stubs types as a
+    # callable-only parameter.
+    dose_levels = np.array([0.01, 0.1, 1.0])
+    shift = np.array([-2.0, 0.0, 2.0])
+    idx = np.searchsorted(dose_levels, df["concentration"].to_numpy(dtype=float))
+    df["log2FoldChange"] = df["log2FoldChange"].to_numpy(dtype=float) + shift[idx]
+    df.to_parquet(path, index=False)
+
+    d = _decomposed(path, tmp_path)
+    worst = float(np.max(d["sigma2_plate"].to_numpy(dtype=float)))
+    assert worst < 1e-9, f"a dose effect must not appear as plate variance; recovered {worst:.4f}"
+
+
 def test_score_positive_planted_reliability_is_recovered(tmp_path: Path) -> None:
     # signal_sd = noise_sd = 1, 8 plates -> 4 per half; half-mean noise sd^2 = 1/4.
     # Expected r = 1 / (1 + 0.25) = 0.8.
