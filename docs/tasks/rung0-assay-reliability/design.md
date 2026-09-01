@@ -66,9 +66,10 @@ response size.
 - *Responder Genes* in addition to having a finite value in each group, the first group also called it differentially expressed (padj < .05). A condition is scored when at least 50
   genes qualify. 
 - *Drugs.* Every drug for which a condition has at least two distinct plates, so a split exists.
-- *Cell lines.* All fifty keys in the table, including the one whose DepMap identifier is
-  missing and appears as the literal string `NA` — it is a real line's data and carries a
-  consistent key throughout.
+- *Cell lines.* Every key in the table, including the one whose DepMap identifier is missing
+  and appears as the literal string `NA` — it is a real line's data and carries a consistent key
+  throughout. Measured, not asserted: 45 keys (this clause read "all fifty" until the screen was
+  counted; see `decisions.md`, 2026-09-01).
 - *Doses.* Pooled: the averaging within each plate group runs over the screen's three doses, so
   a condition means "this drug, at this screen's dose design". A dose-resolved reliability is a
   different quantity and out of scope.

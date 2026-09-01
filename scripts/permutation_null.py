@@ -419,7 +419,15 @@ def stratified_permutation_null(
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--local-dir", required=True, help="dir with the Tahoe DE parquet (on scratch)")
-    ap.add_argument("--drugs-cid-file", default="data/static/tahoe_target_cids.txt")
+    ap.add_argument(
+        "--drugs-cid-file",
+        default="",
+        help="optional PubChem CID list. Empty by default: this check validates the reliability "
+        "computed at the assay's FULL extent, so it must score the same pool. The superseded "
+        "32-compound list still sits untracked in the Alpine checkout, and a default pointing "
+        "at it would have silently validated 33 drugs' dependence against a number computed "
+        "over every drug.",
+    )
     ap.add_argument(
         "--drug-names-file",
         default=None,
@@ -428,6 +436,13 @@ def main() -> None:
     )
     ap.add_argument(
         "--panel-file", default=None, help="one gene per line; same panel the ceiling was scored on"
+    )
+    ap.add_argument(
+        "--frame-cache",
+        default=None,
+        help="directory holding the built split-half frame, keyed by a hash of its inputs -- the "
+        "same cache scripts/delta_reproducibility.py writes. Without it this job repeats that "
+        "job's full scan of every shard, once per gene set.",
     )
     ap.add_argument("--replicate-col", default=None, help="plate/replicate column (auto-detected)")
     ap.add_argument("--min-genes", type=int, default=50, help="min shared genes to score a pair")
@@ -458,9 +473,7 @@ def main() -> None:
     out_dir = Path(args.out_dir) if Path(args.out_dir).is_absolute() else repo / args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    de, repl = dr.build_split_half_frame(
-        paths, names, args.replicate_col, local.parent / "duckdb_tmp"
-    )
+    de, repl = dr._build_or_load_frame(paths, names, args, local)
     de = de.dropna(subset=["lfc0", "lfc1"])
     if de.empty:
         raise SystemExit("no (line, drug, gene) had both plate halves -- too few plates per pair?")
@@ -530,6 +543,31 @@ def main() -> None:
     pd.DataFrame({"perm_mean": strat_perm_means["diff_drug"]}).to_csv(
         out_dir / f"rung0_permutation_perm_means_diff_drug{suffix}.csv", index=False
     )
+
+    # The design declares this figure so the design effect is SEEN rather than asserted -- the
+    # permutation null's spread against the independent-pool spread the bootstrap assumed. It is
+    # drawn here because this is the only job that has the permutation draws.
+    draws_path = out_dir / "rung0_null_draws.csv"
+    reliability_path = out_dir / "rung0_reliability.csv"
+    if draws_path.exists() and reliability_path.exists():
+        from fmharness import figures as fg
+
+        fig_dir = out_dir / "figures"
+        fig_dir.mkdir(parents=True, exist_ok=True)
+        rel = pd.read_csv(reliability_path).iloc[0].to_dict()
+        fg.fig_permutation_vs_bootstrap(
+            pd.DataFrame({"perm_mean": perm_means}),
+            pd.read_csv(draws_path),
+            {**rel, **summary_row},
+            fig_dir / f"10_permutation_vs_bootstrap{suffix}.png",
+        )
+        print(f"wrote {fig_dir}/10_permutation_vs_bootstrap{suffix}.png")
+    else:
+        print(
+            "skipping the design-effect figure: it is drawn from rung0_null_draws.csv and "
+            "rung0_reliability.csv, which this job did not produce -- run "
+            "scripts/delta_reproducibility.py into the same --out-dir first"
+        )
 
     print("\n=== permutation-based exact permutation null (rung 0, final verification step) ===")
     for k, v in summary_row.items():

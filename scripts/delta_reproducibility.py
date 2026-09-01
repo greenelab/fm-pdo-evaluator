@@ -140,6 +140,13 @@ def build_split_half_frame(
 
     ``target_names`` of ``None`` or empty admits every drug in the pool.
 
+    Only (line, drug, gene) groups with a fold change in BOTH halves are returned. That is
+    exactly what every caller's ``dropna(subset=["lfc0", "lfc1"])`` does next, moved into the
+    engine because it is not a small filter here: DESeq2 could not test 59 percent of this
+    screen's rows (``baseMean`` zero, so a null fold change), and doing the drop in pandas means
+    materialising 1.42 billion rows to keep a fraction of them. The semantics are unchanged --
+    a group kept by one is kept by the other.
+
     The frame also carries ``padj0``: the MINIMUM Benjamini-Hochberg adjusted p-value over the
     FIRST group's (plate, dose) rows. The minimum is what the selection rule asks for -- a gene
     is a responder when the first group called it differentially expressed in at least one of
@@ -182,7 +189,9 @@ def build_split_half_frame(
                    {padj1} AS padj1
             FROM read_parquet(?)
             WHERE {chosen} IS NOT NULL{where}
-            GROUP BY Cell_ID_DepMap, drug, gene_name""",
+            GROUP BY Cell_ID_DepMap, drug, gene_name
+            HAVING count(log2FoldChange) FILTER (WHERE hash({chosen}) % 2 = 0) > 0
+               AND count(log2FoldChange) FILTER (WHERE hash({chosen}) % 2 = 1) > 0""",
         [paths, *drug_params],
     )
     return _compact_df(de), chosen

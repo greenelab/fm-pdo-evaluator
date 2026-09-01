@@ -56,6 +56,7 @@ for GENE_SET in all responder; do
     echo "=== permutation null, gene set: $GENE_SET ==="
     python scripts/permutation_null.py \
         --local-dir "/scratch/alpine/$USER/tahoe_pseudobulk_de" \
+        --frame-cache "/scratch/alpine/$USER/rung0_frame_cache" \
         --gene-set "$GENE_SET" \
         --out-dir "$OUT_DIR"
 done

@@ -236,10 +236,16 @@ def test_build_leaves_untestable_genes_null(tmp_path: Path) -> None:
     df.to_parquet(path, index=False)
 
     de, _ = dr.build_split_half_frame([str(path)], None, None, tmp_path / "duck", "2GB")
-    row = de[(de["patient"] == "L0") & (de["drug"] == "D0") & (de["gene_name"] == "G7")]
-    assert len(row) == 1
-    assert pd.isna(row["padj0"].iloc[0]), "an untestable gene carries no adjusted p-value"
-    assert de.dropna(subset=["lfc0", "lfc1"])["gene_name"].nunique() == 299, "G7 drops out"
+    # The build now applies the both-halves-present rule in SQL rather than leaving it to the
+    # caller's dropna, because at full extent that filter removes most of 1.42 billion rows and
+    # doing it in pandas means materialising them first. The observable property is unchanged
+    # and is what this asserts: an untestable gene is scored by nothing, and it is absent for
+    # the finiteness reason rather than by any rule naming baseMean or padj.
+    assert de[de["gene_name"] == "G7"].empty, "an untestable gene must reach no statistic"
+    assert de["gene_name"].nunique() == 299, "every other gene survives"
+    assert de.dropna(subset=["lfc0", "lfc1"])["gene_name"].nunique() == 299, (
+        "the caller's dropna must now be a no-op: the engine already applied it"
+    )
 
 
 def _first_group_plates(path: Path) -> set[str]:
