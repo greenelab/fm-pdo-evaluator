@@ -206,7 +206,8 @@ def _noise_select(repl: str, dose: str | None, base: str) -> tuple[str, str]:
                    avg(lfcSE * lfcSE) AS mean_se2,
                    count(DISTINCT {repl}) AS n_plates,
                    {base} AS base_mean,
-                   avg(log2FoldChange) AS mean_lfc"""
+                   avg(log2FoldChange) AS mean_lfc,
+                   min(padj) FILTER (WHERE hash({repl}) % 2 = 0) AS padj0"""
     grp = (
         f"GROUP BY Cell_ID_DepMap, drug{dose_grp}, gene_name\n"
         f"            HAVING count(DISTINCT {repl}) >= 2"
@@ -293,6 +294,70 @@ def noise_aggregate(
         [paths, *drug_params],
     ).df()
     return overall, strata
+
+
+def noise_by_condition(
+    paths: list[str],
+    target_names: list[str] | None,
+    repl_col: str | None,
+    tmp: Path,
+    memory_limit: str = "36GB",
+    alpha: float = 0.05,
+) -> pd.DataFrame:
+    """Per (line, drug), the noise in that condition -- and the same split by responder status.
+
+    Two of the design's four hypotheses are about noise per condition rather than noise overall:
+    that noise is higher where the correlations are lower, and that it is higher in the
+    responder genes than across all genes. Neither can be answered from a single screen-wide
+    mean, so this returns the per-condition aggregate a reader can join to the per-condition
+    correlations, with the responder split computed alongside from the same first-half adjusted
+    p-value the selection rule uses.
+
+    Aggregated in the engine for the same reason the overall figures are: the rows underneath
+    are on the order of a billion.
+    """
+    con = _connect(tmp, memory_limit)
+    cols = list(
+        con.execute("DESCRIBE SELECT * FROM read_parquet(?) LIMIT 0", [paths]).df()["column_name"]
+    )
+    candidates = ([repl_col] if repl_col else []) + list(REPL_CANDIDATES)
+    repl = next((c for c in candidates if c in cols), None)
+    if repl is None:
+        raise SystemExit(f"no replicate column in {cols}; pass --replicate-col")
+    dose = next((c for c in DOSE_CANDIDATES if c in cols), None)
+    base = "avg(baseMean)" if "baseMean" in cols else "CAST(NULL AS DOUBLE)"
+    sel, grp = _noise_select(repl, dose, base)
+    where, drug_params = _drug_predicate(target_names)
+    return _compact_df(
+        con.execute(
+            f"""
+            WITH g AS ({sel}
+                FROM read_parquet(?)
+                WHERE {repl} IS NOT NULL{where}
+                {grp}),
+            d AS (SELECT *,
+                         greatest(var_lfc - mean_se2, 0.0) AS sigma2_plate,
+                         CASE WHEN var_lfc > 0
+                              THEN greatest(var_lfc - mean_se2, 0.0) / var_lfc END
+                           AS between_plate_fraction,
+                         (padj0 IS NOT NULL AND padj0 < {alpha}) AS is_responder
+                  FROM d_src)
+            SELECT patient, drug,
+                   count(*) AS n_gene_doses,
+                   avg(between_plate_fraction) AS between_plate_fraction_mean,
+                   avg(var_lfc) AS var_lfc_mean,
+                   avg(sigma2_plate) AS sigma2_plate_mean,
+                   avg(mean_se2) AS mean_se2_mean,
+                   avg(var_lfc) FILTER (WHERE is_responder) AS var_lfc_mean_responders,
+                   avg(var_lfc) FILTER (WHERE NOT is_responder) AS var_lfc_mean_nonresponders,
+                   avg(between_plate_fraction) FILTER (WHERE is_responder)
+                     AS between_plate_fraction_mean_responders,
+                   count(*) FILTER (WHERE is_responder) AS n_responder_gene_doses
+            FROM d WHERE between_plate_fraction IS NOT NULL
+            GROUP BY patient, drug ORDER BY patient, drug""".replace("d_src", "g"),
+            [paths, *drug_params],
+        )
+    )
 
 
 def build_noise_frame(
@@ -1348,6 +1413,20 @@ def main() -> None:
         noise_summary = {k: float(v) for k, v in overall.iloc[0].items()}
         _write_params_sidecar(noise_path, args, extra=noise_summary)
         strata.round(5).to_csv(out_dir / "rung0_noise_strata.csv", index=False)
+
+        # Per condition, so the two hypotheses about noise PER CONDITION can be answered:
+        # that noise is higher where the correlations are lower, and that it is higher in the
+        # responder genes than across all genes. Neither follows from a screen-wide mean.
+        by_condition = noise_by_condition(
+            paths,
+            names,
+            args.replicate_col,
+            local.parent / "duckdb_tmp",
+            args.duckdb_memory,
+            alpha=args.padj_threshold,
+        )
+        by_condition.round(6).to_csv(out_dir / "rung0_noise_by_condition.csv", index=False)
+        print(f"per-condition noise: {len(by_condition):,} conditions")
 
         noise = decompose_noise(
             build_noise_frame(

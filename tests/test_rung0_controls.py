@@ -1082,6 +1082,7 @@ def test_main_writes_every_declared_artifact_on_a_synthetic_pool(
         "rung0_noise_decomposition.params.json",
         "rung0_noise_per_gene.csv.gz",
         "rung0_noise_strata.csv",
+        "rung0_noise_by_condition.csv",
         "rung0_control_per_pair.csv",
         "rung0_control_noise.csv.gz",
         "audit_checksums.json",
