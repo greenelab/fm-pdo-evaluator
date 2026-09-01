@@ -1068,6 +1068,7 @@ def test_main_writes_every_declared_artifact_on_a_synthetic_pool(
         "rung0_effect_terciles.csv",
         "rung0_mde_curve.csv",
         "rung0_leakage_control.csv",
+        "rung0_responder_overlap.csv",
         "rung0_per_gene_reliability.csv",
         "rung0_pool_description.csv",
         "rung0_padj_sample.csv.gz",
@@ -1108,3 +1109,36 @@ def test_main_writes_every_declared_artifact_on_a_synthetic_pool(
     assert expected - {"audit_checksums.json"} <= set(sums)
     name = "rung0_reliability.csv"
     assert sums[name] == hashlib.sha256((out / name).read_bytes()).hexdigest()
+
+
+@pytest.mark.step_select
+def test_responder_mask_cannot_read_the_second_group(tmp_path: Path) -> None:
+    """The invariant the whole responder statistic rests on, asserted directly.
+
+    ``padj1`` is carried in the built frame for one reason -- the overlap diagnostic -- and a
+    future edit that let it reach selection would inflate every responder number without
+    changing a single test's shape. So: flip the second group's adjusted p-values to their
+    complement, leaving the first group's untouched, and require the mask to be identical. If
+    selection ever reads the second group, this fails.
+    """
+    path = _write_fixture_pool(tmp_path, n_genes=300, n_responders=90, seed=53)
+    de, _ = dr.build_split_half_frame([str(path)], None, None, tmp_path / "duck", "2GB")
+    de = de.dropna(subset=["lfc0", "lfc1"])
+    panel = set(de["gene_name"].unique())
+    assert "padj1" in de.columns, "the overlap diagnostic needs the second group's p-values"
+    assert de["padj1"].notna().any(), "and they must actually be populated"
+
+    before = dr.responder_mask(dr.padj_pivot(de, panel))
+    flipped = de.copy()
+    flipped["padj1"] = 1.0 - flipped["padj1"].to_numpy(dtype=float)
+    after = dr.responder_mask(dr.padj_pivot(flipped, panel))
+    np.testing.assert_array_equal(before, after)
+
+    # And the diagnostic that IS allowed to read it does move, so the test above is not passing
+    # merely because padj1 is inert everywhere.
+    o_before = dr.responder_overlap_table(de, panel)["n_second"].to_numpy(dtype=int)
+    o_after = dr.responder_overlap_table(flipped, panel)["n_second"].to_numpy(dtype=int)
+    assert not np.array_equal(o_before, o_after), (
+        "the overlap diagnostic must read padj1, or this test cannot distinguish "
+        "'selection ignores it' from 'nothing reads it'"
+    )

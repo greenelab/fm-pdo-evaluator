@@ -127,14 +127,23 @@ def build_split_half_frame(
     # error, not a null column.
     if "padj" in cols:
         padj = f"min(padj) FILTER (WHERE hash({chosen}) % 2 = 0)"
+        # padj1 is the SECOND group's minimum, and it exists for exactly one purpose: the
+        # overlap diagnostic the design's select step declares, which shows how much the two
+        # groups' responder sets agree. It is never an input to selection -- `responder_mask`
+        # takes only padj0 and has no parameter that could admit this column, and a control
+        # asserts that. Carrying it makes the diagnostic possible; using it for selection would
+        # be the winner's curse the one-sided rule exists to avoid.
+        padj1 = f"min(padj) FILTER (WHERE hash({chosen}) % 2 = 1)"
     else:
         padj = "CAST(NULL AS DOUBLE)"
+        padj1 = "CAST(NULL AS DOUBLE)"
         print("no padj column in the pool: responder selection is unavailable for this run")
     de = con.execute(
         f"""SELECT Cell_ID_DepMap AS patient, drug, gene_name,
                    avg(log2FoldChange) FILTER (WHERE hash({chosen}) % 2 = 0) AS lfc0,
                    avg(log2FoldChange) FILTER (WHERE hash({chosen}) % 2 = 1) AS lfc1,
-                   {padj} AS padj0
+                   {padj} AS padj0,
+                   {padj1} AS padj1
             FROM read_parquet(?)
             WHERE {chosen} IS NOT NULL{where}
             GROUP BY Cell_ID_DepMap, drug, gene_name""",
@@ -298,6 +307,44 @@ def padj_pivot(de: pd.DataFrame, panel: set[str]) -> pd.DataFrame:
     """
     d = de[de["gene_name"].isin(panel)]
     return d.pivot_table(index=["patient", "drug"], columns="gene_name", values="padj0")
+
+
+def responder_overlap_table(de: pd.DataFrame, panel: set[str], alpha: float = 0.05) -> pd.DataFrame:
+    """Per condition, how far the two plate groups agree on which genes responded.
+
+    A DIAGNOSTIC and never an input to selection. It answers a question a reader will
+    reasonably ask -- if the first group's responder call is noisy, what does the second group
+    call? -- and it is exactly the quantity that must not steer the gene set, because keeping
+    the genes both groups called is the pooled selection whose winner's curse the leakage
+    control measures. Reported so the reader can see the agreement rate and judge the one-sided
+    rule, not so the rule can be relaxed.
+
+    Columns: ``patient``, ``drug``, ``n_first``, ``n_second``, ``n_both``, ``jaccard``.
+    """
+    p0 = padj_pivot(de, panel)
+    p1 = de[de["gene_name"].isin(panel)].pivot_table(
+        index=["patient", "drug"], columns="gene_name", values="padj1"
+    )
+    cols = p0.columns.intersection(p1.columns)
+    rows = p0.index.intersection(p1.index)
+    a = p0.loc[rows, cols].to_numpy(dtype=float)
+    b = p1.loc[rows, cols].to_numpy(dtype=float)
+    first = np.isfinite(a) & (a < alpha)
+    second = np.isfinite(b) & (b < alpha)
+    both = first & second
+    union = (first | second).sum(axis=1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        jaccard = np.where(union > 0, both.sum(axis=1) / union, np.nan)
+    return pd.DataFrame(
+        {
+            "patient": rows.get_level_values(0),
+            "drug": rows.get_level_values(1),
+            "n_first": first.sum(axis=1),
+            "n_second": second.sum(axis=1),
+            "n_both": both.sum(axis=1),
+            "jaccard": np.round(jaccard, 4),
+        }
+    )
 
 
 def responder_mask(piv_padj0: pd.DataFrame, alpha: float = 0.05) -> np.ndarray:
@@ -1083,6 +1130,9 @@ def main() -> None:
     mde_curve = mde_curve_table(r_all, r_resp, nulls_all, nulls_resp, seed=args.seed)
     mde_curve.to_csv(out_dir / "rung0_mde_curve.csv", index=False)
 
+    overlap = responder_overlap_table(de, panel, alpha=args.padj_threshold)
+    overlap.to_csv(out_dir / "rung0_responder_overlap.csv", index=False)
+
     leakage = leakage_table(args.min_genes, seed=args.seed)
     leakage.to_csv(out_dir / "rung0_leakage_control.csv", index=False)
     print(f"leakage control: {leakage.to_dict(orient='records')}")
@@ -1151,7 +1201,7 @@ def main() -> None:
 
     fg.fig_build(pool, delta_real, delta_syn, fig_dir / "01_build.png")
     fg.fig_split(pool, per_pair, fig_dir / "02_split.png")
-    fg.fig_select(per_pair, padj_sample, leakage, fig_dir / "03_select.png")
+    fg.fig_select(per_pair, padj_sample, leakage, fig_dir / "03_select.png", overlap=overlap)
     fg.fig_score(
         profiles, profile_index, per_pair, control_per_pair, summary, fig_dir / "04_score.png"
     )
