@@ -845,6 +845,89 @@ def test_per_gene_reliability_separates_reliable_from_noise_genes(tmp_path: Path
     assert mean_signal > mean_noise + 0.3, f"signal {mean_signal:.3f} vs noise {mean_noise:.3f}"
 
 
+@pytest.mark.step_score
+@pytest.mark.parametrize("full_reliability", [0.2, 0.5, 0.8])
+def test_spearman_brown_round_trips_a_planted_full_data_reliability(
+    tmp_path: Path, full_reliability: float
+) -> None:
+    """Positive control for score, and the test that checks the correction rather than
+    assuming it.
+
+    Plant a pool whose FULL-data reliability is R. With per-condition signal variance 1, n
+    plates and per-plate noise variance ``n(1 - R)/R``, the mean over all n plates has
+    reliability R and the mean over n/2 has ``R / (2 - R)`` -- which is exactly what
+    Spearman-Brown inverts. So the split-half correlation must come back at ``R / (2 - R)`` and
+    the corrected value back at R. A correction applied to the wrong quantity, or an off-by-one
+    in the half sizes, breaks the round trip.
+    """
+    n_plates = 16
+    noise_sd = float(np.sqrt(n_plates * (1.0 - full_reliability) / full_reliability))
+    path = _write_fixture_pool(
+        tmp_path,
+        n_genes=1500,
+        signal_sd=1.0,
+        noise_sd=noise_sd,
+        plates=tuple(f"P{i}" for i in range(n_plates)),
+        seed=23,
+    )
+    r_all, _, _, _, _ = _scored(path, tmp_path)
+    observed_half = float(np.nanmean(r_all))
+    expected_half = full_reliability / (2.0 - full_reliability)
+    assert observed_half == pytest.approx(expected_half, abs=0.04), (
+        f"planted full-data R = {full_reliability}; half correlation read {observed_half:.3f}, "
+        f"expected {expected_half:.3f}"
+    )
+    corrected = dr.spearman_brown_or_nan(observed_half)
+    assert corrected == pytest.approx(full_reliability, abs=0.05), (
+        f"the correction returned {corrected:.3f} for a planted R of {full_reliability}"
+    )
+
+
+@pytest.mark.step_score
+def test_zero_signal_returns_null_and_the_correction_leaves_zero_at_zero(tmp_path: Path) -> None:
+    """Negative control for score. A correction that manufactured a ceiling out of nothing
+    would be worse than no correction at all, so the identity 2*0/(1+0) = 0 is asserted on the
+    real function and on a real signal-free pool."""
+    path = _write_fixture_pool(tmp_path, n_genes=600, signal_sd=0.0, noise_sd=1.0, seed=29)
+    r_all, _, _, _, _ = _scored(path, tmp_path)
+    mean = float(np.nanmean(r_all))
+    assert abs(mean) < 0.05, f"signal-free pool read {mean:.3f}"
+    assert dr.spearman_brown_or_nan(0.0) == 0.0
+    assert abs(dr.spearman_brown_or_nan(mean)) < 0.1
+    assert np.isnan(dr.spearman_brown_or_nan(-1.0)), "undefined at r = -1, and guarded"
+
+
+@pytest.mark.step_score
+def test_summary_carries_both_gene_sets_with_their_own_counts_and_mdes() -> None:
+    """The summary row is one row carrying two statistics, each with its own condition count,
+    p-values and minimum detectable effect. Two files would let one be quoted without the
+    other; one row with two prefixed families cannot."""
+    rng = np.random.default_rng(31)
+    r_all = rng.normal(0.14, 0.06, 1600)
+    r_resp = np.concatenate([rng.normal(0.31, 0.10, 900), np.full(700, np.nan)])
+    nulls = {
+        "any_pair": rng.normal(0.03, 0.05, 500),
+        "diff_drug": rng.normal(0.03, 0.05, 500),
+        "same_drug": rng.normal(0.07, 0.05, 500),
+    }
+    even = np.zeros(1600, dtype=bool)
+    even[::4] = True
+    s = {
+        **dr.summarize(r_all, nulls, seed=0, label="all", even_mask=even),
+        **dr.summarize(r_resp, nulls, seed=0, label="responder", even_mask=even),
+    }
+    assert s["all_n_pairs"] == 1600
+    assert s["responder_n_pairs"] == 900, "the responder statistic scores fewer conditions"
+    assert s["all_n_pairs"] != s["responder_n_pairs"]
+    for fam in ("all", "responder"):
+        mean = s[f"{fam}_splithalf_mean_r"]
+        assert s[f"{fam}_spearman_brown_full"] == pytest.approx(2 * mean / (1 + mean), abs=2e-3)
+        assert s[f"{fam}_mde_80_vs_diff_drug"] > 0
+        assert s[f"{fam}_mde_80_vs_same_drug"] > 0
+        assert not np.isnan(s[f"{fam}_spearman_brown_full_even_plates"])
+        assert s[f"{fam}_n_pairs_even"] < s[f"{fam}_n_pairs"]
+
+
 def test_summarize_headlines_the_mean_and_reports_both_mdes() -> None:
     rng = np.random.default_rng(9)
     r = rng.normal(0.14, 0.06, 1600)

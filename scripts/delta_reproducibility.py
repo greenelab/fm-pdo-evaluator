@@ -289,7 +289,14 @@ def responder_mask(piv_padj0: pd.DataFrame, alpha: float = 0.05) -> np.ndarray:
     return np.isfinite(v) & (v < alpha)
 
 
-def per_pair_table(piv0: pd.DataFrame, piv1: pd.DataFrame, r: np.ndarray) -> pd.DataFrame:
+def per_pair_table(
+    piv0: pd.DataFrame,
+    piv1: pd.DataFrame,
+    r: np.ndarray,
+    *,
+    r_responder: np.ndarray | None = None,
+    select: np.ndarray | None = None,
+) -> pd.DataFrame:
     """The result's own data: one row per candidate (line, drug) condition.
 
     The headline row summarizes these values; committing them makes the summary re-derivable
@@ -304,7 +311,7 @@ def per_pair_table(piv0: pd.DataFrame, piv1: pd.DataFrame, r: np.ndarray) -> pd.
     ok = np.isfinite(a) & np.isfinite(b)
     n = ok.sum(axis=1)
     mean_abs = np.where(ok, np.abs(a + b) / 2.0, 0.0).sum(axis=1) / np.maximum(n, 1)
-    return pd.DataFrame(
+    out = pd.DataFrame(
         {
             "patient": piv0.index.get_level_values(0),
             "drug": piv0.index.get_level_values(1),
@@ -313,6 +320,14 @@ def per_pair_table(piv0: pd.DataFrame, piv1: pd.DataFrame, r: np.ndarray) -> pd.
             "r": np.round(r, 4),
         }
     )
+    if r_responder is not None:
+        out["r_responder"] = np.round(r_responder, 4)
+    if select is not None:
+        # The responders SCORED, not the responders selected: a gene the first group called but
+        # whose second-group value is missing contributes to neither, so reporting the selection
+        # count would overstate what the responder correlation was computed on.
+        out["n_responders"] = (ok & select).sum(axis=1)
+    return out
 
 
 def stratified_null_draws(
@@ -508,28 +523,65 @@ def per_gene_reliability(
     ).sort_values("r", ascending=False)
 
 
-def summarize(r: np.ndarray, nulls: dict[str, np.ndarray], seed: int = 0) -> dict:
-    """The headline row: mean-over-pairs Pearson (the declared statistic), its nulls,
-    p-values from the bootstrapped null aggregate, and the MDEs (SPEC rule 4)."""
-    from fmharness.statistics import (
-        bootstrap_aggregate_pvalue,
-        minimum_detectable_aggregate,
-        spearman_brown,
-    )
+def spearman_brown_or_nan(r: float) -> float:
+    """``spearman_brown`` with the guard its docstring asks callers to supply.
 
-    r = r[np.isfinite(r)]
+    The lift is undefined at r = -1 (a zero denominator) and meaningless below it. One guarded
+    entry point means the two gene sets, the even-plate subset and any later rung all apply the
+    same correction with the same guard, rather than each re-deciding what to do at the edge.
+    """
+    from fmharness.statistics import spearman_brown
+
+    return spearman_brown(r) if r > -1 else float("nan")
+
+
+def summarize(
+    r: np.ndarray,
+    nulls: dict[str, np.ndarray],
+    seed: int = 0,
+    *,
+    label: str = "",
+    even_mask: np.ndarray | None = None,
+) -> dict:
+    """One reliability's row: mean-over-conditions Pearson (the declared statistic), its nulls,
+    p-values from the bootstrapped null aggregate, and the MDEs (SPEC rule 4).
+
+    ``label`` prefixes every key, so the same function serves the all-gene and responder
+    statistics and both land in ONE summary row. Two files would let one number be quoted
+    without the other; one row with two prefixed families cannot.
+
+    The Spearman-Brown lift is applied to the MEAN over conditions, not per condition and then
+    averaged. ``2r/(1+r)`` is not linear, so the two differ, and the design's declared statistic
+    is the mean.
+
+    ``even_mask`` marks the conditions whose plate count splits into two equal groups, where the
+    correction's equal-halves assumption holds exactly. Its corrected value is reported beside
+    the full one, and the gap between them is the size of that assumption rather than an
+    argument about it. The mask is over ``r`` BEFORE non-finite entries are dropped, so it is
+    the caller's per-condition mask and needs no realignment here.
+    """
+    from fmharness.statistics import bootstrap_aggregate_pvalue, minimum_detectable_aggregate
+
+    finite = np.isfinite(r)
+    r_even = r[finite & even_mask] if even_mask is not None else np.array([])
+    r = r[finite]
     mean = float(np.mean(r))
     nl = nulls["diff_drug"] if nulls["diff_drug"].size else nulls["any_pair"]
     p_boot, ci_lo, ci_hi = bootstrap_aggregate_pvalue(mean, nl, r.size, seed=seed)
     p_same = bootstrap_aggregate_pvalue(mean, nulls["same_drug"], r.size, seed=seed)[0]
-    sb = spearman_brown(mean) if mean > -1 else float("nan")
-    return {
+    mean_even = float(np.mean(r_even)) if r_even.size else float("nan")
+    out = {
         "n_pairs": int(r.size),
         "splithalf_mean_r": round(mean, 3),
         "splithalf_median_r": round(float(np.median(r)), 3),
         "splithalf_q1_r": round(float(np.quantile(r, 0.25)), 3),
         "splithalf_q3_r": round(float(np.quantile(r, 0.75)), 3),
-        "spearman_brown_full": round(sb, 3),
+        "spearman_brown_full": round(spearman_brown_or_nan(mean), 3),
+        "n_pairs_even": int(r_even.size),
+        "splithalf_mean_r_even_plates": round(mean_even, 3),
+        "spearman_brown_full_even_plates": round(spearman_brown_or_nan(mean_even), 3)
+        if r_even.size
+        else float("nan"),
         "frac_pos": round(float(np.mean(r > 0)), 3),
         "null_any_pair_mean_r": round(float(np.mean(nulls["any_pair"])), 3),
         "null_diff_drug_mean_r": round(float(np.mean(nulls["diff_drug"])), 3),
@@ -544,6 +596,7 @@ def summarize(r: np.ndarray, nulls: dict[str, np.ndarray], seed: int = 0) -> dic
             minimum_detectable_aggregate(r, nulls["same_drug"], r.size, seed=seed), 4
         ),
     }
+    return {f"{label}_{k}" if label else k: v for k, v in out.items()}
 
 
 DOSE_CANDIDATES = ("dose", "Dose", "drug_dose", "concentration", "dose_uM")
