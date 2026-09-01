@@ -169,6 +169,7 @@ def permutation_null(
     seed: int,
     *,
     pools: dict[str, np.ndarray] | None = None,
+    select: np.ndarray | None = None,
 ) -> tuple[dict[str, float], np.ndarray]:
     """The exact-permutation null for the split-half mean, carrying the half-profile-sharing
     dependence by construction instead of treating the mismatched-pair pool as exchangeable.
@@ -197,6 +198,10 @@ def permutation_null(
     piv0_f, piv1_f = piv0.loc[finite], piv1.loc[finite]
     a = piv0_f.to_numpy(dtype=float)
     b = piv1_f.to_numpy(dtype=float)
+    # The mask is over the caller's full row set, so it is filtered to the finite rows with the
+    # pivots -- and it is indexed by the row whose FIRST half is used, never by the permuted
+    # partner, so a permuted pairing scores the same genes the selection rule would have read.
+    sel = select[finite] if select is not None else None
     n = a.shape[0]
     if n < 2:
         raise ValueError(
@@ -210,7 +215,9 @@ def permutation_null(
     perm_means = np.empty(n_perm, dtype=float)
     for k in range(n_perm):
         sigma = sample_permutation(rng, n)
-        perm_means[k] = float(np.nanmean(dr.masked_rowwise_pearson(a, b[sigma], min_genes)))
+        perm_means[k] = float(
+            np.nanmean(dr.masked_rowwise_pearson(a, b[sigma], min_genes, select=sel))
+        )
 
     # An all-NaN row-correlation vector for a single permutation (every mismatched pairing in
     # that draw falling below min_genes shared finite entries) would put a NaN into perm_means.
@@ -224,7 +231,7 @@ def permutation_null(
 
     if pools is None:
         pools = dr.stratified_null_draws(
-            piv0_f, piv1_f, n_perm=n_perm, seed=seed, min_genes=min_genes
+            piv0_f, piv1_f, n_perm=n_perm, seed=seed, min_genes=min_genes, select=sel
         )
     pool = pools["any_pair"]
     var_pool = float(np.var(pool, ddof=1))
@@ -267,6 +274,7 @@ def stratified_permutation_null(
     seed: int,
     *,
     pools: dict[str, np.ndarray] | None = None,
+    select: np.ndarray | None = None,
 ) -> tuple[dict[str, float], dict[str, np.ndarray]]:
     """Stratum-preserving permutation nulls for the promoted PER-STRATUM p-values.
 
@@ -313,6 +321,9 @@ def stratified_permutation_null(
     piv0_f, piv1_f = piv0.loc[finite], piv1.loc[finite]
     a = piv0_f.to_numpy(dtype=float)
     b = piv1_f.to_numpy(dtype=float)
+    # Filtered with the pivots, and indexed by the row whose FIRST half is used -- the same
+    # one-sided rule the observed statistic applies (see `permutation_null`).
+    sel = select[finite] if select is not None else None
     r_f = r[finite]
     n = a.shape[0]
     if n < 2:
@@ -340,7 +351,12 @@ def stratified_permutation_null(
     perm_means_same = np.empty(n_perm, dtype=float)
     for k in range(n_perm):
         sigma = sample_within_drug_permutation(rng, drugs)
-        row_r = dr.masked_rowwise_pearson(a[multi_mask], b[sigma[multi_mask]], min_genes)
+        row_r = dr.masked_rowwise_pearson(
+            a[multi_mask],
+            b[sigma[multi_mask]],
+            min_genes,
+            select=None if sel is None else sel[multi_mask],
+        )
         perm_means_same[k] = float(np.nanmean(row_r))
     # Same NaN-propagation hazard `permutation_null` guards against: a broken draw (zero
     # scoreable pairs among the multi-row rows) must fail loudly, not silently corrupt
@@ -352,13 +368,13 @@ def stratified_permutation_null(
     perm_means_diff = np.empty(n_perm, dtype=float)
     for k in range(n_perm):
         sigma = sample_cross_permutation(rng, drugs, lines)
-        row_r = dr.masked_rowwise_pearson(a, b[sigma], min_genes)
+        row_r = dr.masked_rowwise_pearson(a, b[sigma], min_genes, select=sel)
         perm_means_diff[k] = float(np.nanmean(row_r))
     assert not np.isnan(perm_means_diff).any(), "a cross permutation produced zero scoreable pairs"
 
     if pools is None:
         pools = dr.stratified_null_draws(
-            piv0_f, piv1_f, n_perm=n_perm, seed=seed, min_genes=min_genes
+            piv0_f, piv1_f, n_perm=n_perm, seed=seed, min_genes=min_genes, select=sel
         )
 
     def _stratum(
@@ -418,6 +434,15 @@ def main() -> None:
     ap.add_argument("--n-perm", type=int, default=500, help="permutation null draws")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out-dir", default="rung0_outputs")
+    ap.add_argument(
+        "--gene-set",
+        choices=("all", "responder"),
+        default="all",
+        help="which of rung 0's two reliabilities to check. 'responder' scores each condition "
+        "over the genes its FIRST plate group called differentially expressed, the same "
+        "one-sided rule the observed statistic uses, and writes its outputs under a "
+        "_responder suffix so the two runs cannot overwrite each other.",
+    )
     args = ap.parse_args()
     repo = Path(__file__).resolve().parent.parent
 
@@ -426,15 +451,9 @@ def main() -> None:
     paths = sorted(str(p) for p in local.rglob("*.parquet") if dr.DE in str(p))
     if not paths:
         raise SystemExit(f"no {dr.DE} parquet under {local}")
-    if args.drug_names_file:
-        names = sorted(
-            {ln.strip() for ln in Path(args.drug_names_file).read_text().splitlines() if ln.strip()}
-        )
-    else:
-        cid_file = Path(args.drugs_cid_file)
-        cid_file = cid_file if cid_file.is_absolute() else repo / cid_file
-        names = dr._target_names(repo, cid_file)
-    print(f"{len(names)} target drugs; reading {len(paths)} DE parquet files ...")
+    names = dr.resolve_drug_names(repo, args)
+    scope = "all drugs (no drug list given)" if names is None else f"{len(names)} target drugs"
+    print(f"{scope}; reading {len(paths)} DE parquet files ...")
 
     out_dir = Path(args.out_dir) if Path(args.out_dir).is_absolute() else repo / args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -457,6 +476,14 @@ def main() -> None:
         print(f"no --panel-file given; scoring on all {len(panel)} genes present in the data")
 
     r, piv0, piv1 = dr.score_split_half(de, panel, min_genes=args.min_genes)
+    select = None
+    if args.gene_set == "responder":
+        padj = dr.padj_pivot(de, panel).reindex(columns=piv0.columns).loc[piv0.index]
+        select = dr.responder_mask(padj)
+        r, piv0, piv1 = dr.score_split_half(de, panel, min_genes=args.min_genes, select=select)
+        print(
+            f"responder gene set: {int(select.sum(axis=1).mean())} genes per condition on average"
+        )
     if not np.any(np.isfinite(r)):
         raise SystemExit("no (line, drug) pair had enough shared panel genes to score")
 
@@ -473,32 +500,35 @@ def main() -> None:
         n_perm=args.n_perm,
         seed=args.seed,
         min_genes=args.min_genes,
+        select=None if select is None else select[finite],
     )
     summary, perm_means = permutation_null(
-        piv0, piv1, r, args.min_genes, args.n_perm, args.seed, pools=pools
+        piv0, piv1, r, args.min_genes, args.n_perm, args.seed, pools=pools, select=select
     )
     strat_summary, strat_perm_means = stratified_permutation_null(
-        piv0, piv1, r, args.min_genes, args.n_perm, args.seed, pools=pools
+        piv0, piv1, r, args.min_genes, args.n_perm, args.seed, pools=pools, select=select
     )
     summary_row = {
         "replicate_col": repl,
         "n_genes": len(panel),
+        "gene_set": args.gene_set,
         **summary,
         **strat_summary,
     }
 
-    summary_path = out_dir / "rung0_permutation_summary.csv"
+    suffix = "" if args.gene_set == "all" else "_responder"
+    summary_path = out_dir / f"rung0_permutation_summary{suffix}.csv"
     pd.DataFrame([summary_row]).to_csv(summary_path, index=False)
     dr._write_params_sidecar(summary_path, args, extra={"n_pairs": summary["n_pairs"]})
 
     pd.DataFrame({"perm_mean": perm_means}).to_csv(
-        out_dir / "rung0_permutation_perm_means.csv", index=False
+        out_dir / f"rung0_permutation_perm_means{suffix}.csv", index=False
     )
     pd.DataFrame({"perm_mean": strat_perm_means["same_drug"]}).to_csv(
-        out_dir / "rung0_permutation_perm_means_same_drug.csv", index=False
+        out_dir / f"rung0_permutation_perm_means_same_drug{suffix}.csv", index=False
     )
     pd.DataFrame({"perm_mean": strat_perm_means["diff_drug"]}).to_csv(
-        out_dir / "rung0_permutation_perm_means_diff_drug.csv", index=False
+        out_dir / f"rung0_permutation_perm_means_diff_drug{suffix}.csv", index=False
     )
 
     print("\n=== permutation-based exact permutation null (rung 0, final verification step) ===")

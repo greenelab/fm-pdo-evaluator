@@ -41,6 +41,27 @@ def _target_names(repo: Path, cid_file: Path) -> list[str]:
     return sorted(dm[dm["cid"].isin(cids)]["drug"].astype(str).unique())
 
 
+def resolve_drug_names(repo: Path, args: argparse.Namespace) -> list[str] | None:
+    """The drug list a run scores, or ``None`` meaning every drug in the pool.
+
+    Rung 0 measures at the assay's full extent, so no drug file is the expected case and
+    ``None`` is the expected answer. A file is still accepted -- a later rung asking for a
+    restriction needs one -- but a missing default file is not an error here, because the
+    superseded rung's compound list is not on any branch and cannot be rebuilt.
+    """
+    if getattr(args, "drug_names_file", None):
+        return sorted(
+            {ln.strip() for ln in Path(args.drug_names_file).read_text().splitlines() if ln.strip()}
+        )
+    cid_file = Path(getattr(args, "drugs_cid_file", "") or "")
+    if not str(cid_file):
+        return None
+    cid_file = cid_file if cid_file.is_absolute() else repo / cid_file
+    if not cid_file.exists():
+        return None
+    return _target_names(repo, cid_file)
+
+
 def _connect(tmp: Path, memory_limit: str = "36GB"):
     """A DuckDB connection configured to spill to ``tmp`` rather than exhaust memory."""
     import duckdb  # type: ignore  # Alpine-only
@@ -336,12 +357,21 @@ def stratified_null_draws(
     n_perm: int = 500,
     seed: int = 0,
     min_genes: int = 50,
+    *,
+    select: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     """Mismatched-pair null correlations per stratum.
 
     any_pair: two different pairs (continuity with the archived lineage's first run).
     diff_drug: different line AND drug -- the generic-structure floor the ceiling clears.
     same_drug: same drug, different line -- the line-specificity floor.
+
+    With ``select``, a draw pairing condition *i*'s first group against condition *j*'s second
+    group scores over **row i's** selected genes -- the row whose first group is used, which is
+    the row the selection rule would have read. Using row *j*'s mask, or the union of the two,
+    would apply a different rule to the null than to the observed value and the comparison would
+    stop being like for like. The finiteness rule then intersects with row *j*'s second group,
+    exactly as it does for a matched pair.
     """
     lines = piv0.index.get_level_values(0).to_numpy(dtype=str)
     drugs = piv0.index.get_level_values(1).to_numpy(dtype=str)
@@ -365,7 +395,8 @@ def stratified_null_draws(
             out[name] = np.array([])
             continue
         pick = rng.choice(avail, size=min(n_perm, avail.size), replace=False)
-        r = masked_rowwise_pearson(a[ii[pick]], b[jj[pick]], min_genes)
+        sel = select[ii[pick]] if select is not None else None
+        r = masked_rowwise_pearson(a[ii[pick]], b[jj[pick]], min_genes, select=sel)
         out[name] = r[np.isfinite(r)]
     return out
 

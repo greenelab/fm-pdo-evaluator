@@ -928,6 +928,77 @@ def test_summary_carries_both_gene_sets_with_their_own_counts_and_mdes() -> None
         assert s[f"{fam}_n_pairs_even"] < s[f"{fam}_n_pairs"]
 
 
+@pytest.mark.step_null
+def test_a_mismatched_responder_draw_uses_the_first_conditions_mask() -> None:
+    """A null draw pairs condition i's first group with condition j's second group. The genes
+    it scores must be i's responders -- the row whose first group is in play, and so the row
+    the selection rule would actually have read. Row j's mask, or the union, would apply a
+    different rule to the null than to the observed value.
+
+    Built from disjoint planted responder sets so the three candidate answers -- i's count,
+    j's count, and the union's -- are all different numbers.
+    """
+    n_cond, n_genes = 6, 400
+    rng = np.random.default_rng(37)
+    idx = pd.MultiIndex.from_arrays(
+        [[f"L{i}" for i in range(n_cond)], [f"D{i % 2}" for i in range(n_cond)]],
+        names=["patient", "drug"],
+    )
+    cols = pd.Index([f"G{k}" for k in range(n_genes)], name="gene_name")
+    piv0 = pd.DataFrame(rng.normal(size=(n_cond, n_genes)), index=idx, columns=cols)
+    piv1 = pd.DataFrame(rng.normal(size=(n_cond, n_genes)), index=idx, columns=cols)
+    # Row i selects genes [60*i, 60*i + 60): disjoint blocks, 60 genes each.
+    select = np.zeros((n_cond, n_genes), dtype=bool)
+    for i in range(n_cond):
+        select[i, 60 * i : 60 * i + 60] = True
+
+    nulls = dr.stratified_null_draws(piv0, piv1, n_perm=200, seed=0, min_genes=10, select=select)
+    assert nulls["any_pair"].size > 0
+
+    # The scored count is what identifies which mask was used, so read it off the real path:
+    # rerun one draw's arithmetic with each candidate mask and require only i's to match 60.
+    ii, jj = 0, 3
+    a = piv0.to_numpy(dtype=float)[[ii]]
+    b = piv1.to_numpy(dtype=float)[[jj]]
+    for name, mask, expected in (
+        ("first condition", select[[ii]], 60),
+        ("second condition", select[[jj]], 60),
+        ("union", (select[[ii]] | select[[jj]]), 120),
+    ):
+        scored = int((np.isfinite(a) & np.isfinite(b) & mask).sum())
+        assert scored == expected, f"{name} mask scored {scored}"
+    r_first = dr.masked_rowwise_pearson(a, b, 10, select=select[[ii]])
+    r_union = dr.masked_rowwise_pearson(a, b, 10, select=select[[ii]] | select[[jj]])
+    assert not np.allclose(r_first, r_union), (
+        "the three candidate masks must give different answers, or this test cannot tell "
+        "which one the null used"
+    )
+    # And every value the shipped path returned is one the FIRST-condition mask produces, and
+    # none is one the union produces. Asserted as set membership rather than by replaying the
+    # draw order: stratified_null_draws advances one shared generator across the three strata,
+    # so a fresh generator reproduces only the first stratum's picks, and a test that assumed
+    # otherwise would be testing its own bookkeeping.
+    n = len(piv0)
+    gi, gj = np.divmod(np.arange(n * n), n)
+    off = gi != gj
+    gi, gj = gi[off], gj[off]
+    a_all = piv0.to_numpy(dtype=float)[gi]
+    b_all = piv1.to_numpy(dtype=float)[gj]
+    cand_first = dr.masked_rowwise_pearson(a_all, b_all, 10, select=select[gi])
+    cand_union = dr.masked_rowwise_pearson(a_all, b_all, 10, select=select[gi] | select[gj])
+    first_set = np.round(cand_first[np.isfinite(cand_first)], 9)
+    union_set = np.round(cand_union[np.isfinite(cand_union)], 9)
+    for stratum, draws in nulls.items():
+        got = np.round(draws, 9)
+        assert np.isin(got, first_set).all(), (
+            f"{stratum} drew a value the first-condition mask cannot produce"
+        )
+        assert not np.isin(got, union_set).any(), (
+            f"{stratum} drew a value only the union mask produces -- the null is using a "
+            "different selection rule from the observed statistic"
+        )
+
+
 def test_summarize_headlines_the_mean_and_reports_both_mdes() -> None:
     rng = np.random.default_rng(9)
     r = rng.normal(0.14, 0.06, 1600)
