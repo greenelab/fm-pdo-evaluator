@@ -33,9 +33,7 @@ pytestmark = pytest.mark.step_document
 
 REPO = Path(__file__).resolve().parents[1]
 
-_SPEC = importlib.util.spec_from_file_location(
-    "verify_rung0", REPO / "scripts" / "verify_rung0.py"
-)
+_SPEC = importlib.util.spec_from_file_location("verify_rung0", REPO / "scripts" / "verify_rung0.py")
 assert _SPEC is not None and _SPEC.loader is not None
 vr: Any = importlib.util.module_from_spec(_SPEC)
 sys.modules["verify_rung0"] = vr

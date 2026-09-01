@@ -449,9 +449,7 @@ def _pearson_by_group(frame: pd.DataFrame, key: str, x: str, y: str) -> dict[str
         a = points[x].to_numpy(dtype=float)
         b = points[y].to_numpy(dtype=float)
         ok = np.isfinite(a) & np.isfinite(b)
-        out[str(name)] = (
-            float(np.corrcoef(a[ok], b[ok])[0, 1]) if ok.sum() > 1 else float("nan")
-        )
+        out[str(name)] = float(np.corrcoef(a[ok], b[ok])[0, 1]) if ok.sum() > 1 else float("nan")
     return out
 
 
@@ -505,7 +503,11 @@ def check_figures(task_dir: Path) -> list[Check]:
             "every figure design.md declares was written, and is a real image",
             f"{len(FIGURES)} figures, each a PNG over 5 kB",
             f"{len(present)} present, {len(substantial)} non-trivial"
-            + (f"; missing: {sorted(set(FIGURES) - set(present))}" if len(present) < len(FIGURES) else ""),
+            + (
+                f"; missing: {sorted(set(FIGURES) - set(present))}"
+                if len(present) < len(FIGURES)
+                else ""
+            ),
             len(substantial) == len(FIGURES),
         )
     ]
@@ -516,9 +518,7 @@ def check_figures(task_dir: Path) -> list[Check]:
     values = read_table(values_path)
     recomputed = _pearson_by_group(values, "example_id", "lfc0", "lfc1")
     printed = values.groupby("example_id")["r_printed"].first().to_dict()
-    disagree = [
-        str(k) for k, v in printed.items() if not _close(float(v), recomputed[str(k)], 4)
-    ]
+    disagree = [str(k) for k, v in printed.items() if not _close(float(v), recomputed[str(k)], 4)]
     checks.append(
         Check(
             "the score figure's printed correlations recompute from its own points",
@@ -790,7 +790,7 @@ def main() -> int:
         "--task-dir",
         type=Path,
         default=DEFAULT_TASK_DIR,
-        help="directory holding one run's artifacts (default: docs/tasks/%s)" % TASK,
+        help=f"directory holding one run's artifacts (default: docs/tasks/{TASK})",
     )
     ns = ap.parse_args()
     task_dir = ns.task_dir if ns.task_dir.is_absolute() else REPO / ns.task_dir
