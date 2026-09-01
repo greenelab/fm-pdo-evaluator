@@ -1371,6 +1371,23 @@ def main() -> None:
         raise SystemExit("no (line, drug) pair had enough shared genes to score")
     padj = padj_pivot(de, panel).reindex(columns=piv0.columns).loc[piv0.index]
     select = responder_mask(padj, alpha=args.padj_threshold)
+
+    # Everything that still needs the long frame is done HERE, before the null draws, and then
+    # the frame is released. At this screen's size it is 451 million rows and the null step
+    # allocates arrays quadratic in the condition count on top of it -- holding both put the
+    # first attempt at 178 GB of a 200 GB allocation. Nothing about the numbers changes; the
+    # frame is simply not alive during the step that needs the room.
+    overlap = responder_overlap_table(de, panel, alpha=args.padj_threshold)
+    overlap.to_csv(out_dir / "rung0_responder_overlap.csv", index=False)
+    stride = max(1, len(de) // 200_000)
+    delta_real = pd.DataFrame({"log2FoldChange": de["lfc0"].to_numpy(dtype=float)[::stride]})
+    padj_sample = pd.DataFrame({"padj0": padj.to_numpy(dtype=float).ravel()}).dropna()
+    padj_sample = padj_sample.sample(min(200_000, len(padj_sample)), random_state=args.seed)
+    padj_sample.to_csv(out_dir / "rung0_padj_sample.csv.gz", index=False)
+    del de, padj
+    import gc
+
+    gc.collect()
     r_resp = masked_rowwise_pearson(
         piv0.to_numpy(dtype=float), piv1.to_numpy(dtype=float), args.min_genes, select=select
     )
@@ -1443,9 +1460,6 @@ def main() -> None:
     mde_curve = mde_curve_table(r_all, r_resp, nulls_all, nulls_resp, seed=args.seed)
     mde_curve.to_csv(out_dir / "rung0_mde_curve.csv", index=False)
 
-    overlap = responder_overlap_table(de, panel, alpha=args.padj_threshold)
-    overlap.to_csv(out_dir / "rung0_responder_overlap.csv", index=False)
-
     leakage = leakage_table(args.min_genes, seed=args.seed)
     leakage.to_csv(out_dir / "rung0_leakage_control.csv", index=False)
     print(f"leakage control: {leakage.to_dict(orient='records')}")
@@ -1453,10 +1467,6 @@ def main() -> None:
     per_gene = per_gene_reliability(piv0, piv1)
     per_gene.to_csv(out_dir / "rung0_per_gene_reliability.csv", index=False)
     pool.to_csv(out_dir / "rung0_pool_description.csv", index=False)
-
-    padj_sample = pd.DataFrame({"padj0": padj.to_numpy(dtype=float).ravel()}).dropna()
-    padj_sample = padj_sample.sample(min(200_000, len(padj_sample)), random_state=args.seed)
-    padj_sample.to_csv(out_dir / "rung0_padj_sample.csv.gz", index=False)
 
     # --- the noise decomposition -------------------------------------------------------------
     noise_summary: dict[str, float] = {}
@@ -1525,9 +1535,6 @@ def main() -> None:
     control_per_pair = pd.concat(ctrl_rows, ignore_index=True)
     control_per_pair.to_csv(out_dir / "rung0_control_per_pair.csv", index=False)
 
-    delta_real = pd.DataFrame(
-        {"log2FoldChange": de["lfc0"].to_numpy(dtype=float)[:: max(1, len(de) // 200_000)]}
-    )
     delta_syn = pd.DataFrame({"log2FoldChange": pos["lfc0"].to_numpy(dtype=float)})
 
     fg.fig_build(pool, delta_real, delta_syn, fig_dir / "01_build.png")
