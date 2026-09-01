@@ -188,12 +188,111 @@ def build_split_half_frame(
     return _compact_df(de), chosen
 
 
+def _noise_select(repl: str, dose: str | None, base: str) -> tuple[str, str]:
+    """The per (line, drug, dose, gene) select list and GROUP BY the decomposition rests on."""
+    dose_sel = f"{dose} AS dose," if dose else "CAST(NULL AS DOUBLE) AS dose,"
+    dose_grp = f", {dose}" if dose else ""
+    sel = f"""SELECT Cell_ID_DepMap AS patient, drug, {dose_sel} gene_name,
+                   var_samp(log2FoldChange) AS var_lfc,
+                   avg(lfcSE * lfcSE) AS mean_se2,
+                   count(DISTINCT {repl}) AS n_plates,
+                   {base} AS base_mean,
+                   avg(log2FoldChange) AS mean_lfc"""
+    grp = (
+        f"GROUP BY Cell_ID_DepMap, drug{dose_grp}, gene_name\n"
+        f"            HAVING count(DISTINCT {repl}) >= 2"
+    )
+    return sel, grp
+
+
+def noise_aggregate(
+    paths: list[str],
+    target_names: list[str] | None,
+    repl_col: str | None,
+    tmp: Path,
+    memory_limit: str = "36GB",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """The decomposition's reported numbers, aggregated IN DuckDB over every gene.
+
+    At the assay's full extent there are on the order of a billion (line, drug, dose, gene)
+    groups. Returning them to pandas and writing them out is neither possible in the job's
+    memory nor useful to a reader -- the design reports the between-plate share aggregated over
+    genes within a condition and over conditions, stratified by expression and by response size,
+    and those are what a promoted claim is read from. So the arithmetic that produces them runs
+    in the engine, over all rows, and only the compact result comes back.
+
+    Returns ``(overall, strata)``: one row of headline numbers, and one row per
+    (expression quartile, response-size quartile) cell.
+    """
+    con = _connect(tmp, memory_limit)
+    cols = list(
+        con.execute("DESCRIBE SELECT * FROM read_parquet(?) LIMIT 0", [paths]).df()["column_name"]
+    )
+    candidates = ([repl_col] if repl_col else []) + list(REPL_CANDIDATES)
+    repl = next((c for c in candidates if c in cols), None)
+    if repl is None:
+        raise SystemExit(f"no replicate column in {cols}; pass --replicate-col")
+    if "lfcSE" not in cols:
+        raise SystemExit("the pool carries no lfcSE column; the noise decomposition needs it")
+    dose = next((c for c in DOSE_CANDIDATES if c in cols), None)
+    if dose is None:
+        print(
+            "WARNING: no dose column in the pool. Grouping by (line, drug, gene) only, so a dose "
+            "effect would be charged to plate noise -- the decomposition is not interpretable."
+        )
+    base = "avg(baseMean)" if "baseMean" in cols else "CAST(NULL AS DOUBLE)"
+    sel, grp = _noise_select(repl, dose, base)
+    where, drug_params = _drug_predicate(target_names)
+    inner = f"""
+        WITH g AS ({sel}
+            FROM read_parquet(?)
+            WHERE {repl} IS NOT NULL{where}
+            {grp}),
+        d AS (SELECT *,
+                     greatest(var_lfc - mean_se2, 0.0) AS sigma2_plate,
+                     CASE WHEN var_lfc > 0
+                          THEN greatest(var_lfc - mean_se2, 0.0) / var_lfc END
+                       AS between_plate_fraction
+              FROM g)
+    """
+    overall = con.execute(
+        inner
+        + """
+        SELECT count(*) AS n_gene_conditions,
+               avg(between_plate_fraction) AS between_plate_fraction_mean,
+               median(between_plate_fraction) AS between_plate_fraction_median,
+               avg(sigma2_plate) AS sigma2_plate_mean,
+               avg(mean_se2) AS mean_se2_mean,
+               avg(CASE WHEN between_plate_fraction > 0.5 THEN 1.0 ELSE 0.0 END)
+                 AS frac_plate_dominated
+        FROM d WHERE between_plate_fraction IS NOT NULL""",
+        [paths, *drug_params],
+    ).df()
+    strata = con.execute(
+        inner
+        + """
+        SELECT expression_quartile, response_quartile,
+               count(*) AS n,
+               avg(between_plate_fraction) AS between_plate_fraction_mean,
+               avg(base_mean) AS base_mean_mean,
+               avg(abs_lfc) AS abs_mean_lfc_mean
+        FROM (SELECT between_plate_fraction, base_mean, abs(mean_lfc) AS abs_lfc,
+                     ntile(4) OVER (ORDER BY base_mean) AS expression_quartile,
+                     ntile(4) OVER (ORDER BY abs(mean_lfc)) AS response_quartile
+              FROM d WHERE between_plate_fraction IS NOT NULL)
+        GROUP BY 1, 2 ORDER BY 1, 2""",
+        [paths, *drug_params],
+    ).df()
+    return overall, strata
+
+
 def build_noise_frame(
     paths: list[str],
     target_names: list[str] | None,
     repl_col: str | None,
     tmp: Path,
     memory_limit: str = "36GB",
+    sample_rows: int | None = None,
 ) -> pd.DataFrame:
     """Per (line, drug, dose, gene) with at least two plates: the ingredients of the noise split.
 
@@ -226,21 +325,23 @@ def build_noise_frame(
             "WARNING: no dose column in the pool. Grouping by (line, drug, gene) only, so a dose "
             "effect would be charged to plate noise -- the decomposition is not interpretable."
         )
-    dose_sel = f"{dose} AS dose," if dose else "CAST(NULL AS DOUBLE) AS dose,"
-    dose_grp = f", {dose}" if dose else ""
     base = "avg(baseMean)" if "baseMean" in cols else "CAST(NULL AS DOUBLE)"
+    sel, grp = _noise_select(repl, dose, base)
     where, drug_params = _drug_predicate(target_names)
+    # A reservoir sample when the pool is large enough to need one. The sample feeds the figures
+    # and the row-wise identity check; every reported number comes from `noise_aggregate`, which
+    # runs over all rows in the engine. Sampling the evidence a figure draws is honest as long as
+    # the claim is not read from it -- and it is not.
+    limit = (
+        f"\n        USING SAMPLE reservoir({int(sample_rows)} ROWS) REPEATABLE (0)"
+        if sample_rows
+        else ""
+    )
     noise = con.execute(
-        f"""SELECT Cell_ID_DepMap AS patient, drug, {dose_sel} gene_name,
-                   var_samp(log2FoldChange) AS var_lfc,
-                   avg(lfcSE * lfcSE) AS mean_se2,
-                   count(DISTINCT {repl}) AS n_plates,
-                   {base} AS base_mean,
-                   avg(log2FoldChange) AS mean_lfc
+        f"""{sel}
             FROM read_parquet(?)
             WHERE {repl} IS NOT NULL{where}
-            GROUP BY Cell_ID_DepMap, drug{dose_grp}, gene_name
-            HAVING count(DISTINCT {repl}) >= 2""",
+            {grp}{limit}""",
         [paths, *drug_params],
     )
     return _compact_df(noise)
@@ -875,7 +976,16 @@ def _build_or_load_frame(
             print(f"loaded the split-half frame from {cache} ({len(de):,} rows, replicate {repl})")
             return de, repl
 
-    de, repl = build_split_half_frame(paths, names, args.replicate_col, local.parent / "duckdb_tmp")
+    # getattr, not attribute access: the frame-cache control constructs a minimal Namespace to
+    # exercise the cache key, and a helper that demands every CLI flag makes that test carry the
+    # whole argument list rather than the two fields it is about.
+    de, repl = build_split_half_frame(
+        paths,
+        names,
+        args.replicate_col,
+        local.parent / "duckdb_tmp",
+        getattr(args, "duckdb_memory", "36GB"),
+    )
     if cache is not None:
         de.to_parquet(cache, index=False)
         cache.with_suffix(".json").write_text(json.dumps({"replicate_col": repl}) + "\n")
@@ -1054,6 +1164,21 @@ def main() -> None:
         "or changing a figure reruns in about a minute instead of repeating the scan.",
     )
     ap.add_argument(
+        "--duckdb-memory",
+        default="36GB",
+        help="DuckDB's memory_limit. The engine spills to --local-dir's parent when it runs "
+        "out, so a value below the job's allocation trades speed for safety; set it well under "
+        "the SBATCH --mem so the returned pandas frames still have room.",
+    )
+    ap.add_argument(
+        "--noise-sample-rows",
+        type=int,
+        default=2_000_000,
+        help="rows of the per-gene noise table to keep for the figures and the row-wise "
+        "identity check. Every reported number is aggregated over all rows in the engine; this "
+        "only bounds what comes back.",
+    )
+    ap.add_argument(
         "--skip-noise",
         action="store_true",
         help="skip the noise decomposition's second full scan (local smoke runs only)",
@@ -1194,28 +1319,32 @@ def main() -> None:
         print("skipping the noise decomposition (--skip-noise)")
         noise = pd.DataFrame()
     else:
-        noise = decompose_noise(
-            build_noise_frame(paths, names, args.replicate_col, local.parent / "duckdb_tmp")
+        # Every reported number is aggregated in the engine over ALL gene-conditions; only a
+        # bounded sample comes back for the figures and the row-wise identity check. At full
+        # extent there are on the order of a billion groups, which neither fits in the job nor
+        # helps a reader.
+        overall, strata = noise_aggregate(
+            paths, names, args.replicate_col, local.parent / "duckdb_tmp", args.duckdb_memory
         )
-        frac = noise["between_plate_fraction"].to_numpy(dtype=float)
-        frac = frac[np.isfinite(frac)]
-        noise_summary = {
-            "n_gene_conditions": len(noise),
-            "between_plate_fraction_mean": round(float(np.mean(frac)), 4),
-            "between_plate_fraction_median": round(float(np.median(frac)), 4),
-            "sigma2_plate_mean": round(
-                float(np.mean(noise["sigma2_plate"].to_numpy(dtype=float))), 5
-            ),
-            "mean_se2_mean": round(float(np.mean(noise["mean_se2"].to_numpy(dtype=float))), 5),
-            "frac_plate_dominated": round(float(np.mean(frac > 0.5)), 4),
-        }
         noise_path = out_dir / "rung0_noise_decomposition.csv"
-        pd.DataFrame([noise_summary]).to_csv(noise_path, index=False)
+        overall.round(5).to_csv(noise_path, index=False)
+        noise_summary = {k: float(v) for k, v in overall.iloc[0].items()}
         _write_params_sidecar(noise_path, args, extra=noise_summary)
-        # The per-gene rows are large; committed compressed, and the summary above is what a
-        # promoted claim is read from.
+        strata.round(5).to_csv(out_dir / "rung0_noise_strata.csv", index=False)
+
+        noise = decompose_noise(
+            build_noise_frame(
+                paths,
+                names,
+                args.replicate_col,
+                local.parent / "duckdb_tmp",
+                args.duckdb_memory,
+                sample_rows=args.noise_sample_rows,
+            )
+        )
         noise.to_csv(out_dir / "rung0_noise_per_gene.csv.gz", index=False)
-        print(f"noise: {noise_summary}")
+        print(f"noise (all rows): {noise_summary}")
+        print(f"noise sample for figures: {len(noise):,} gene-conditions")
 
     # --- figures -------------------------------------------------------------------------------
     from fmharness import figures as fg

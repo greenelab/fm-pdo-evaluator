@@ -4,9 +4,9 @@
 #SBATCH --qos=cpu-normal      # acpu accepts only cpu-normal / cpu-long, not normal
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=48G                    # DuckDB memory_limit 36G + the aggregated result frame
-#SBATCH --time=02:00:00
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=200G                    # DuckDB memory_limit 36G + the aggregated result frame
+#SBATCH --time=06:00:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.out
 #

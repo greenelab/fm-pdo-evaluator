@@ -4,9 +4,12 @@
 #SBATCH --qos=cpu-normal      # acpu accepts only cpu-normal / cpu-long, not normal
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=48G                    # DuckDB memory_limit 36G + the aggregated result frame
-#SBATCH --time=02:00:00
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=200G                   # scoring every drug, not the superseded rung's 32:
+                                     # the returned frame is tens of times larger, and the
+                                     # nodes carry 245G, so headroom is free here and an
+                                     # out-of-memory kill costs the whole 40-minute scan
+#SBATCH --time=06:00:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.out
 #
@@ -57,4 +60,5 @@ OUT_DIR="${OUT_DIR:-docs/tasks/rung0-assay-reliability}"
 python scripts/delta_reproducibility.py \
     --local-dir "/scratch/alpine/$USER/tahoe_pseudobulk_de" \
     --frame-cache "/scratch/alpine/$USER/rung0_frame_cache" \
+    --duckdb-memory 110GB \
     --out-dir "$OUT_DIR"
