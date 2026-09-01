@@ -42,6 +42,10 @@ def _write_fixture_pool(
     noise_sd: float = 1.0,
     drug_sd: float = 0.0,
     seed: int = 0,
+    n_responders: int | None = None,
+    doses: tuple[float, ...] = (0.05,),
+    plate_offset_sd: float = 0.0,
+    se: float | None = None,
 ) -> Path:
     """A synthetic replicate pool in the DE table's own shape, one parquet file.
 
@@ -49,29 +53,62 @@ def _write_fixture_pool(
     drug-shared component (sd ``drug_sd``), plus independent per-plate noise (sd
     ``noise_sd``). Expected split-half r over genes, as plate count grows:
     (signal_sd^2 + drug_sd^2) / (signal_sd^2 + drug_sd^2 + noise_sd^2 / plates_per_half).
+
+    The DESeq2 columns the assay-reliability task reads are planted too:
+
+    ``n_responders``  the first N genes are planted as differentially expressed -- ``padj``
+                      drawn below 0.01 -- and the rest above 0.2. ``None`` (the default) plants
+                      ``padj`` uniform on (0, 1) for every gene, which is the signal-free case
+                      selection must admit at no more than the nominal rate.
+    ``doses``         one row per (plate, dose); the reliabilities pool over dose, the noise
+                      decomposition holds it fixed.
+    ``plate_offset_sd``  a per-plate offset shared across genes and doses -- the plate effect
+                      ``lfcSE`` cannot see and the decomposition exists to recover. It is added
+                      ON TOP of ``noise_sd``, so the planted plate variance is
+                      ``plate_offset_sd ** 2`` and the planted within-plate variance is
+                      ``noise_sd ** 2``.
+    ``se``            the value written to ``lfcSE``. Defaults to ``noise_sd``, which is the
+                      truth for this generator: each row's deviation from its condition mean is
+                      drawn at sd ``noise_sd``, so a standard error of ``noise_sd`` is what a
+                      correctly calibrated DESeq2 would report.
     """
     rng = np.random.default_rng(seed)
     lines = [f"L{i}" for i in range(n_lines)]
     drugs = [f"D{j}" for j in range(n_drugs)]
     genes = [f"G{k}" for k in range(n_genes)]
     drug_eff = {d: rng.normal(0.0, drug_sd, n_genes) for d in drugs}
+    plate_off = {p: rng.normal(0.0, plate_offset_sd, 1)[0] for p in plates}
+    lfc_se = noise_sd if se is None else se
     rows = []
     for li in lines:
         for d in drugs:
             signal = rng.normal(0.0, signal_sd, n_genes) + drug_eff[d]
             for p in plates:
-                lfc = signal + rng.normal(0.0, noise_sd, n_genes)
-                rows.append(
-                    pd.DataFrame(
-                        {
-                            "Cell_ID_DepMap": li,
-                            "drug": d,
-                            "gene_name": genes,
-                            "log2FoldChange": lfc,
-                            "plate": p,
-                        }
+                for dose in doses:
+                    lfc = signal + rng.normal(0.0, noise_sd, n_genes) + plate_off[p]
+                    if n_responders is None:
+                        padj = rng.uniform(0.0, 1.0, n_genes)
+                    else:
+                        padj = np.where(
+                            np.arange(n_genes) < n_responders,
+                            rng.uniform(0.0, 0.01, n_genes),
+                            rng.uniform(0.2, 1.0, n_genes),
+                        )
+                    rows.append(
+                        pd.DataFrame(
+                            {
+                                "Cell_ID_DepMap": li,
+                                "drug": d,
+                                "gene_name": genes,
+                                "log2FoldChange": lfc,
+                                "lfcSE": lfc_se,
+                                "padj": padj,
+                                "baseMean": 100.0,
+                                "concentration": dose,
+                                "plate": p,
+                            }
+                        )
                     )
-                )
     pool_dir = tmp / "pseudobulk_differential_expression"
     pool_dir.mkdir(parents=True)
     out = pool_dir / "train-00000-of-00001.parquet"
@@ -133,6 +170,76 @@ def test_build_edge_all_nan_pair_drops_out_after_the_dropna_path(tmp_path: Path)
     remaining_pairs = {tuple(row) for row in de[["patient", "drug"]].drop_duplicates().to_numpy()}
     assert ("L0", "D0") not in remaining_pairs, "an all-NaN pair must not survive the dropna path"
     assert ("L1", "D0") in remaining_pairs, "other pairs must be unaffected"
+
+
+@pytest.mark.step_build
+def test_build_admits_every_drug_when_no_drug_list_is_given(tmp_path: Path) -> None:
+    """Positive control for build, this task's inclusion rule: every splittable drug.
+
+    The superseded rung passed a 32-compound list this task does not have and cannot rebuild;
+    ``target_names=None`` is what "no drug file" means at the SQL level, and it must admit the
+    whole pool rather than silently matching nothing.
+    """
+    path = _write_fixture_pool(tmp_path)
+    de, chosen = dr.build_split_half_frame(
+        [str(path)], None, None, tmp_path / "duck", memory_limit="2GB"
+    )
+    assert chosen == "plate"
+    assert set(de["drug"].unique()) == {"D0", "D1", "D2"}
+    assert de.dropna(subset=["lfc0", "lfc1"]).groupby(["patient", "drug"]).ngroups == 12
+
+
+@pytest.mark.step_build
+def test_build_carries_the_first_groups_minimum_padj(tmp_path: Path) -> None:
+    """The selection rule is "significant in AT LEAST ONE of the first group's rows", so the
+    aggregate that decides it is the MINIMUM adjusted p-value over those rows, not their mean.
+    A mean would let one strongly significant row be averaged away by its neighbours."""
+    path = _write_fixture_pool(tmp_path)
+    df = pd.read_parquet(path)
+    # Which plates land in the first group is DuckDB's hash, so read it off the engine rather
+    # than assuming: plant into whichever plates the build itself calls group 0.
+    import duckdb
+
+    half0 = {
+        str(p)
+        for p in duckdb.connect()
+        .execute(
+            "SELECT DISTINCT plate FROM read_parquet(?) WHERE hash(plate) % 2 = 0", [str(path)]
+        )
+        .df()["plate"]
+    }
+    assert half0 and half0 != set(df["plate"].unique()), "fixture must split across both groups"
+    first = sorted(half0)[0]
+    key = (df["Cell_ID_DepMap"] == "L0") & (df["drug"] == "D0") & (df["gene_name"] == "G0")
+    df.loc[key, "padj"] = 0.9
+    df.loc[key & (df["plate"] == first), "padj"] = 0.01
+    other = (df["Cell_ID_DepMap"] == "L0") & (df["drug"] == "D0") & (df["gene_name"] == "G1")
+    df.loc[other, "padj"] = 0.9
+    df.to_parquet(path, index=False)
+
+    de, _ = dr.build_split_half_frame([str(path)], None, None, tmp_path / "duck", "2GB")
+    got = de.set_index(["patient", "drug", "gene_name"])["padj0"]
+    assert got.loc[("L0", "D0", "G0")] == pytest.approx(0.01), "one significant row must carry"
+    assert got.loc[("L0", "D0", "G1")] == pytest.approx(0.9), "no significant row, no selection"
+
+
+@pytest.mark.step_build
+def test_build_leaves_untestable_genes_null(tmp_path: Path) -> None:
+    """A gene DESeq2 could not test carries baseMean 0 and null in every statistic column.
+    Such genes must fall out by the finiteness rule the scorer already applies -- not by a
+    filter of ours, which would be a second, undeclared inclusion rule."""
+    path = _write_fixture_pool(tmp_path)
+    df = pd.read_parquet(path)
+    dead = df["gene_name"] == "G7"
+    df.loc[dead, ["log2FoldChange", "lfcSE", "padj"]] = np.nan
+    df.loc[dead, "baseMean"] = 0.0
+    df.to_parquet(path, index=False)
+
+    de, _ = dr.build_split_half_frame([str(path)], None, None, tmp_path / "duck", "2GB")
+    row = de[(de["patient"] == "L0") & (de["drug"] == "D0") & (de["gene_name"] == "G7")]
+    assert len(row) == 1
+    assert pd.isna(row["padj0"].iloc[0]), "an untestable gene carries no adjusted p-value"
+    assert de.dropna(subset=["lfc0", "lfc1"])["gene_name"].nunique() == 299, "G7 drops out"
 
 
 def test_score_positive_planted_reliability_is_recovered(tmp_path: Path) -> None:

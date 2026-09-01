@@ -41,9 +41,33 @@ def _target_names(repo: Path, cid_file: Path) -> list[str]:
     return sorted(dm[dm["cid"].isin(cids)]["drug"].astype(str).unique())
 
 
+def _connect(tmp: Path, memory_limit: str = "36GB"):
+    """A DuckDB connection configured to spill to ``tmp`` rather than exhaust memory."""
+    import duckdb  # type: ignore  # Alpine-only
+
+    tmp.mkdir(parents=True, exist_ok=True)
+    con = duckdb.connect()
+    con.execute(f"SET temp_directory='{tmp}'")
+    con.execute(f"SET memory_limit='{memory_limit}'")
+    con.execute("SET preserve_insertion_order=false")
+    return con
+
+
+def _drug_predicate(target_names: list[str] | None) -> tuple[str, list[object]]:
+    """The drug filter, and the parameters it needs — empty when every drug is admitted.
+
+    Rung 0 measures at the assay's full extent: every drug with plates enough to split. The
+    superseded rung passed a 32-compound list derived from inputs no longer on any branch, so
+    "no drug file" has to mean *no predicate*, not a predicate matching nothing.
+    """
+    if not target_names:
+        return "", []
+    return " AND drug IN (SELECT unnest(?))", [list(target_names)]
+
+
 def build_split_half_frame(
     paths: list[str],
-    target_names: list[str],
+    target_names: list[str] | None,
     repl_col: str | None,
     tmp: Path,
     memory_limit: str = "36GB",
@@ -53,14 +77,18 @@ def build_split_half_frame(
     Splits plates by ``hash(repl_col) % 2`` (deterministic, no RNG) and aggregates each half
     IN-ENGINE, so raw rows are never materialized. Returns the long frame plus the chosen
     replicate column.
-    """
-    import duckdb  # type: ignore  # Alpine-only
 
-    tmp.mkdir(parents=True, exist_ok=True)
-    con = duckdb.connect()
-    con.execute(f"SET temp_directory='{tmp}'")
-    con.execute(f"SET memory_limit='{memory_limit}'")
-    con.execute("SET preserve_insertion_order=false")
+    ``target_names`` of ``None`` or empty admits every drug in the pool.
+
+    The frame also carries ``padj0``: the MINIMUM Benjamini-Hochberg adjusted p-value over the
+    FIRST group's (plate, dose) rows. The minimum is what the selection rule asks for -- a gene
+    is a responder when the first group called it differentially expressed in at least one of
+    its rows -- and it is deliberately one-sided: nothing here aggregates the second group's
+    adjusted p-values, because selecting on the half a correlation is scored against inflates
+    that correlation by winner's curse. ``min`` skips nulls, so a gene DESeq2 could not test
+    comes back null and falls out by the same finiteness rule that governs the fold changes.
+    """
+    con = _connect(tmp, memory_limit)
     schema = con.execute("DESCRIBE SELECT * FROM read_parquet(?) LIMIT 0", [paths]).df()
     cols = list(schema["column_name"])
     print(f"DE columns: {cols}")
@@ -69,14 +97,24 @@ def build_split_half_frame(
     if chosen is None:
         raise SystemExit(f"no replicate column in {cols}; pass --replicate-col")
     print(f"splitting plates by hash({chosen}) % 2")
+    where, drug_params = _drug_predicate(target_names)
+    # FILTER attaches only to an aggregate call, so the no-padj fallback has to replace the whole
+    # expression rather than just the function -- `CAST(NULL AS DOUBLE) FILTER (...)` is a parse
+    # error, not a null column.
+    if "padj" in cols:
+        padj = f"min(padj) FILTER (WHERE hash({chosen}) % 2 = 0)"
+    else:
+        padj = "CAST(NULL AS DOUBLE)"
+        print("no padj column in the pool: responder selection is unavailable for this run")
     de = con.execute(
         f"""SELECT Cell_ID_DepMap AS patient, drug, gene_name,
                    avg(log2FoldChange) FILTER (WHERE hash({chosen}) % 2 = 0) AS lfc0,
-                   avg(log2FoldChange) FILTER (WHERE hash({chosen}) % 2 = 1) AS lfc1
+                   avg(log2FoldChange) FILTER (WHERE hash({chosen}) % 2 = 1) AS lfc1,
+                   {padj} AS padj0
             FROM read_parquet(?)
-            WHERE drug IN (SELECT unnest(?)) AND {chosen} IS NOT NULL
+            WHERE {chosen} IS NOT NULL{where}
             GROUP BY Cell_ID_DepMap, drug, gene_name""",
-        [paths, target_names],
+        [paths, *drug_params],
     ).df()
     return de, chosen
 
@@ -383,31 +421,36 @@ DOSE_CANDIDATES = ("dose", "Dose", "drug_dose", "concentration", "dose_uM")
 
 
 def pool_description(
-    paths: list[str], target_names: list[str], repl: str, tmp: Path
+    paths: list[str], target_names: list[str] | None, repl: str, tmp: Path
 ) -> pd.DataFrame:
     """Measured composition of the consumed pool (design: 'measured not asserted'):
     per (line, drug) the replicate-row count, distinct plates per half, and dose levels
-    when a dose column exists."""
-    import duckdb  # type: ignore  # heavy path; imported where used
+    when a dose column exists.
 
-    con = duckdb.connect()
-    con.execute(f"SET temp_directory='{tmp}'")
+    ``n_plates_even`` marks the conditions whose plate count splits into two equal groups.
+    Spearman-Brown assumes equal halves, and three quarters of this screen's conditions split
+    one plate against two; the corrected value is reported again over these conditions, where
+    the correction is exact, and the gap between the two is the size of the assumption.
+    """
+    con = _connect(tmp)
     cols = list(
         con.execute("DESCRIBE SELECT * FROM read_parquet(?) LIMIT 0", [paths]).df()["column_name"]
     )
     dose = next((c for c in DOSE_CANDIDATES if c in cols), None)
     dose_expr = f"count(DISTINCT {dose})" if dose else "NULL"
+    where, drug_params = _drug_predicate(target_names)
     return con.execute(
         f"""SELECT Cell_ID_DepMap AS patient, drug,
                    count(*) AS n_rows,
                    count(DISTINCT {repl}) AS n_plates,
+                   count(DISTINCT {repl}) % 2 = 0 AS n_plates_even,
                    count(DISTINCT {repl}) FILTER (WHERE hash({repl}) % 2 = 0) AS n_plates_half0,
                    count(DISTINCT {repl}) FILTER (WHERE hash({repl}) % 2 = 1) AS n_plates_half1,
                    {dose_expr} AS n_dose_levels
             FROM read_parquet(?)
-            WHERE drug IN (SELECT unnest(?)) AND {repl} IS NOT NULL
+            WHERE {repl} IS NOT NULL{where}
             GROUP BY Cell_ID_DepMap, drug ORDER BY patient, drug""",
-        [paths, target_names],
+        [paths, *drug_params],
     ).df()
 
 
