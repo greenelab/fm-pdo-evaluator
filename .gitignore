@@ -218,9 +218,9 @@ __marimo__/
 .streamlit/secrets.toml
 
 # fmharness project-specific
-# Cached tranche artifacts (large). `.gitignore` has no inline comments — a trailing `# ...`
-# becomes part of the pattern, so this rule stands on its own line to match anything.
-data/tranches/
+# data/tranches/ was ignored when tranches meant large cached data bundles; the redesigned
+# tranche is a small schema-validated provenance record (JSON + shard manifest) that MUST be
+# tracked — the data itself lives on cluster scratch and never enters the repository.
 reports/              # generated reports
 containers/*.sif      # built Apptainer images
 .fmharness/           # local user secrets/state

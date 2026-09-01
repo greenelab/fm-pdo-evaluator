@@ -12,6 +12,10 @@ requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2.7",
     "numpy>=1.26",
+    "pandas>=2.2",
+    "duckdb>=1.0",
+    "pyarrow>=15",
+    "matplotlib>=3.8",
 ]
 
 [project.optional-dependencies]
@@ -22,6 +26,8 @@ dev = [
     "ruff>=0.4",
     "pyright>=1.1.360",
     "pre-commit>=3.7",
+    # for running each task's verify and summary notebooks (PROCESS §3's executable verification)
+    "jupyterlab>=4.2",
 ]
 
 [build-system]
@@ -62,4 +68,11 @@ addopts = "-ra -q"
 markers = [
     "step_promote: writing a result and its provenance record",
     "step_document: recording specs, state, and the reversals behind them",
+    "step_build: assembling the split-half frame the measurement runs on",
+    "step_split: dividing a condition's replicate plates into two groups",
+    "step_select: choosing a condition's responder genes from its first group alone",
+    "step_score: computing a reported statistic from a measurement",
+    "step_decompose: splitting replicate noise into its between-plate and within-plate parts",
+    "step_null: building the negative-control distribution a statistic is read against",
+    "known_answer: plants a known answer and requires the real, shipped function to recover it",
 ]
