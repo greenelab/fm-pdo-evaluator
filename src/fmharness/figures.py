@@ -627,7 +627,12 @@ def fig_score(
     example_ids = _example_ids(profiles, profile_index)
     n_cols = max(1, len(example_ids))
     control_r = _finite(control_per_pair, "r") if control_per_pair is not None else None
-    n_rows = 2 if control_r is None else 3
+    # One scatter row per gene set, then the histogram row, then the control row when there is
+    # one. The responder scatters only exist when the profile table carries the marking.
+    responder_flag = _flags(profiles, "is_responder")
+    has_responders = bool(responder_flag.any())
+    scatter_rows = 2 if has_responders else 1
+    n_rows = scatter_rows + 1 + (0 if control_r is None else 1)
 
     # The bottom row carries six labelled reference lines in its legend, so the figure stays
     # wide enough for them even when only one example scatter sits above.
@@ -646,49 +651,67 @@ def fig_score(
         )
     )
 
+    # Drawn TWICE, as the design declares: once over every gene finite in both halves, then once
+    # over that condition's responders. The second panel is what a rung scoring responding genes
+    # is actually read against, and seeing the two side by side is how a reader judges whether
+    # restricting to responders bought signal or only removed the easy agreement of shared zeros.
+    # The responder marking comes from the committed profile table, not from a recomputation the
+    # figure has no data for.
     exported: list[pd.DataFrame] = []
-    for position, example_id in enumerate(example_ids):
-        ax = fig.add_subplot(grid[0, position])
-        selected = (profile_ids == example_id) & np.isfinite(profile_lfc0)
-        selected &= np.isfinite(profile_lfc1)
-        x, y = profile_lfc0[selected], profile_lfc1[selected]
-        r_printed = _pearson(x, y)
-        if x.size:
-            ax.scatter(x, y, s=6, alpha=0.4, color=_REAL_COLOR, edgecolors="none")
-            low = float(np.minimum(x.min(), y.min()))
-            high = float(np.maximum(x.max(), y.max()))
-            ax.plot([low, high], [low, high], color="k", lw=0.8, linestyle="--", label="identity")
-        else:
-            _note_empty(ax, "no genes finite in both halves")
-        kind = kinds.get(example_id, "")
-        ax.set_title(f"{example_id}{f' ({kind})' if kind else ''}", fontsize=9)
-        ax.set_xlabel(f"group 1 {_LFC_UNITS}")
-        ax.set_ylabel(f"group 2 {_LFC_UNITS}")
-        ax.text(
-            0.04,
-            0.95,
-            f"r = {r_printed:.4f}\nn = {x.size} genes",
-            transform=ax.transAxes,
-            ha="left",
-            va="top",
-            fontsize=8,
-        )
-        _legend(ax, fontsize=7)
-        exported.append(
-            pd.DataFrame(
-                {
-                    "example_id": np.repeat(example_id, x.size),
-                    "gene": profile_genes[selected],
-                    "lfc0": x,
-                    "lfc1": y,
-                    "r_printed": np.repeat(r_printed, x.size),
-                }
+    variants: list[tuple[int, str, bool]] = [(0, "all genes", False)]
+    if has_responders:
+        variants.append((1, "responders", True))
+    for row, variant_label, responders_only in variants:
+        for position, example_id in enumerate(example_ids):
+            ax = fig.add_subplot(grid[row, position])
+            selected = (profile_ids == example_id) & np.isfinite(profile_lfc0)
+            selected &= np.isfinite(profile_lfc1)
+            if responders_only:
+                selected &= responder_flag
+            x, y = profile_lfc0[selected], profile_lfc1[selected]
+            r_printed = _pearson(x, y)
+            if x.size:
+                colour = _RESPONDER_COLOR if responders_only else _REAL_COLOR
+                ax.scatter(x, y, s=6, alpha=0.4, color=colour, edgecolors="none")
+                low = float(np.minimum(x.min(), y.min()))
+                high = float(np.maximum(x.max(), y.max()))
+                ax.plot(
+                    [low, high], [low, high], color="k", lw=0.8, linestyle="--", label="identity"
+                )
+            else:
+                _note_empty(ax, "no genes finite in both halves")
+            kind = kinds.get(example_id, "")
+            ax.set_title(
+                f"{example_id}{f' ({kind})' if kind else ''} -- {variant_label}", fontsize=9
             )
-        )
+            ax.set_xlabel(f"group 1 {_LFC_UNITS}")
+            ax.set_ylabel(f"group 2 {_LFC_UNITS}")
+            ax.text(
+                0.04,
+                0.95,
+                f"r = {r_printed:.4f}\nn = {x.size} genes",
+                transform=ax.transAxes,
+                ha="left",
+                va="top",
+                fontsize=8,
+            )
+            _legend(ax, fontsize=7)
+            exported.append(
+                pd.DataFrame(
+                    {
+                        "example_id": np.repeat(example_id, x.size),
+                        "gene_set": np.repeat(variant_label, x.size),
+                        "gene": profile_genes[selected],
+                        "lfc0": x,
+                        "lfc1": y,
+                        "r_printed": np.repeat(r_printed, x.size),
+                    }
+                )
+            )
     if not example_ids:
         _note_empty(fig.add_subplot(grid[0, 0]), "no example profiles exported")
 
-    ax_hist = fig.add_subplot(grid[1, :])
+    ax_hist = fig.add_subplot(grid[scatter_rows, :])
     r_all = _finite(per_pair, "r")
     r_responder = _finite(per_pair, "r_responder")
     bins = _shared_bins(
@@ -716,7 +739,7 @@ def fig_score(
     _legend(ax_hist, fontsize=7, ncol=2)
 
     if control_r is not None:
-        ax_control = fig.add_subplot(grid[2, :], sharex=ax_hist)
+        ax_control = fig.add_subplot(grid[scatter_rows + 1, :], sharex=ax_hist)
         # The control pools are drawn SEPARATELY. Merging them makes one bimodal blur under a
         # title that is wrong for half of it: the positive pool should sit at its planted value
         # and the negative pool at zero, and the whole point of the panel is that a reader can
@@ -761,7 +784,7 @@ def fig_score(
     fig.suptitle("score: split-half reliability, per condition and over the screen", fontsize=11)
     written = _finish(fig, out)
 
-    columns = ["example_id", "gene", "lfc0", "lfc1", "r_printed"]
+    columns = ["example_id", "gene_set", "gene", "lfc0", "lfc1", "r_printed"]
     table = (
         pd.concat(exported, ignore_index=True)
         if exported

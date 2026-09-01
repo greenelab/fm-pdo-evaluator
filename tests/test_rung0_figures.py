@@ -284,7 +284,14 @@ def test_fig_score_writes_a_png_and_a_companion_values_csv(tmp_path: Path) -> No
     values_csv = tmp_path / "score.values.csv"
     assert values_csv.exists(), "the printed correlation has no companion table to be checked from"
     exported = pd.read_csv(values_csv)
-    assert list(exported.columns) == ["example_id", "gene", "lfc0", "lfc1", "r_printed"]
+    assert list(exported.columns) == [
+        "example_id",
+        "gene_set",
+        "gene",
+        "lfc0",
+        "lfc1",
+        "r_printed",
+    ]
     assert set(exported["example_id"]) == set(profiles["example_id"])
 
 
@@ -349,7 +356,14 @@ def test_fig_score_tolerates_no_control_pool_and_no_examples(tmp_path: Path) -> 
     )
     _assert_is_a_png(out)
     exported = pd.read_csv(tmp_path / "score_empty.values.csv")
-    assert list(exported.columns) == ["example_id", "gene", "lfc0", "lfc1", "r_printed"]
+    assert list(exported.columns) == [
+        "example_id",
+        "gene_set",
+        "gene",
+        "lfc0",
+        "lfc1",
+        "r_printed",
+    ]
     assert len(exported) == 0
 
 
@@ -548,3 +562,37 @@ def test_no_emojis_in_the_figures_module() -> None:
     source = (Path(figures.__file__)).read_text(encoding="utf-8")
     offending = [character for character in source if ord(character) > 0x2100]
     assert not offending, f"non-ascii pictographic characters in figures.py: {offending}"
+
+
+def test_fig_score_draws_the_examples_over_both_gene_sets(tmp_path: Path) -> None:
+    """The design declares the example scatters drawn twice -- all genes, then that condition's
+    responders -- because the second is what a rung scoring responding genes is read against,
+    and seeing them side by side is how a reader judges whether restricting to responders bought
+    signal or only removed the easy agreement of shared zeros.
+
+    The marking comes from the committed profile table. When the table carries no responder
+    column the figure falls back to one row rather than inventing a panel, which is the state a
+    run without responder selection leaves behind.
+    """
+    profiles, index = _profiles()
+    rng = np.random.default_rng(3)
+    profiles = profiles.assign(is_responder=rng.random(len(profiles)) < 0.4)
+    figures.fig_score(profiles, index, _per_pair(), None, _summary(), tmp_path / "score.png")
+    exported = pd.read_csv(tmp_path / "score.values.csv")
+    assert set(exported["gene_set"]) == {"all genes", "responders"}
+    for example_id, part in exported.groupby("example_id"):
+        n_all = int((part["gene_set"] == "all genes").sum())
+        n_resp = int((part["gene_set"] == "responders").sum())
+        assert n_resp < n_all, f"{example_id}: responders must be a subset, got {n_resp}/{n_all}"
+        # And each panel's printed r must still recompute from the points that panel plotted.
+        for gene_set, panel in part.groupby("gene_set"):
+            if len(panel) > 2:
+                got = float(np.corrcoef(panel["lfc0"], panel["lfc1"])[0, 1])
+                assert got == pytest.approx(float(panel["r_printed"].iloc[0]), abs=1e-4), (
+                    f"{example_id} / {gene_set}: printed r does not match its own points"
+                )
+
+    # No responder column: one row of scatters, and the companion table says so.
+    figures.fig_score(_profiles()[0], index, _per_pair(), None, _summary(), tmp_path / "score2.png")
+    plain = pd.read_csv(tmp_path / "score2.values.csv")
+    assert set(plain["gene_set"]) == {"all genes"}

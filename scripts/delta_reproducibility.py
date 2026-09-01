@@ -739,6 +739,7 @@ def example_pair_profiles(
     quantiles: tuple[float, ...] = (0.05, 0.25, 0.5, 0.95),
     max_genes: int | None = None,
     seed: int = 0,
+    select: np.ndarray | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Gene-level half-profiles for a few example conditions, so an r can be seen as a scatter.
 
@@ -774,9 +775,10 @@ def example_pair_profiles(
     if order.size == 0:
         index_cols = ["example_id", "kind", "patient0", "drug0", "patient1", "drug1"]
         index_cols += ["n_genes_full", "r_full", "n_genes_shown", "r_shown"]
-        return pd.DataFrame(columns=["example_id", "gene", "lfc0", "lfc1"]), pd.DataFrame(
-            columns=index_cols
-        )
+        index_cols += ["n_responders_shown", "r_responder_full"]
+        return pd.DataFrame(
+            columns=["example_id", "gene", "lfc0", "lfc1", "is_responder"]
+        ), pd.DataFrame(columns=index_cols)
 
     def _at(q: float) -> int:
         return int(order[round(q * (order.size - 1))])
@@ -807,6 +809,16 @@ def example_pair_profiles(
         )
         x, y = a[i][shown], b[j][shown]
         r_shown = float(masked_rowwise_pearson(x[None, :], y[None, :], min_genes=1)[0])
+        # Which of the exported points are the FIRST condition's responders -- the same row the
+        # selection rule reads, including for a mismatched example, so the marking means the same
+        # thing everywhere. Exported so the design's second scatter can be drawn from the
+        # committed table rather than recomputed from data the figure does not have.
+        resp = select[i][shown] if select is not None else np.zeros(shown.size, dtype=bool)
+        r_resp = (
+            float(masked_rowwise_pearson(a[i][None, :], b[j][None, :], 1, select=select[[i]])[0])
+            if select is not None
+            else float("nan")
+        )
         frames.append(
             pd.DataFrame(
                 {
@@ -814,6 +826,7 @@ def example_pair_profiles(
                     "gene": genes[shown],
                     "lfc0": np.round(x, 4),
                     "lfc1": np.round(y, 4),
+                    "is_responder": resp,
                 }
             )
         )
@@ -829,6 +842,8 @@ def example_pair_profiles(
                 "r_full": round(r_full, 4),
                 "n_genes_shown": int(shown.size),
                 "r_shown": round(r_shown, 4),
+                "n_responders_shown": int(resp.sum()),
+                "r_responder_full": round(r_resp, 4) if np.isfinite(r_resp) else float("nan"),
             }
         )
     return pd.concat(frames, ignore_index=True), pd.DataFrame(rows)
@@ -1418,7 +1433,7 @@ def main() -> None:
     ]
     pd.concat(null_rows, ignore_index=True).to_csv(out_dir / "rung0_null_draws.csv", index=False)
 
-    profiles, profile_index = example_pair_profiles(piv0, piv1, r_all)
+    profiles, profile_index = example_pair_profiles(piv0, piv1, r_all, select=select)
     profiles.to_csv(out_dir / "rung0_example_pair_profiles.csv.gz", index=False)
     profile_index.to_csv(out_dir / "rung0_example_pair_index.csv", index=False)
 
