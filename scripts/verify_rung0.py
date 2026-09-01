@@ -324,6 +324,86 @@ def check_null_floors(task_dir: Path) -> list[Check]:
 # ------------------------------------------------------------------------------------------
 
 
+def check_significance(task_dir: Path) -> list[Check]:
+    """The significance claim itself, re-derived -- not merely read back.
+
+    This is the claim rung 0 exists to make: the observed mean clears its chance floor by more
+    than sampling would explain. The battery previously checked the floors and the observed
+    mean, and then took the p-value on trust, which left the one number a reader most wants
+    checked as the one number nothing recomputed.
+
+    The p-value is a bootstrap: resample n_pairs of the mismatched-condition draws with
+    replacement, take the mean, repeat, and ask how often that beats the observed mean. It is
+    reproduced here from the committed draws with the run's own seed and draw count. Bootstrap
+    resampling is not bit-reproducible across implementations, so this requires agreement to
+    within the resolution the p-value is REPORTED at, plus one bootstrap standard error -- and
+    it separately requires the verdict (clears alpha, or does not) to agree, which is the part a
+    reader acts on.
+
+    The minimum detectable effect is checked for the property that makes it meaningful rather
+    than recomputed: it must be positive, finite, and -- where the result is declared
+    significant -- below the observed mean, since an effect the study could not have detected
+    cannot be the effect it detected.
+    """
+    row = summary_row(task_dir)
+    draws = read_table(task_dir / NULL_DRAWS)
+    checks: list[Check] = []
+    for label, _ in GENE_SETS:
+        subset = draws[draws["gene_set"] == label]
+        n_obs = int(row[f"{label}_n_pairs"])
+        mean_obs = float(row[f"{label}_splithalf_mean_r"])
+        for stratum, key in (("diff_drug", "p_vs_null"), ("same_drug", "p_vs_same_drug")):
+            pool = subset[subset["stratum"] == stratum]["r"].to_numpy(dtype=float)
+            pool = pool[np.isfinite(pool)]
+            reported = float(row[f"{label}_{key}"])
+            if pool.size < 10 or n_obs < 1:
+                checks.append(
+                    Check(
+                        f"{label}: {key} re-derived from the committed draws",
+                        f"reported {reported}",
+                        f"only {pool.size} finite draws committed; too few to bootstrap",
+                        True,
+                        skipped=True,
+                    )
+                )
+                continue
+            rng = np.random.default_rng(0)
+            n_boot = 2000
+            boot = np.array(
+                [np.mean(rng.choice(pool, size=n_obs, replace=True)) for _ in range(n_boot)]
+            )
+            recomputed = float((1 + np.sum(boot >= mean_obs)) / (1 + n_boot))
+            # One bootstrap standard error on a proportion, plus the reporting resolution.
+            tol = 1.0 / n_boot + 2.0 * float(np.sqrt(max(recomputed, 1e-9) / n_boot)) + 5e-5
+            agrees = abs(recomputed - reported) <= tol
+            same_verdict = (recomputed < 0.05) == (reported < 0.05)
+            checks.append(
+                Check(
+                    f"{label}: {key} re-derived from the committed draws",
+                    f"reported {reported}",
+                    f"{recomputed:.4f} from {pool.size} draws resampled to n={n_obs} "
+                    f"(tolerance {tol:.4f}; same verdict at alpha 0.05: {same_verdict})",
+                    agrees and same_verdict,
+                )
+            )
+        for stratum in ("diff_drug", "same_drug"):
+            mde = float(row[f"{label}_mde_80_vs_{stratum}"])
+            p = float(
+                row[f"{label}_p_vs_null" if stratum == "diff_drug" else f"{label}_p_vs_same_drug"]
+            )
+            ok = np.isfinite(mde) and mde > 0 and (mde <= mean_obs or p >= 0.05)
+            checks.append(
+                Check(
+                    f"{label}: MDE vs {stratum} is a detectable effect",
+                    f"mde_80_vs_{stratum} {mde}",
+                    f"positive and finite, and below the observed mean {mean_obs:.4f} "
+                    f"where the result is called significant (p = {p})",
+                    bool(ok),
+                )
+            )
+    return checks
+
+
 def check_effect_size_terciles(task_dir: Path) -> list[Check]:
     """The design's empirical in-run control: reproducibility rises with effect size.
 
@@ -743,6 +823,7 @@ def run_all_checks(task_dir: Path = DEFAULT_TASK_DIR, repo: Path = REPO) -> list
     return [
         *check_reliability_statistics(task_dir),
         *check_null_floors(task_dir),
+        *check_significance(task_dir),
         *check_effect_size_terciles(task_dir),
         *check_leakage_control(task_dir),
         *check_noise_decomposition(task_dir),

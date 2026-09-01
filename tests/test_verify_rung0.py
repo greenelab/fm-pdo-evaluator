@@ -59,7 +59,7 @@ _CANDIDATES = [
 #: revisited rather than quietly going stale -- the one number in the wave that nothing else
 #: guards. Skipped checks are counted: whether the permutation job has run changes what can be
 #: checked, never how many claims the battery is answerable for.
-EXPECTED_CHECKS = 51
+EXPECTED_CHECKS = 59
 
 
 def _example_run() -> Path:

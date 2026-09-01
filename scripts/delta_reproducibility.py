@@ -854,6 +854,13 @@ def pool_description(
     )
     dose = next((c for c in DOSE_CANDIDATES if c in cols), None)
     dose_expr = f"count(DISTINCT {dose})" if dose else "NULL"
+    # The share of this condition's rows DESeq2 could not test (baseMean zero, so a null fold
+    # change). Measured per condition because it is large and uneven here -- 59 percent of the
+    # screen's rows overall -- and a reader comparing gene counts across conditions needs to
+    # see it rather than infer it.
+    untestable = (
+        "avg(CASE WHEN baseMean = 0 THEN 1.0 ELSE 0.0 END)" if "baseMean" in cols else "NULL"
+    )
     where, drug_params = _drug_predicate(target_names)
     return con.execute(
         f"""SELECT Cell_ID_DepMap AS patient, drug,
@@ -862,7 +869,8 @@ def pool_description(
                    count(DISTINCT {repl}) % 2 = 0 AS n_plates_even,
                    count(DISTINCT {repl}) FILTER (WHERE hash({repl}) % 2 = 0) AS n_plates_half0,
                    count(DISTINCT {repl}) FILTER (WHERE hash({repl}) % 2 = 1) AS n_plates_half1,
-                   {dose_expr} AS n_dose_levels
+                   {dose_expr} AS n_dose_levels,
+                   {untestable} AS frac_untestable
             FROM read_parquet(?)
             WHERE {repl} IS NOT NULL{where}
             GROUP BY Cell_ID_DepMap, drug ORDER BY patient, drug""",

@@ -127,3 +127,54 @@ def test_promotion_keys_a_labeled_input_by_its_label(repo: Path) -> None:
     record_path = _promote(repo, inputs=[input_path], input_labels={input_path: "gene_panel"})
     record = PromotedResult.model_validate_json(record_path.read_text())
     assert record.inputs == {"gene_panel": pr.sha256_of(input_path)}
+
+
+@pytest.mark.step_promote
+def test_promotion_refuses_an_artifact_whose_checksum_moved_since_the_audit(
+    tmp_path: Path,
+) -> None:
+    """The promote step's negative control, and the refusal that closes the audit window.
+
+    The audit reads the run's artifacts in the working tree before they are committed, and
+    records each one's sha256. Between that read and the promotion commit, nothing structural
+    stops an artifact changing -- so promotion recomputes the checksum and refuses when it has
+    moved. Without this the window is unchecked, and "the audit passed" would say nothing about
+    the bytes that got promoted.
+    """
+    import json
+
+    result = tmp_path / "rung0_reliability.csv"
+    result.write_text("all_splithalf_mean_r\n0.135\n")
+    sums = tmp_path / "audit_checksums.json"
+    sums.write_text(json.dumps({result.name: pr.sha256_of(result)}))
+
+    # Matching checksum: the guard lets it through.
+    pr._refuse_if_checksums_moved(result, sums)
+
+    # One byte different, and it must refuse by name.
+    result.write_text("all_splithalf_mean_r\n0.136\n")
+    with pytest.raises(SystemExit) as excinfo:
+        pr._refuse_if_checksums_moved(result, sums)
+    assert "changed after the audit read it" in str(excinfo.value)
+    assert result.name in str(excinfo.value)
+
+
+@pytest.mark.step_promote
+def test_promotion_refuses_when_the_audit_never_read_the_artifact(tmp_path: Path) -> None:
+    """A missing record is the same evidential state as a mismatched one: nothing establishes
+    that what is being promoted is what was reviewed. Both are refused, and a missing checksums
+    file is refused rather than treated as "no constraint"."""
+    import json
+
+    result = tmp_path / "rung0_reliability.csv"
+    result.write_text("x\n1\n")
+    sums = tmp_path / "audit_checksums.json"
+    sums.write_text(json.dumps({"some_other_table.csv": "0" * 64}))
+    with pytest.raises(SystemExit, match="did not read this artifact"):
+        pr._refuse_if_checksums_moved(result, sums)
+
+    with pytest.raises(SystemExit, match="does not exist"):
+        pr._refuse_if_checksums_moved(result, tmp_path / "absent.json")
+
+    # And with no record requested at all the guard is inert, so existing callers are unaffected.
+    pr._refuse_if_checksums_moved(result, None)

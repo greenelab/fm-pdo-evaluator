@@ -69,6 +69,7 @@ SCORING_THRESHOLD = 50
 
 _REAL_COLOR = "tab:blue"
 _RESPONDER_COLOR = "tab:red"
+_CONTROL_COLORS = ("#8c564b", "#7f7f7f", "#bcbd22")
 _CONTROL_COLOR = "tab:orange"
 _LFC_UNITS = "log2 fold change (drug vs control)"
 
@@ -477,6 +478,7 @@ def fig_select(
     """
     n_panels = 3 if overlap is None else 4
     fig, axes = plt.subplots(1, n_panels, figsize=(5.0 * n_panels, 4.6), layout="constrained")
+    axes = np.atleast_1d(axes)
     ax_padj, ax_responders, ax_leakage = axes[0], axes[1], axes[2]
 
     padj = _finite(padj_sample, "padj0")
@@ -715,20 +717,45 @@ def fig_score(
 
     if control_r is not None:
         ax_control = fig.add_subplot(grid[2, :], sharex=ax_hist)
-        if control_r.size:
-            ax_control.hist(
-                control_r,
-                bins=bins,
-                density=True,
-                alpha=0.55,
-                color=_CONTROL_COLOR,
-                label="control pool, all genes",
-            )
+        # The control pools are drawn SEPARATELY. Merging them makes one bimodal blur under a
+        # title that is wrong for half of it: the positive pool should sit at its planted value
+        # and the negative pool at zero, and the whole point of the panel is that a reader can
+        # see those two places are different. Split on the `control` column when the run
+        # labelled them, and say so plainly when it did not.
+        pools: list[tuple[str, np.ndarray]] = []
+        if control_per_pair is not None and "control" in control_per_pair.columns:
+            labels = control_per_pair["control"].astype(str).to_numpy()
+            all_r = _numeric(control_per_pair, "r")
+            for name in dict.fromkeys(labels):
+                vals = all_r[(labels == name) & np.isfinite(all_r)]
+                if vals.size:
+                    pools.append((str(name), vals))
+        elif control_r.size:
+            pools.append(("control pool (unlabelled)", control_r))
+        if pools:
+            for i, (name, vals) in enumerate(pools):
+                ax_control.hist(
+                    vals,
+                    bins=bins,
+                    density=True,
+                    alpha=0.55,
+                    color=_CONTROL_COLORS[i % len(_CONTROL_COLORS)],
+                    label=f"{name} (n={vals.size})",
+                )
+                ax_control.axvline(
+                    float(np.mean(vals)),
+                    color=_CONTROL_COLORS[i % len(_CONTROL_COLORS)],
+                    lw=1.4,
+                    linestyle="--",
+                )
         else:
             _note_empty(ax_control, "control pool has no scored conditions")
         ax_control.set_xlabel("split-half Pearson r per condition (same axis as the panel above)")
         ax_control.set_ylabel("density (conditions per unit r)")
-        ax_control.set_title("control pool: where a planted answer lands", fontsize=9)
+        ax_control.set_title(
+            "control pools: a planted reliability and a pool with none, on the axis above",
+            fontsize=9,
+        )
         _legend(ax_control, fontsize=7)
 
     fig.suptitle("score: split-half reliability, per condition and over the screen", fontsize=11)

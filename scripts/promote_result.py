@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import platform
 import subprocess
 import sys
@@ -52,6 +53,44 @@ def _git(repo: Path, *args: str) -> str:
     ).stdout.strip()
 
 
+def _refuse_if_checksums_moved(result: Path, audit_checksums: Path | None) -> None:
+    """Refuse to promote an artifact that changed after the audit read it.
+
+    The audit reads the run's artifacts in the working tree, before they are committed
+    (PROCESS section 1, "What reaches GitHub, and when"), and records the sha256 of each one it
+    read. That leaves a window between what was audited and what gets committed, and this is
+    what closes it: promotion recomputes the checksum of the artifact it is about to promote and
+    refuses when it no longer matches the recorded one.
+
+    A missing record is refused too when a path was given. "The checksums file is not there" is
+    the same evidential state as "the checksums do not match" -- in both cases nothing has
+    established that what is being promoted is what was reviewed.
+    """
+    if audit_checksums is None:
+        return
+    if not audit_checksums.exists():
+        raise SystemExit(
+            f"--audit-checksums {audit_checksums} does not exist. Promotion checks the promoted "
+            "artifact against the checksum the audit recorded; with no record there is nothing "
+            "establishing that this file is the one that was reviewed."
+        )
+    recorded = json.loads(audit_checksums.read_text())
+    name = result.name
+    if name not in recorded:
+        raise SystemExit(
+            f"{name} is not in {audit_checksums}. The audit did not read this artifact, so "
+            "promoting it would put a number into the record that no audit covered."
+        )
+    now = sha256_of(result)
+    if now != recorded[name]:
+        raise SystemExit(
+            f"{name} changed after the audit read it.\n"
+            f"  audit recorded: {recorded[name]}\n"
+            f"  now:            {now}\n"
+            "Re-run the audit against the current artifacts, or promote the ones it read."
+        )
+
+
 def promote(
     *,
     task: str,
@@ -65,8 +104,10 @@ def promote(
     log: Path | None,
     repo: Path,
     input_labels: dict[Path, str] | None = None,
+    audit_checksums: Path | None = None,
 ) -> Path:
     repo = repo.resolve()
+    _refuse_if_checksums_moved(result, audit_checksums)
     if not (repo / script).exists():
         raise SystemExit(
             f"--script {script} is not in the repo; a result whose producing script "
@@ -152,6 +193,14 @@ def main() -> None:
     ap.add_argument("--seed", type=int, required=True)
     ap.add_argument("--data-commit", required=True)
     ap.add_argument("--arg", action="append", default=[], help="key=value, repeatable")
+    ap.add_argument(
+        "--audit-checksums",
+        type=Path,
+        default=None,
+        help="the audit's checksum record (audit_checksums.json beside the artifacts). When "
+        "given, promotion refuses if the artifact's checksum has moved since the audit read "
+        "it, which is what closes the window opened by auditing uncommitted artifacts.",
+    )
     ap.add_argument("--job-id", default=None)
     ap.add_argument("--log", type=Path, default=None)
     ap.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[1])
@@ -178,6 +227,7 @@ def main() -> None:
         log=ns.log,
         repo=ns.repo,
         input_labels=input_labels,
+        audit_checksums=ns.audit_checksums,
     )
 
 
