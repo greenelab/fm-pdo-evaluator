@@ -1,9 +1,12 @@
 """One test per numbered project rule in ``docs/SPEC.md``.
 
 The project rules are what every task must satisfy, whichever rung or dataset it is about. They
-arrive with the work that first needs them, and so do their tests: this repository holds
-documents and the review apparatus, so it carries the two rules that bind those. Rules governing
-splits, statistics, controls, capacity and embargo land with the code and data they constrain.
+arrive with the work that first needs them, and so do their tests. Four rules live here so far:
+rule 1 (every promoted result carries a provenance record), rule 2 (a task is named in the spec
+tree, and a reversal of a task document's own lines carries a dated entry), rule 3 (the README
+stays in step with the documents it summarises), and rule 4 (every measurement step declares a
+positive and a negative control). Rules governing splits, statistics, capacity and embargo land
+with the code and data they constrain.
 
 Two kinds of test live here, and the difference decides how much a pass is worth:
 
@@ -17,9 +20,9 @@ Where a rule has nothing to check yet — no promoted results, no task folders �
 rather than passing. A vacuous pass is worse than a skip, because a green run then reports
 compliance that was never tested.
 
-Neither rule here has per-instance cases, so there is nothing to exempt. The registry of known
-violations, and the strict-xfail machinery that forces an entry out once its owning task lands,
-arrives with the first rule that checks instances one at a time.
+No rule here has per-instance exemptions yet, so there is nothing to exempt. The registry of
+known violations, and the strict-xfail machinery that forces an entry out once its owning task
+lands, arrives with the first rule that checks instances one at a time.
 """
 
 from __future__ import annotations
@@ -110,7 +113,7 @@ def test_rule_01_edge_promoted_records_validate_against_the_schema() -> None:
 # Rule 2 — a reversal is written into the task's own documents
 # ======================================================================================
 
-TASK_DOCUMENTS = ("design.md", "plan.md")
+TASK_DOCUMENTS = ("design.md", "plan.md", "decisions.md")
 DATED_ENTRY = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")
 
 
@@ -154,8 +157,13 @@ def _merge_base() -> str | None:
 
 @pytest.mark.step_document
 def test_rule_02_edge_non_additive_task_edits_carry_a_dated_entry() -> None:
-    """A task document that rewrites its own history must say so, dated, at its foot.
+    """A task document that rewrites its own history must say so, dated.
 
+    The dated entry lives in the task's ``decisions.md`` (SPEC rule 2's amended location,
+    2026-08-31) or in the rewritten document itself (the original form, still accepted).
+    ``decisions.md`` is itself in the scanned set: it now carries the history this rule
+    protects, so deleting or rewriting its entries demands a new dated entry the same way
+    (found at the wave's scoped review -- the scan set had not followed the moved content).
     Appending to a task document is free. Deleting or rewriting lines already there is a
     reversal of something the document previously asserted, and the rule requires the old choice
     and the reason for changing it to be recorded rather than overwritten. That distinction is a
@@ -194,10 +202,19 @@ def test_rule_02_edge_non_additive_task_edits_carry_a_dated_entry() -> None:
             continue  # removed at HEAD; there is no document left to carry an entry
         new_dates = set(DATED_ENTRY.findall(after)) - set(DATED_ENTRY.findall(before))
         if not new_dates:
+            # SPEC rule 2's amended location: the dated entry may live in the task's
+            # decisions.md rather than in the rewritten document itself
+            decisions = str(Path(doc).parent / "decisions.md")
+            decisions_before = _git("show", f"{base}:{decisions}") or ""
+            decisions_after = _git("show", f"HEAD:{decisions}") or ""
+            new_dates = set(DATED_ENTRY.findall(decisions_after)) - set(
+                DATED_ENTRY.findall(decisions_before)
+            )
+        if not new_dates:
             offenders.append(doc)
     assert not offenders, (
-        "these task documents rewrote existing lines without recording the change, dated, at"
-        f" the foot of the document: {offenders}"
+        "these task documents rewrote existing lines without recording the change, dated, in"
+        f" the task's decisions.md or the document itself: {offenders}"
     )
 
 
@@ -257,4 +274,90 @@ def test_rule_03_edge_readme_is_revisited_when_the_ladder_changes() -> None:
     assert "README.md" in touched, (
         "the ladder in docs/SPEC.md changed but README.md did not; the summary a reader opens "
         "first has to be revisited in the same change"
+    )
+
+
+# ======================================================================================
+# Rule 4 — every measurement step carries a positive and a negative control
+# ======================================================================================
+
+MEASUREMENT_STEPS = ("load", "build", "restrict", "split", "fit", "score", "null")
+
+
+@pytest.mark.step_score
+@pytest.mark.step_null
+def test_rule_04_every_task_declares_controls_for_its_measurement_steps() -> None:
+    """Scan: a task touching measurement steps declares both control signs for each of them.
+
+    Reads the ``**Steps**`` header line of each task's ``design.md``; for every measurement
+    step named there, the document's Controls section must hold an entry for that step
+    containing both a positive and a negative control. Does not prove the declared control is
+    implemented anywhere, or that a plant is placed where it proves something — the known-answer
+    tests are the implemented half, and the edge-case test below ties them to promotion.
+    """
+    folders = _task_folders()
+    if not folders:
+        pytest.skip("no task folders yet; nothing for this rule to check")
+
+    problems: list[str] = []
+    for folder in folders:
+        design = folder / "design.md"
+        if not design.exists():
+            problems.append(f"{folder.name}: no design.md")
+            continue
+        text = design.read_text()
+        header = re.search(r"\*\*Steps\*\*(.+)", text)
+        if header is None:
+            problems.append(f"{folder.name}: design.md has no **Steps** header line")
+            continue
+        steps = [s for s in MEASUREMENT_STEPS if re.search(rf"\b{s}\b", header.group(1))]
+        if not steps:
+            continue  # a documentation- or promotion-only task measures nothing
+        controls = re.search(r"^## .*[Cc]ontrols.*$", text, re.M)
+        if controls is None:
+            problems.append(
+                f"{folder.name}: touches measurement steps {steps} but design.md has no "
+                "Controls section"
+            )
+            continue
+        section = text[controls.end() :]
+        nxt = re.search(r"^## ", section, re.M)
+        if nxt:
+            section = section[: nxt.start()]
+        for step in steps:
+            entry = re.search(rf"\*\*{step}\*\*(.*?)(?=\n- \*\*|\Z)", section, re.S)
+            if entry is None:
+                problems.append(f"{folder.name}: no control entry for step '{step}'")
+                continue
+            # Strip markdown emphasis before the colon-form search, so a bolded declaration
+            # like "**positive**:" is recognized the same as a plain "positive:".
+            body = entry.group(1).lower().replace("*", "")
+            for sign in ("positive", "negative"):
+                # Require the declaration FORM "positive:"/"negative:" (colon required), not a
+                # bare occurrence of the word -- prose like "positive control omitted" contains
+                # the word "positive" without declaring one, and used to pass this scan.
+                if f"{sign}:" not in body:
+                    problems.append(f"{folder.name}: step '{step}' lacks a '{sign}:' control")
+    assert not problems, problems
+
+
+@pytest.mark.step_score
+@pytest.mark.step_null
+def test_rule_04_edge_promoted_tasks_have_known_answer_tests() -> None:
+    """A promoted result may not exist while no test carries the known-answer marker.
+
+    Declared controls precede their implementation while a task is being built, so this binds
+    only at promotion: once any result is promoted, the repository must hold at least one test
+    marked ``known_answer``. A shape scan — it cannot tell whether the marked tests cover the
+    controls the promoting task declared; the reviewer of that task's PR can.
+    """
+    if not _promoted_results():
+        pytest.skip("no promoted results yet; declared controls precede their implementation")
+
+    marked = [
+        p for p in sorted((REPO / "tests").glob("test_*.py")) if "known_answer" in p.read_text()
+    ]
+    assert marked, (
+        "results are promoted but no test file carries pytest.mark.known_answer; rule 4 "
+        "requires the declared controls to be implemented before a number becomes evidence"
     )

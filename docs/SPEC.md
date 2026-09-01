@@ -1,6 +1,6 @@
 # fm-pm-evaluator — project spec
 
-**As of** 2026-08-27.
+**As of** 2026-08-31.
 
 ## The question
 
@@ -27,7 +27,7 @@ Seven different conclusions demanding seven different responses, and one end-to-
 The evaluation is built as a **ladder**: each rung adds exactly one boundary to the rung below it, and every rung is scored against the reproducibility ceiling.
 Where the score falls off localises the failure to a specific boundary.
 
-## Three words this project uses precisely
+## Five words this project uses precisely
 
 | Word | Means | Lifecycle |
 |---|---|---|
@@ -35,9 +35,16 @@ Where the score falls off localises the failure to a specific boundary.
 | **Step** | A stage of the evaluation pipeline that every rung passes through: load, build, restrict, split, fit, score, null, promote, release, document. The machinery. | Never "done"; rules attach here |
 | **Task** | A unit of work with a spec, an owner and a definition of done. Touches one or more steps, serves one rung or is cross-cutting. | OPEN or CLOSED |
 | **Tranche** | A versioned, content-hashed bundle of data from one source — the material a rung is run on, and what a leakage profile is keyed to. | Ingested once, then immutable |
+| **Frame** | The invariants a cross-rung ratio holds fixed: the tranches (by content hash) and the declared statistic. A fraction-of-ceiling is valid only when numerator and denominator share a frame *and* a panel — the denominator being rung 0's ceiling restricted to the numerator's genes and drugs. | Versioned by its hashes; a new tranche opens a new frame; a new panel adds a restriction, not a frame |
 
-A rung is *what we are asking*; a step is *where in the machinery*; a task is *what someone is doing about it*.
+A rung is *what we are asking*; a step is *where in the machinery*; a task is *what someone is doing about it*; a tranche is *what it runs on*; a frame is *what a ratio holds fixed*.
 The project rules below bind to steps, which is why they hold for every rung without being restated per rung.
+
+Scores from different frames are different quantities.
+Bringing in a new tranche — new cell lines, a new screen — does not extend the current frame; it opens a new one, and every cross-rung comparison is recomputed inside it.
+That recompute is a re-run of parameterized pipelines over new inputs, not a redesign, and it does not invalidate the old frame: promoted results carry the tranche hashes that say which frame they belong to, and remain citable claims about it.
+Panels are not frame elements. Rung 0 measures the ceiling at the assay's full extent — every gene and every splittable drug — and a rung that scores a subset reads against a **restriction** of that ceiling to its own subset, declared before it scores, promoted under the rung that needs it, and listed in `docs/STATE.md` with its panel hashes and motivating rung. A restriction never changes the value it restricts; it is a different question, never a revision.
+The one asymmetry is rung 6 — a registered prospective prediction is frozen in its frame by definition, so a frame change after registration is recorded, and new predictions are registered in the new frame going forward.
 
 ## Specific Implementation
 
@@ -47,16 +54,17 @@ The project rules below bind to steps, which is why they hold for every rung wit
 
 **Question** How much of a measured perturbation response is signal rather than assay noise?
 **Adds** A reference for every other rung to read against.
-**Measure** Split the replicate pool in half, correlate the two halves' per-(line, drug) expression deltas on the declared gene panel, Spearman-Brown corrected to full-data reliability, against a mismatched-pair null.
-**Passing means** A ceiling significantly above the mismatched-pair null. A rung above it can then be reported as a fraction of what is achievable rather than as a fraction of a hypothetical 1.0.
+**Measure** Split each (line, drug) condition's replicate plates in two and correlate the two groups' per-gene expression deltas — per-pair Pearson, aggregated as the mean over pairs, the one statistic every delta rung reports — Spearman-Brown corrected to full-data reliability, against stratified mismatched-pair nulls and alongside a planted-signal positive control. At the assay's full extent, every drug with plates enough to split, over two gene sets: every gene the table carries, and the genes each condition's first plate group calls differentially expressed — selected from that group alone, never from the group the correlation is scored against. The two are different questions, since across all genes the correlation is dominated by genes that did not respond. Promoted beside them: a decomposition of each delta's variance into its between-plate part and the within-plate standard error the screen's own differential-expression statistics carry, which says whether replicate noise is plate effects or cell sampling — a finding about the assay in its own right, and the thing that decides whether an unreplicated condition can ever carry a ceiling. Rung 0 measures at full extent only; a later rung that scores a subset declares and computes its own restriction of these ceilings, per the frame rules above.
+**Passing means** Both ceilings significantly above the mismatched-pair null. A rung above them can then be reported as a fraction of what is achievable rather than as a fraction of a hypothetical 1.0.
 **If it is low** A low ceiling does not stop the rungs above it; it rescales them. A score of 0.2 against a ceiling of 0.2 sits at the limit the assay supports, while the same 0.2 against a ceiling of 0.9 is a large shortfall — reporting a rung without its ceiling makes those two indistinguishable.
+**Tasks** [docs/tasks/rung0-assay-reliability/design.md](tasks/rung0-assay-reliability/design.md) — OPEN. Supersedes the unmerged branch `rung0-replicate-ceiling`, whose gene and drug panels could not be justified from anything a reader at rung 0 can open.
 
 ### Rung 1 — can a model predict an unseen cell line, in-distribution?
 
 
 **Question** Given a cell line the model has never seen, can it predict that line's expression response to a drug?
 **Adds** One boundary: a cell line the model has not seen — where *unseen* is what the tranche's leakage profile asserts, not what the split assumes. Same platform, readout and substrate.
-**Measure** Correlation between predicted and measured delta on the held-out line, against a floor that must fail and a planted signal that must be recovered, reported as a fraction of rung 0's ceiling.
+**Measure** Correlation between predicted and measured delta on the held-out line, scored with rung 0's declared statistic — per-pair Pearson, mean over pairs, so the fraction is a ratio of like quantities — against a floor that must fail and a planted signal that must be recovered, reported as a fraction of rung 0's ceiling restricted to the genes and drugs this rung scores — whichever of rung 0's two ceilings matches the genes it scores — a restriction this rung declares before scoring.
 **Passing means** The method beats its floor and recovers a stated fraction of the ceiling — the minimum competence claim, in the easiest setting the ladder offers.
 **How it contextualises the rest** A model that fails here fails in-distribution, so a shortfall at any rung above is not evidence about organoids, platforms or readouts — the same weakness is already present with none of those boundaries crossed.
 
@@ -130,11 +138,11 @@ The rules stay generic: which artifact violates one today is current state, and 
    **Edge-case test** `::test_rule_01_edge_promoted_records_validate_against_the_schema` — every record must parse as `PromotedResult`, so a second provenance format cannot appear alongside the first without failing.
 
 2. **Reversing an analysis design, a method, or a data source is written into the task's own documents, not left to the commit.**
-   The old choice and the reason for changing it are dated and appended to the bottom of that task's `design.md` and `plan.md`, so the document a reader arrives at carries its own history.
+   The old choice and the reason for changing it are dated and appended to that task's `decisions.md`, labeled by the document they amend (project-level decisions go to `docs/decisions.md`), so a task's history sits in one findable place while `design.md` and `plan.md` carry the current position.
    A reversal recorded only in git log is invisible to everyone who reads the documents, which is how a decision gets silently reinstated by the next person to touch it.
    **Step** document. **Enforced by** `tests/test_project_rules.py::test_rule_02_every_task_is_named_in_the_spec_tree` (`-m step_document`).
    **Edge case** the check reads the document, not the work: a reversal carried out in code while the task document is left untouched passes it. Where the reversal moves a promoted number, rule 1's checksum catches it instead; where it changes a method without yet changing a number, nothing does.
-   **Edge-case test** `::test_rule_02_edge_non_additive_task_edits_carry_a_dated_entry` — a task document whose diff against the merge base deletes or rewrites existing lines must also gain a dated entry at its foot. Appending needs no entry; rewriting history does.
+   **Edge-case test** `::test_rule_02_edge_non_additive_task_edits_carry_a_dated_entry` — a task document (`design.md`, `plan.md`, or `decisions.md` itself) whose diff against the merge base deletes or rewrites existing lines must also gain a dated entry, in the document itself or in the task's `decisions.md`. Appending needs no entry; rewriting history does.
 
 3. **The README stays in step with the documents it summarises.**
    Most readers open the README and nothing else, so a stale summary misinforms more people than a stale document does.
@@ -143,7 +151,18 @@ The rules stay generic: which artifact violates one today is current state, and 
    **Edge case** a README can link correctly and still describe last month's ladder; no test reads prose for accuracy.
    **Edge-case test** `::test_rule_03_edge_readme_is_revisited_when_the_ladder_changes` — a change to the ladder in `docs/SPEC.md` requires `README.md` to have changed too. It proves the summary was revisited, not that it was revised well.
 
+4. **Every measurement step a task touches carries a positive and a negative control, and every promoted comparison reports its detection power.**
+   For each pipeline step that produces or transforms a measurement — load, build, restrict, split, fit, score, null; promote, release and document are bookkeeping — the task's `design.md` declares a positive control (plant a known signal, require the real code to recover it) and a negative control (feed signal-free or mismatched data, require null), implemented as known-answer tests that import the shipped functions.
+   Controls are placed relative to the measurement's minimum detectable effect, and every promoted comparison reports that MDE at the declared α and power beside its p-value — a null with no MDE cannot be told apart from an underpowered experiment.
+   **Step** score, null (declared at design time for every measurement step the task touches). **Enforced by** `tests/test_project_rules.py::test_rule_04_every_task_declares_controls_for_its_measurement_steps` (`-m "step_score or step_null"`).
+   **Edge case** the scan reads declarations, not implementations: a Controls section can describe a control no test implements, and a weak plant proves little. The known-answer tests are the implemented half, and they land with the code they validate.
+   **Edge-case test** `::test_rule_04_edge_promoted_tasks_have_known_answer_tests` — a promoted result may not exist while the repository carries no known-answer-marked test; skips until the first promotion.
+
 ## Process
 
 How work moves from question to promoted result — the lifecycle, the task folders, the compute boundary, the definition of done — is in [`docs/PROCESS.md`](PROCESS.md).
-The short version: every task gets a folder under `docs/tasks/`, a place in the ladder above, and a state entry; every promoted number carries provenance; every rule above is enforced by a named test.
+The short version: every task gets a folder under `docs/tasks/`, its own branch cut from the trunk, a place in the ladder above, and a state entry; every task passes a drift audit of its design against what actually landed **before its result is promoted**, to the standard in [`docs/audit.md`](audit.md); every promoted number carries provenance; every rule above is enforced by a named test; and every task carries a plain-language summary notebook of hypothesis, evidence and conclusions, walking the reviewer through each step with its figures, its pull request opening as a draft for one final review round.
+
+## Changes
+
+This document's dated change lineage lives in [`docs/decisions.md`](decisions.md) (moved 2026-08-31).
