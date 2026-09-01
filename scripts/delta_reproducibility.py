@@ -480,6 +480,68 @@ def masked_rowwise_pearson(
     return r
 
 
+def dense_pivots(
+    de: pd.DataFrame, panel: set[str], value_cols: tuple[str, ...]
+) -> tuple[pd.MultiIndex, pd.Index, dict[str, np.ndarray]]:
+    """Condition-by-gene matrices, built by scatter instead of ``pivot_table``.
+
+    ``pivot_table`` groups and unstacks, and on this screen's 451 million rows its intermediates
+    take more memory than the matrices they produce -- the first full-extent run reached 137 GB
+    of a 200 GB allocation in that call alone. The result is a dense array either way, so this
+    allocates it once and writes each row into place: linear in the rows, and the only large
+    objects are the matrices themselves.
+
+    Equivalent to ``pivot_table`` here, not merely similar. That function averages duplicate
+    (row, column) pairs; the frame this reads was produced by a ``GROUP BY`` on exactly
+    ``(patient, drug, gene_name)``, so no duplicates exist and a scatter and a mean agree. The
+    index and columns are sorted the same way, so downstream alignment is unchanged, and a
+    known-answer test asserts the two paths return identical arrays.
+    """
+    d = de[de["gene_name"].isin(panel)]
+
+    def codes(col: str) -> tuple[np.ndarray, np.ndarray]:
+        """Integer codes into the column's distinct values, plus those values."""
+        series = d[col]
+        if not isinstance(series.dtype, pd.CategoricalDtype):
+            series = series.astype("category")
+        cat = series.cat
+        used, idx = np.unique(cat.codes.to_numpy(), return_inverse=True)
+        return idx, np.asarray(cat.categories, dtype=object)[used]
+
+    p_idx, p_names = codes("patient")
+    g_idx, g_names = codes("gene_name")
+    d_idx, d_names = codes("drug")
+
+    # One code per (patient, drug), then sorted the way pivot_table sorts: by patient name, then
+    # drug name. The dictionary encoding the build returns orders categories by first appearance,
+    # not lexicographically, so the sort is applied explicitly rather than assumed from the codes.
+    pair = p_idx.astype(np.int64) * d_names.size + d_idx.astype(np.int64)
+    pair_used, cond_idx = np.unique(pair, return_inverse=True)
+    cond_patient = p_names[pair_used // d_names.size]
+    cond_drug = d_names[pair_used % d_names.size]
+    cond_order = np.lexsort((cond_drug, cond_patient))
+    cond_rank = np.empty_like(cond_order)
+    cond_rank[cond_order] = np.arange(cond_order.size)
+    rows = cond_rank[cond_idx]
+
+    # Columns keep the CATEGORY order, not a sorted one. Read off pandas rather than assumed:
+    # pivot_table sorts its index but leaves a categorical column axis in category order, and
+    # the dictionary encoding the build returns orders categories by first appearance. The gene
+    # axis is therefore arbitrary but consistent -- which is all the scorer needs, since it
+    # intersects the two halves' columns before correlating anything.
+    index = pd.MultiIndex.from_arrays(
+        [cond_patient[cond_order], cond_drug[cond_order]], names=["patient", "drug"]
+    )
+    columns = pd.Index(g_names, name="gene_name")
+
+    out: dict[str, np.ndarray] = {}
+    for col in value_cols:
+        mat = np.full((cond_order.size, g_names.size), np.nan, dtype=np.float64)
+        mat[rows, g_idx] = d[col].to_numpy(dtype=float)
+        out[col] = mat
+    return index, columns, out
+
+
 def score_split_half(
     de: pd.DataFrame,
     panel: set[str],
@@ -493,20 +555,14 @@ def score_split_half(
     pivots this function returns, which is what ``padj_pivot`` exists to guarantee. Passing
     ``None`` reproduces the unselected statistic exactly.
     """
-    d = de[de["gene_name"].isin(panel)]
-    piv0 = d.pivot_table(
-        index=["patient", "drug"], columns="gene_name", values="lfc0", observed=True
-    )
-    piv1 = d.pivot_table(
-        index=["patient", "drug"], columns="gene_name", values="lfc1", observed=True
-    )
-    common = piv0.index.intersection(piv1.index)
-    piv0, piv1 = piv0.loc[common], piv1.loc[common]
-    # pivot_table drops all-NaN columns per half, so the two halves can carry different gene
-    # sets even after the index intersection above -- callers that skip main()'s dropna could
-    # otherwise silently correlate misaligned genes whenever the column COUNTS happen to match.
-    cols = piv0.columns.intersection(piv1.columns)
-    piv0, piv1 = piv0[cols], piv1[cols]
+    # Both halves are scattered into ONE pass over the same rows, so they share an index and a
+    # column axis by construction. The pivot_table path needed an index and column intersection
+    # afterwards because it dropped all-NaN columns per half independently, which could leave
+    # the two halves carrying different gene sets whenever their column counts happened to
+    # match. That failure mode cannot arise here.
+    index, columns, mats = dense_pivots(de, panel, ("lfc0", "lfc1"))
+    piv0 = pd.DataFrame(mats["lfc0"], index=index, columns=columns)
+    piv1 = pd.DataFrame(mats["lfc1"], index=index, columns=columns)
     r = masked_rowwise_pearson(
         piv0.to_numpy(dtype=float), piv1.to_numpy(dtype=float), min_genes, select=select
     )
@@ -521,10 +577,8 @@ def padj_pivot(de: pd.DataFrame, panel: set[str]) -> pd.DataFrame:
     caller reindexes it onto the scored pivots' rows and columns, which is the alignment step
     that guarantees a mask entry refers to the gene it appears to refer to.
     """
-    d = de[de["gene_name"].isin(panel)]
-    return d.pivot_table(
-        index=["patient", "drug"], columns="gene_name", values="padj0", observed=True
-    )
+    index, columns, mats = dense_pivots(de, panel, ("padj0",))
+    return pd.DataFrame(mats["padj0"], index=index, columns=columns)
 
 
 def responder_overlap_table(de: pd.DataFrame, panel: set[str], alpha: float = 0.05) -> pd.DataFrame:
@@ -539,14 +593,8 @@ def responder_overlap_table(de: pd.DataFrame, panel: set[str], alpha: float = 0.
 
     Columns: ``patient``, ``drug``, ``n_first``, ``n_second``, ``n_both``, ``jaccard``.
     """
-    p0 = padj_pivot(de, panel)
-    p1 = de[de["gene_name"].isin(panel)].pivot_table(
-        index=["patient", "drug"], columns="gene_name", values="padj1", observed=True
-    )
-    cols = p0.columns.intersection(p1.columns)
-    rows = p0.index.intersection(p1.index)
-    a = p0.loc[rows, cols].to_numpy(dtype=float)
-    b = p1.loc[rows, cols].to_numpy(dtype=float)
+    rows, _, mats = dense_pivots(de, panel, ("padj0", "padj1"))
+    a, b = mats["padj0"], mats["padj1"]
     first = np.isfinite(a) & (a < alpha)
     second = np.isfinite(b) & (b < alpha)
     both = first & second

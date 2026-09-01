@@ -1150,3 +1150,30 @@ def test_responder_mask_cannot_read_the_second_group(tmp_path: Path) -> None:
         "the overlap diagnostic must read padj1, or this test cannot distinguish "
         "'selection ignores it' from 'nothing reads it'"
     )
+
+
+@pytest.mark.step_score
+def test_dense_pivots_match_pivot_table_exactly(tmp_path: Path) -> None:
+    """The scatter path must be equivalent to pandas' pivot_table, not merely similar.
+
+    pivot_table averages duplicate (row, column) pairs; the frame this reads comes from a GROUP
+    BY on exactly (patient, drug, gene_name), so there are no duplicates and the two agree.
+    Asserted rather than argued, because the whole reason to replace the call is that it takes
+    more memory than the matrices it produces -- and a faster path that quietly reorders rows or
+    columns would misalign every correlation without changing a single shape.
+    """
+    path = _write_fixture_pool(tmp_path, n_lines=5, n_drugs=3, n_genes=120, n_responders=40, seed=61)
+    de, _ = dr.build_split_half_frame([str(path)], None, None, tmp_path / "duck", "2GB")
+    de = de.dropna(subset=["lfc0", "lfc1"])
+    panel = set(de["gene_name"].unique())
+
+    index, columns, mats = dr.dense_pivots(de, panel, ("lfc0", "lfc1", "padj0"))
+    for col in ("lfc0", "lfc1", "padj0"):
+        expected = de[de["gene_name"].isin(panel)].pivot_table(
+            index=["patient", "drug"], columns="gene_name", values=col, observed=True
+        )
+        assert list(expected.index) == list(index), f"{col}: condition order differs"
+        assert list(expected.columns) == list(columns), f"{col}: gene order differs"
+        np.testing.assert_allclose(
+            expected.to_numpy(dtype=float), mats[col], equal_nan=True, rtol=0, atol=0
+        )
