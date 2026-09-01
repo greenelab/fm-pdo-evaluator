@@ -77,6 +77,42 @@ def _connect(tmp: Path, memory_limit: str = "36GB"):
     return con
 
 
+KEY_COLUMNS = ("patient", "drug", "gene_name", "dose")
+
+
+def _compact_df(result) -> pd.DataFrame:
+    """Fetch a DuckDB result as pandas with the key columns dictionary-encoded.
+
+    Rung 0 scores every drug in the screen, not the superseded rung's 32, so the aggregated
+    frame is tens of times larger and its three key columns repeat a few tens of thousands of
+    distinct strings across hundreds of millions of rows. As Python objects those strings, not
+    the fold changes, are what exhausts the job's memory. Arrow's dictionary encoding stores
+    each distinct value once and an integer code per row, and pandas reads a dictionary array
+    back as a Categorical, so the frame that reaches the scorer carries the same values at a
+    fraction of the footprint. Nothing downstream changes: a Categorical indexes, groups and
+    pivots exactly as the object column did.
+    """
+    import pyarrow as pa  # type: ignore  # Alpine-only
+
+    # `.arrow()` returns a RecordBatchReader on some DuckDB versions and a Table on others;
+    # `fetch_arrow_table()` is the one that is a Table everywhere, with the reader read out as
+    # the fallback. Read off the installed version rather than assumed -- the first version of
+    # this helper called `.arrow()` and failed on `column_names`.
+    for attr in ("to_arrow_table", "fetch_arrow_table", "arrow"):
+        if hasattr(result, attr):
+            tbl = getattr(result, attr)()
+            break
+    else:  # pragma: no cover - every supported DuckDB exposes one of the three
+        raise RuntimeError("this DuckDB build exposes no Arrow accessor")
+    if hasattr(tbl, "read_all"):  # a RecordBatchReader on some versions
+        tbl = tbl.read_all()
+    cols = [
+        tbl.column(i).dictionary_encode() if name in KEY_COLUMNS else tbl.column(i)
+        for i, name in enumerate(tbl.column_names)
+    ]
+    return pa.Table.from_arrays(cols, names=tbl.column_names).to_pandas()
+
+
 def _drug_predicate(target_names: list[str] | None) -> tuple[str, list[object]]:
     """The drug filter, and the parameters it needs — empty when every drug is admitted.
 
@@ -148,8 +184,8 @@ def build_split_half_frame(
             WHERE {chosen} IS NOT NULL{where}
             GROUP BY Cell_ID_DepMap, drug, gene_name""",
         [paths, *drug_params],
-    ).df()
-    return de, chosen
+    )
+    return _compact_df(de), chosen
 
 
 def build_noise_frame(
@@ -194,7 +230,7 @@ def build_noise_frame(
     dose_grp = f", {dose}" if dose else ""
     base = "avg(baseMean)" if "baseMean" in cols else "CAST(NULL AS DOUBLE)"
     where, drug_params = _drug_predicate(target_names)
-    return con.execute(
+    noise = con.execute(
         f"""SELECT Cell_ID_DepMap AS patient, drug, {dose_sel} gene_name,
                    var_samp(log2FoldChange) AS var_lfc,
                    avg(lfcSE * lfcSE) AS mean_se2,
@@ -206,7 +242,8 @@ def build_noise_frame(
             GROUP BY Cell_ID_DepMap, drug{dose_grp}, gene_name
             HAVING count(DISTINCT {repl}) >= 2""",
         [paths, *drug_params],
-    ).df()
+    )
+    return _compact_df(noise)
 
 
 def decompose_noise(noise: pd.DataFrame) -> pd.DataFrame:
@@ -282,8 +319,12 @@ def score_split_half(
     ``None`` reproduces the unselected statistic exactly.
     """
     d = de[de["gene_name"].isin(panel)]
-    piv0 = d.pivot_table(index=["patient", "drug"], columns="gene_name", values="lfc0")
-    piv1 = d.pivot_table(index=["patient", "drug"], columns="gene_name", values="lfc1")
+    piv0 = d.pivot_table(
+        index=["patient", "drug"], columns="gene_name", values="lfc0", observed=True
+    )
+    piv1 = d.pivot_table(
+        index=["patient", "drug"], columns="gene_name", values="lfc1", observed=True
+    )
     common = piv0.index.intersection(piv1.index)
     piv0, piv1 = piv0.loc[common], piv1.loc[common]
     # pivot_table drops all-NaN columns per half, so the two halves can carry different gene
@@ -306,7 +347,9 @@ def padj_pivot(de: pd.DataFrame, panel: set[str]) -> pd.DataFrame:
     that guarantees a mask entry refers to the gene it appears to refer to.
     """
     d = de[de["gene_name"].isin(panel)]
-    return d.pivot_table(index=["patient", "drug"], columns="gene_name", values="padj0")
+    return d.pivot_table(
+        index=["patient", "drug"], columns="gene_name", values="padj0", observed=True
+    )
 
 
 def responder_overlap_table(de: pd.DataFrame, panel: set[str], alpha: float = 0.05) -> pd.DataFrame:
@@ -323,7 +366,7 @@ def responder_overlap_table(de: pd.DataFrame, panel: set[str], alpha: float = 0.
     """
     p0 = padj_pivot(de, panel)
     p1 = de[de["gene_name"].isin(panel)].pivot_table(
-        index=["patient", "drug"], columns="gene_name", values="padj1"
+        index=["patient", "drug"], columns="gene_name", values="padj1", observed=True
     )
     cols = p0.columns.intersection(p1.columns)
     rows = p0.index.intersection(p1.index)
