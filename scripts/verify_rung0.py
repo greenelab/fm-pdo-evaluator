@@ -503,12 +503,15 @@ def check_noise_decomposition(task_dir: Path) -> list[Check]:
     # phase of the job and the one that has failed most, so a battery that raises on its absence
     # is unusable exactly when it is most needed -- reviewing a partial run.
     if not (task_dir / NOISE).exists() or not (task_dir / NOISE_PER_GENE).exists():
+        # One skip per check the full path runs, under the SAME names. A battery whose shape
+        # changes with which stages completed cannot have its coverage asserted -- the count
+        # test and the layer test both read the names, and a partial run would silently look
+        # like a battery missing a check rather than a stage that has not happened.
+        why = f"{NOISE} / {NOISE_PER_GENE} not written yet"
         return [
-            skipped(
-                "noise: the decomposition's reported figures",
-                f"{NOISE} / {NOISE_PER_GENE} not written yet",
-            ),
-            skipped("noise: the per-gene variance identity", "the decomposition has not run"),
+            skipped("noise: the per-gene table has the row count the summary reports", why),
+            skipped("noise: between-plate fraction is the mean of the per-gene fractions", why),
+            skipped("noise: sigma2_plate = max(var_lfc - mean_se2, 0) row by row", why),
         ]
     reported = read_table(task_dir / NOISE).iloc[0]
     n_rows, total, n_finite, worst = _stream_noise(task_dir / NOISE_PER_GENE)

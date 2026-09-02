@@ -147,8 +147,15 @@ def test_a_perturbed_claim_fails_the_battery(artifacts: Path) -> None:
         f"the battery passed on a summary whose all-gene mean was moved from {original} to 0.123; "
         f"failures reported: {failed}"
     )
-    # And the recorded checksum notices the altered file, which is what ties what an auditor read
-    # to what a reviewer later pulls.
-    assert any("checksum recomputes" in name for name in failed), (
-        f"the recorded checksums did not notice an altered artifact; failures: {failed}"
-    )
+    # And where the run recorded checksums, they notice the altered file too -- that is what ties
+    # what an auditor read to what a reviewer later pulls. A run that was killed before writing
+    # them has nothing to check against, and this asserts the difference rather than assuming a
+    # complete run: the arithmetic check above catches the edit either way.
+    if (artifacts / vr.CHECKSUMS).exists():
+        assert any("checksum recomputes" in name for name in failed), (
+            f"the recorded checksums did not notice an altered artifact; failures: {failed}"
+        )
+    else:
+        assert any("checksum recomputes" in str(c.name) and c.skipped for c in checks), (
+            "with no checksum record the battery must SKIP that check, not silently pass it"
+        )
