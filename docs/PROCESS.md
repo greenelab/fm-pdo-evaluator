@@ -149,6 +149,7 @@ A result without a `.provenance.json` provenance record is not citable in a writ
   `git ls-files '*.py' '*.ipynb' | xargs uv run ruff check`, the same with `ruff format --check`, then `uv run pyright`.
   Continuous integration runs `ruff check .` on a clean checkout, which lints notebook code cells too; a local gate scoped to source directories cannot see a violation in a committed notebook, and the branch went red for a day on exactly that gap.
   Selecting tracked files keeps the untracked working-tree strays out (the reason the scoping existed) without hiding anything continuous integration will see.
+  **Run the gates after staging, not before.** `git ls-files` lists what is tracked *now*, so a file added in the same change is invisible to a gate run before `git add` — which is how a notebook reached a commit unformatted while the local check reported every file clean. Continuous integration sees the committed tree and has no such blind spot, so the gate that matters is the one run against what is about to be committed.
 - **Run the project-rule tests for what you touched.**
   `uv run pytest tests/test_project_rules.py` every time — they may catch a violation the task never intended — plus `-m` for the steps named in the task's `design.md` header, e.g. `uv run pytest -m "step_split or step_score"`.
   The step-to-rule-to-test mapping sits under each rule in `docs/SPEC.md`, and each step's marker is registered in `pyproject.toml` alongside the test that uses it, so the selection is the same whichever rung or dataset the task is about.
