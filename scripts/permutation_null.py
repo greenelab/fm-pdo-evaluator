@@ -183,7 +183,7 @@ def permutation_null(
     variance of the mean under permutation resampling to the variance an i.i.d. pool of the
     same size would have (``stratified_null_draws``'s ``any_pair`` stratum, the pool a
     permutation's composition matches): the number the write-up caveat in
-    `docs/tasks/rung0-replicate-ceiling/verification.md` could only bound theoretically.
+    the superseded branch's verification write-up could only bound theoretically.
 
     ``pools``, if given, must be `stratified_null_draws`'s return value computed on the same
     (``piv0_f``, ``piv1_f``, ``n_perm``, ``seed``, ``min_genes``) this function would use --

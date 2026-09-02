@@ -1017,26 +1017,6 @@ def pool_description(
     ).df()
 
 
-def write_figure(r: np.ndarray, nulls: dict[str, np.ndarray], out_png: Path) -> None:
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    fig, ax = plt.subplots(figsize=(7, 4.5))
-    bins = np.linspace(-0.3, 0.8, 56)
-    ax.hist(r[np.isfinite(r)], bins=bins, density=True, alpha=0.65, label="matched pairs")
-    ax.hist(nulls["diff_drug"], bins=bins, density=True, alpha=0.45, label="diff-drug null")
-    ax.hist(nulls["same_drug"], bins=bins, density=True, alpha=0.45, label="same-drug null")
-    ax.axvline(float(np.nanmean(r)), color="k", lw=1.5, label="mean (headline)")
-    ax.set_xlabel("split-half Pearson r per (line, drug) pair")
-    ax.set_ylabel("density")
-    ax.legend(frameon=False)
-    fig.tight_layout()
-    fig.savefig(out_png, dpi=150)
-    plt.close(fig)
-
-
 def write_per_gene_figure(per_gene: pd.DataFrame, out_png: Path) -> None:
     """Histogram of the per-gene split-half diagnostic (design.md, 'per-gene reliability').
 
@@ -1515,6 +1495,25 @@ def main() -> None:
         )
         by_condition.round(6).to_csv(out_dir / "rung0_noise_by_condition.csv", index=False)
         print(f"per-condition noise: {len(by_condition):,} conditions")
+
+        # The design says the between-plate share is aggregated "over genes within a condition
+        # and over conditions". The engine-side figure above is a flat mean over gene-conditions,
+        # which weights a condition by how many of its genes were testable -- and testability
+        # varies a lot here, since DESeq2 could not test most rows. Both are reported: the flat
+        # mean, and the mean over conditions of each condition's own mean, which is what the
+        # design's wording describes. Where they disagree, the gap is uneven gene coverage.
+        per_cond = by_condition["between_plate_fraction_mean"].to_numpy(dtype=float)
+        per_cond = per_cond[np.isfinite(per_cond)]
+        noise_summary["between_plate_fraction_mean_over_conditions"] = round(
+            float(np.mean(per_cond)), 5
+        )
+        noise_summary["n_conditions_decomposed"] = int(per_cond.size)
+        pd.DataFrame([noise_summary]).round(5).to_csv(noise_path, index=False)
+        print(
+            "between-plate share: "
+            f"{noise_summary['between_plate_fraction_mean']:.4f} over gene-conditions, "
+            f"{noise_summary['between_plate_fraction_mean_over_conditions']:.4f} over conditions"
+        )
 
         noise = decompose_noise(
             build_noise_frame(

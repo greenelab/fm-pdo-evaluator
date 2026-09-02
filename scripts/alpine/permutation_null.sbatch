@@ -10,7 +10,7 @@
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.out
 #
-# Rung-0 permutation-based exact permutation null (docs/tasks/rung0-replicate-ceiling/design.md,
+# Rung-0 permutation-based exact permutation null (docs/tasks/rung0-assay-reliability/design.md,
 # decision history). Reuses the same DuckDB split-half build as delta_reproducibility.sbatch,
 # then runs THREE permutation-based nulls over the half-profile pivots, carrying the
 # half-profile-sharing dependence the bootstrapped p-values had to assume away by construction

@@ -9,14 +9,14 @@ its claim.
 
 Usage (rung 0):
     uv run python scripts/promote_result.py \
-        --task rung0-replicate-ceiling \
-        --result docs/tasks/rung0-replicate-ceiling/rung0_delta_reproducibility.csv \
+        --task rung0-assay-reliability \
+        --result docs/tasks/rung0-assay-reliability/rung0_reliability.csv \
         --script scripts/delta_reproducibility.py \
         --input gene_panel=/path/to/common_panel.txt \
         --input drug_cids=/path/to/tahoe_target_cids.txt \
         --seed 0 --data-commit <tranche content_hash> \
         --arg tranche_id=tahoe100m-pseudobulk-de.v1 --job-id <slurm id> \
-        --log results/rung0-replicate-ceiling/<job log>
+        --log results/rung0-assay-reliability/<job log>
 
 ``--input`` takes ``LABEL=PATH``, so the promoted record's ``inputs`` dict is keyed by a durable
 label rather than a scratch path; a bare ``PATH`` (no ``=``) is still accepted for back-compat
@@ -124,7 +124,7 @@ def promote(
 
     # Check clean_tree status before writing any files. ``-uno`` restricts this to tracked
     # files: this project's working trees deliberately carry untracked data (rung 0's plan,
-    # docs/tasks/rung0-replicate-ceiling/plan.md, Global Constraints), locally and on the
+    # docs/tasks/rung0-assay-reliability/plan.md, Global constraints), locally and on the
     # cluster, so counting untracked files would make clean_tree permanently False and
     # meaningless. What this flag records is whether the tracked code and docs carried
     # uncommitted modifications at promotion time.

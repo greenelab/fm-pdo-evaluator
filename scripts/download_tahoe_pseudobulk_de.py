@@ -19,7 +19,7 @@ from pathlib import Path
 
 TAHOE = "tahoebio/Tahoe-100M"
 DE = "pseudobulk_differential_expression"
-# The revision registered as tahoe100m-pseudobulk-de.v1 (docs/tasks/rung0-replicate-ceiling/
+# The revision registered as tahoe100m-pseudobulk-de.v1 (docs/tasks/rung0-assay-reliability/
 # verification.md): "registered tahoe100m-pseudobulk-de.v1: 1026 shards, version
 # 2dc57900b7981cfcf5e211527169a0b006546a95". Pinning here means a re-download always
 # reproduces the same tranche instead of silently picking up whatever HF Hub serves as

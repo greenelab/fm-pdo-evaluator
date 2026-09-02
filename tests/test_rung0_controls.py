@@ -128,7 +128,11 @@ def test_build_positive_planted_pool_comes_out_with_the_planted_shape(tmp_path: 
     assert de["gene_name"].nunique() == 300
 
 
+@pytest.mark.step_split
 def test_build_negative_no_replication_yields_no_scoreable_pairs(tmp_path: Path) -> None:
+    """Negative control for split as well as build: with one plate there is no second group,
+    so no condition is scoreable. Marked for both steps because it is the evidence for both --
+    `-m step_split` selecting nothing is a step whose controls cannot be run on demand."""
     path = _write_fixture_pool(tmp_path, plates=("P1",))  # one plate: one half stays empty
     de, _ = dr.build_split_half_frame(
         [str(path)], ["D0", "D1", "D2"], None, tmp_path / "duck", memory_limit="2GB"
@@ -1163,7 +1167,9 @@ def test_dense_pivots_match_pivot_table_exactly(tmp_path: Path) -> None:
     more memory than the matrices it produces -- and a faster path that quietly reorders rows or
     columns would misalign every correlation without changing a single shape.
     """
-    path = _write_fixture_pool(tmp_path, n_lines=5, n_drugs=3, n_genes=120, n_responders=40, seed=61)
+    path = _write_fixture_pool(
+        tmp_path, n_lines=5, n_drugs=3, n_genes=120, n_responders=40, seed=61
+    )
     de, _ = dr.build_split_half_frame([str(path)], None, None, tmp_path / "duck", "2GB")
     de = de.dropna(subset=["lfc0", "lfc1"])
     panel = set(de["gene_name"].unique())
