@@ -596,8 +596,18 @@ def check_figures(task_dir: Path) -> list[Check]:
         checks.append(skipped("the score figure's printed correlations", f"no {SCORE_VALUES}"))
         return checks
     values = read_table(values_path)
-    recomputed = _pearson_by_group(values, "example_id", "lfc0", "lfc1")
-    printed = values.groupby("example_id")["r_printed"].first().to_dict()
+    # One panel is an (example, gene set) pair, not an example: the score figure draws each
+    # example twice, over all genes and over that condition's responders, and the two print
+    # different correlations. Grouping by example alone silently pools two panels' points and
+    # matches neither -- which is how this check caught the change that introduced the second
+    # row rather than passing over it.
+    key = "panel"
+    if "gene_set" in values.columns:
+        values = values.assign(panel=values["example_id"] + " | " + values["gene_set"])
+    else:
+        values = values.assign(panel=values["example_id"])
+    recomputed = _pearson_by_group(values, key, "lfc0", "lfc1")
+    printed = values.groupby(key)["r_printed"].first().to_dict()
     disagree = [str(k) for k, v in printed.items() if not _close(float(v), recomputed[str(k)], 4)]
     checks.append(
         Check(
