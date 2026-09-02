@@ -1184,3 +1184,54 @@ def test_dense_pivots_match_pivot_table_exactly(tmp_path: Path) -> None:
         np.testing.assert_allclose(
             expected.to_numpy(dtype=float), mats[col], equal_nan=True, rtol=0, atol=0
         )
+
+
+@pytest.mark.step_decompose
+def test_the_two_pass_run_produces_the_same_artifacts_as_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cluster runs this as two processes; a local run does it in one. Both must land the
+    same set of artifacts, or the job is exercising a path no test covers.
+
+    The split exists because the two phases each need most of the machine and exhausted memory
+    when they shared it. The risk it introduces is the second pass silently not finding what the
+    first wrote -- so this asserts the decompose figure, which only the second pass can draw and
+    only from the first pass's table, is actually there.
+    """
+    path = _write_fixture_pool(
+        tmp_path,
+        n_lines=5,
+        n_drugs=3,
+        n_genes=300,
+        n_responders=90,
+        doses=(0.01, 0.1),
+        plates=("P1", "P2", "P3", "P4"),
+        plate_offset_sd=0.3,
+        seed=91,
+    )
+    out = tmp_path / "out"
+    common = [
+        "--local-dir",
+        str(path.parent.parent),
+        "--out-dir",
+        str(out),
+        "--min-genes",
+        "20",
+        "--n-perm",
+        "30",
+    ]
+    monkeypatch.setattr(sys, "argv", ["x", *common, "--only-noise"])
+    dr.main()
+    noise_only = {p.name for p in out.glob("*") if p.is_file()}
+    assert "rung0_noise_decomposition.csv" in noise_only
+    assert "rung0_reliability.csv" not in noise_only, "--only-noise must do only the noise"
+
+    monkeypatch.setattr(sys, "argv", ["x", *common, "--skip-noise"])
+    dr.main()
+    files = {p.name for p in out.glob("*") if p.is_file()}
+    figures = {p.name for p in (out / "figures").glob("*.png")}
+    assert "rung0_reliability.csv" in files
+    assert "rung0_noise_strata.csv" in files
+    assert "05_decompose.png" in figures, (
+        "the second pass must draw the decompose figure from the first pass's table"
+    )

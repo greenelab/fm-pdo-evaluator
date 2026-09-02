@@ -62,8 +62,21 @@ python -c "import duckdb, matplotlib" 2>/dev/null || pip install -q "duckdb>=1.0
 # ceiling a measurement of a subset nobody at rung 0 can justify. A later rung that scores a
 # subset computes its own restriction and supplies its own files.
 OUT_DIR="${OUT_DIR:-docs/tasks/rung0-assay-reliability}"
+# Two passes, deliberately. The noise decomposition groups four billion rows into roughly one
+# and a half billion and needs most of the machine; the reliability pass holds two dense
+# condition-by-gene matrices in pandas and needs most of the machine too. Sharing one allocation
+# exhausted memory twice -- job 31985344 with pandas over the limit at 184.9 GB, job 31995022
+# with the engine over its own at 55.8 GB. Separate processes give each phase the room it needs,
+# and cost one extra read of a table that is on scratch anyway.
+python scripts/delta_reproducibility.py \
+    --local-dir "/scratch/alpine/$USER/tahoe_pseudobulk_de" \
+    --only-noise \
+    --duckdb-memory 150GB \
+    --out-dir "$OUT_DIR"
+
 python scripts/delta_reproducibility.py \
     --local-dir "/scratch/alpine/$USER/tahoe_pseudobulk_de" \
     --frame-cache "/scratch/alpine/$USER/rung0_frame_cache" \
-    --duckdb-memory 60GB \
+    --skip-noise \
+    --duckdb-memory 40GB \
     --out-dir "$OUT_DIR"

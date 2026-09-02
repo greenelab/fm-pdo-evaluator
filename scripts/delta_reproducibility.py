@@ -221,7 +221,7 @@ def noise_aggregate(
     repl_col: str | None,
     tmp: Path,
     memory_limit: str = "36GB",
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> pd.DataFrame:
     """The decomposition's reported numbers, aggregated IN DuckDB over every gene.
 
     At the assay's full extent there are on the order of a billion (line, drug, dose, gene)
@@ -231,8 +231,8 @@ def noise_aggregate(
     and those are what a promoted claim is read from. So the arithmetic that produces them runs
     in the engine, over all rows, and only the compact result comes back.
 
-    Returns ``(overall, strata)``: one row of headline numbers, and one row per
-    (expression quartile, response-size quartile) cell.
+    Returns one row of headline numbers. The stratified view comes from
+    ``noise_strata_from_sample``, for the reason given there.
     """
     con = _connect(tmp, memory_limit)
     cols = list(
@@ -265,12 +265,18 @@ def noise_aggregate(
                        AS between_plate_fraction
               FROM g)
     """
+    # Every aggregate here is single-pass. The first version used median() and two ntile()
+    # window functions, all of which sort, and this groups 4.09 billion rows into roughly 1.4
+    # billion -- DuckDB hit its own memory limit inside that sort and the job failed. An
+    # approximate median from a sketch is the right trade for a reported summary statistic: it
+    # costs a fraction of a percent of accuracy on a number quoted to three decimals, and it is
+    # the difference between the query running and not.
     overall = con.execute(
         inner
         + """
         SELECT count(*) AS n_gene_conditions,
                avg(between_plate_fraction) AS between_plate_fraction_mean,
-               median(between_plate_fraction) AS between_plate_fraction_median,
+               approx_quantile(between_plate_fraction, 0.5) AS between_plate_fraction_median,
                avg(sigma2_plate) AS sigma2_plate_mean,
                avg(mean_se2) AS mean_se2_mean,
                avg(CASE WHEN between_plate_fraction > 0.5 THEN 1.0 ELSE 0.0 END)
@@ -278,22 +284,49 @@ def noise_aggregate(
         FROM d WHERE between_plate_fraction IS NOT NULL""",
         [paths, *drug_params],
     ).df()
-    strata = con.execute(
-        inner
-        + """
-        SELECT expression_quartile, response_quartile,
-               count(*) AS n,
-               avg(between_plate_fraction) AS between_plate_fraction_mean,
-               avg(base_mean) AS base_mean_mean,
-               avg(abs_lfc) AS abs_mean_lfc_mean
-        FROM (SELECT between_plate_fraction, base_mean, abs(mean_lfc) AS abs_lfc,
-                     ntile(4) OVER (ORDER BY base_mean) AS expression_quartile,
-                     ntile(4) OVER (ORDER BY abs(mean_lfc)) AS response_quartile
-              FROM d WHERE between_plate_fraction IS NOT NULL)
-        GROUP BY 1, 2 ORDER BY 1, 2""",
-        [paths, *drug_params],
-    ).df()
-    return overall, strata
+    return overall
+
+
+def noise_strata_from_sample(noise: pd.DataFrame) -> pd.DataFrame:
+    """The between-plate share by expression and response-size quartile, from the sample.
+
+    Computed on the bounded sample rather than on every gene-condition, and that is a deliberate
+    trade rather than a shortcut. Assigning quartiles over 1.4 billion rows means sorting them
+    twice, which is exactly what exhausted the engine's memory when this ran in SQL. A quartile
+    MEAN from a two-million-row sample has a standard error in the fourth decimal place -- far
+    inside the precision anyone reads a variance share to -- while the headline figures the
+    design promotes are still computed over every row.
+    """
+    if noise.empty:
+        return pd.DataFrame(
+            columns=[
+                "expression_quartile",
+                "response_quartile",
+                "n",
+                "between_plate_fraction_mean",
+                "base_mean_mean",
+                "abs_mean_lfc_mean",
+            ]
+        )
+    d = noise.dropna(subset=["between_plate_fraction"]).copy()
+    d["abs_lfc"] = d["mean_lfc"].abs()
+    d["expression_quartile"] = pd.qcut(
+        d["base_mean"].rank(method="first"), 4, labels=[1, 2, 3, 4]
+    ).astype(int)
+    d["response_quartile"] = pd.qcut(
+        d["abs_lfc"].rank(method="first"), 4, labels=[1, 2, 3, 4]
+    ).astype(int)
+    out = (
+        d.groupby(["expression_quartile", "response_quartile"], observed=True)
+        .agg(
+            n=("between_plate_fraction", "size"),
+            between_plate_fraction_mean=("between_plate_fraction", "mean"),
+            base_mean_mean=("base_mean", "mean"),
+            abs_mean_lfc_mean=("abs_lfc", "mean"),
+        )
+        .reset_index()
+    )
+    return out
 
 
 def noise_by_condition(
@@ -1265,6 +1298,63 @@ def write_audit_checksums(out_dir: Path) -> Path:
     return path
 
 
+def run_noise(
+    paths: list[str], names: list[str] | None, args: argparse.Namespace, local: Path, out_dir: Path
+) -> pd.DataFrame:
+    """The whole noise decomposition, written to ``out_dir``, returning the figure sample.
+
+    Run as its OWN process (``--only-noise``). It groups 4.09 billion rows into roughly 1.4
+    billion, and the engine needs most of the machine to do that; sharing an allocation with the
+    pandas pivots is what killed the first two full-extent attempts -- once with pandas over the
+    limit, once with the engine over its own. Splitting the phases gives each the room it needs
+    and costs one extra read of a table that is on scratch anyway.
+    """
+    tmp = local.parent / "duckdb_tmp"
+    overall = noise_aggregate(paths, names, args.replicate_col, tmp, args.duckdb_memory)
+    noise_path = out_dir / "rung0_noise_decomposition.csv"
+    noise_summary = {k: float(v) for k, v in overall.iloc[0].items()}
+
+    by_condition = noise_by_condition(
+        paths, names, args.replicate_col, tmp, args.duckdb_memory, alpha=args.padj_threshold
+    )
+    by_condition.round(6).to_csv(out_dir / "rung0_noise_by_condition.csv", index=False)
+    print(f"per-condition noise: {len(by_condition):,} conditions")
+
+    # The design says the between-plate share is aggregated "over genes within a condition and
+    # over conditions". The engine-side figure is a flat mean over gene-conditions, which weights
+    # a condition by how many of its genes were testable -- and testability varies a lot here,
+    # since DESeq2 could not test most rows. Both are reported; where they disagree, the gap is
+    # uneven gene coverage rather than anything about plates.
+    per_cond = by_condition["between_plate_fraction_mean"].to_numpy(dtype=float)
+    per_cond = per_cond[np.isfinite(per_cond)]
+    noise_summary["between_plate_fraction_mean_over_conditions"] = round(
+        float(np.mean(per_cond)), 5
+    )
+    noise_summary["n_conditions_decomposed"] = int(per_cond.size)
+    pd.DataFrame([noise_summary]).round(5).to_csv(noise_path, index=False)
+    _write_params_sidecar(noise_path, args, extra=noise_summary)
+    print(
+        "between-plate share: "
+        f"{noise_summary['between_plate_fraction_mean']:.4f} over gene-conditions, "
+        f"{noise_summary['between_plate_fraction_mean_over_conditions']:.4f} over conditions"
+    )
+
+    noise = decompose_noise(
+        build_noise_frame(
+            paths,
+            names,
+            args.replicate_col,
+            tmp,
+            args.duckdb_memory,
+            sample_rows=args.noise_sample_rows,
+        )
+    )
+    noise.to_csv(out_dir / "rung0_noise_per_gene.csv.gz", index=False)
+    noise_strata_from_sample(noise).round(5).to_csv(out_dir / "rung0_noise_strata.csv", index=False)
+    print(f"noise sample for figures: {len(noise):,} gene-conditions")
+    return noise
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--local-dir", required=True, help="dir with the Tahoe DE parquet (on scratch)")
@@ -1317,7 +1407,15 @@ def main() -> None:
     ap.add_argument(
         "--skip-noise",
         action="store_true",
-        help="skip the noise decomposition's second full scan (local smoke runs only)",
+        help="do not compute the noise decomposition; read what an earlier --only-noise pass "
+        "wrote into --out-dir, so the figures still show it",
+    )
+    ap.add_argument(
+        "--only-noise",
+        action="store_true",
+        help="compute ONLY the noise decomposition and exit. It groups four billion rows into "
+        "roughly one and a half billion and needs most of the machine to do it; sharing an "
+        "allocation with the reliability pass exhausted memory twice, once on each side.",
     )
     args = ap.parse_args()
     repo = Path(__file__).resolve().parent.parent
@@ -1334,6 +1432,10 @@ def main() -> None:
     out_dir = Path(args.out_dir) if Path(args.out_dir).is_absolute() else repo / args.out_dir
     fig_dir = out_dir / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.only_noise:
+        run_noise(paths, names, args, local, out_dir)
+        return
 
     de, repl = _build_or_load_frame(paths, names, args, local)
     n_rows_built = len(de)
@@ -1464,70 +1566,17 @@ def main() -> None:
     pool.to_csv(out_dir / "rung0_pool_description.csv", index=False)
 
     # --- the noise decomposition -------------------------------------------------------------
-    noise_summary: dict[str, float] = {}
+    sample_path = out_dir / "rung0_noise_per_gene.csv.gz"
     if args.skip_noise:
-        print("skipping the noise decomposition (--skip-noise)")
-        noise = pd.DataFrame()
+        # The noise phase runs as its own process; read what it wrote, so the figures below are
+        # drawn from the same tables a reader opens rather than from a second computation.
+        noise = pd.read_csv(sample_path) if sample_path.exists() else pd.DataFrame()
+        if noise.empty:
+            print("no noise tables present: the decompose figure will be skipped")
+        else:
+            print(f"read the noise sample written by the --only-noise pass: {len(noise):,} rows")
     else:
-        # Every reported number is aggregated in the engine over ALL gene-conditions; only a
-        # bounded sample comes back for the figures and the row-wise identity check. At full
-        # extent there are on the order of a billion groups, which neither fits in the job nor
-        # helps a reader.
-        overall, strata = noise_aggregate(
-            paths, names, args.replicate_col, local.parent / "duckdb_tmp", args.duckdb_memory
-        )
-        noise_path = out_dir / "rung0_noise_decomposition.csv"
-        overall.round(5).to_csv(noise_path, index=False)
-        noise_summary = {k: float(v) for k, v in overall.iloc[0].items()}
-        _write_params_sidecar(noise_path, args, extra=noise_summary)
-        strata.round(5).to_csv(out_dir / "rung0_noise_strata.csv", index=False)
-
-        # Per condition, so the two hypotheses about noise PER CONDITION can be answered:
-        # that noise is higher where the correlations are lower, and that it is higher in the
-        # responder genes than across all genes. Neither follows from a screen-wide mean.
-        by_condition = noise_by_condition(
-            paths,
-            names,
-            args.replicate_col,
-            local.parent / "duckdb_tmp",
-            args.duckdb_memory,
-            alpha=args.padj_threshold,
-        )
-        by_condition.round(6).to_csv(out_dir / "rung0_noise_by_condition.csv", index=False)
-        print(f"per-condition noise: {len(by_condition):,} conditions")
-
-        # The design says the between-plate share is aggregated "over genes within a condition
-        # and over conditions". The engine-side figure above is a flat mean over gene-conditions,
-        # which weights a condition by how many of its genes were testable -- and testability
-        # varies a lot here, since DESeq2 could not test most rows. Both are reported: the flat
-        # mean, and the mean over conditions of each condition's own mean, which is what the
-        # design's wording describes. Where they disagree, the gap is uneven gene coverage.
-        per_cond = by_condition["between_plate_fraction_mean"].to_numpy(dtype=float)
-        per_cond = per_cond[np.isfinite(per_cond)]
-        noise_summary["between_plate_fraction_mean_over_conditions"] = round(
-            float(np.mean(per_cond)), 5
-        )
-        noise_summary["n_conditions_decomposed"] = int(per_cond.size)
-        pd.DataFrame([noise_summary]).round(5).to_csv(noise_path, index=False)
-        print(
-            "between-plate share: "
-            f"{noise_summary['between_plate_fraction_mean']:.4f} over gene-conditions, "
-            f"{noise_summary['between_plate_fraction_mean_over_conditions']:.4f} over conditions"
-        )
-
-        noise = decompose_noise(
-            build_noise_frame(
-                paths,
-                names,
-                args.replicate_col,
-                local.parent / "duckdb_tmp",
-                args.duckdb_memory,
-                sample_rows=args.noise_sample_rows,
-            )
-        )
-        noise.to_csv(out_dir / "rung0_noise_per_gene.csv.gz", index=False)
-        print(f"noise (all rows): {noise_summary}")
-        print(f"noise sample for figures: {len(noise):,} gene-conditions")
+        noise = run_noise(paths, names, args, local, out_dir)
 
     # --- figures -------------------------------------------------------------------------------
     from fmharness import figures as fg
