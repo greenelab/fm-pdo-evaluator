@@ -72,6 +72,8 @@ python scripts/delta_reproducibility.py \
     --local-dir "/scratch/alpine/$USER/tahoe_pseudobulk_de" \
     --only-noise \
     --duckdb-memory 150GB \
+    --noise-partitions 16 \
+    --duckdb-threads 4 \
     --out-dir "$OUT_DIR"
 
 python scripts/delta_reproducibility.py \
