@@ -4,12 +4,11 @@
 The spec says what each rung must establish and what a passing result means; this document says where each one stands.
 It carries no history: a rung's result belongs here, how it came to be belongs in git and in that rung's spec.
 
-**As of** 2026-09-01.
+**As of** 2026-09-02.
 
 A number not carried here with its provenance record is not evidence.
 Promotion means a result in `results/<task-slug>/` with a `<result>.provenance.json` beside it recording the commit, job and inputs that produced it — project rule 1.
-No `results/` directory exists yet, so nothing in this repository is evidence of anything.
-Rung 0's measurement is running; its outputs stay in the task folder and out of the git record until the summary has been read and the result promoted (PROCESS section 1).
+Rung 0 has promoted one result, and it is provisional: a dose-pooled reliability that measures a dose-to-dose correlation rather than a test-retest reliability, promoted so the run is traceable rather than because it settles the rung. Its provenance record says so in its own `dose_handling` field. No rung is closed.
 
 ---
 
@@ -17,7 +16,7 @@ Rung 0's measurement is running; its outputs stay in the task folder and out of 
 
 | Rung | What the spec requires | Status |
 |---|---|---|
-| 0 — assay reliability | Two reproducibility ceilings clearing their nulls at the assay's full extent — all genes, and each condition's responders — with replicate noise decomposed into plate and cell-sampling parts | **In progress.** Design approved and the apparatus landed on branch `rung0-assay-reliability` ([design](tasks/rung0-assay-reliability/design.md), [plan](tasks/rung0-assay-reliability/plan.md)); the measurement is running on Alpine. **Nothing promoted** — promotion follows the summary review, so no number here is evidence yet |
+| 0 — assay reliability | Two reproducibility ceilings clearing their nulls at the assay's full extent — all genes, and each condition's responders — with replicate noise decomposed into plate and cell-sampling parts | **Provisional result promoted, rung not closed.** Dose-pooled run on branch `rung0-assay-reliability` ([design](tasks/rung0-assay-reliability/design.md) · [summary](tasks/rung0-assay-reliability/summary.ipynb) · [result](../results/rung0-assay-reliability/rung0_reliability.csv)): all-gene split-half **0.118** (Spearman-Brown **0.210**) over 18,329 conditions, responders **0.559** (**0.717**) over 16,644, both clearing their floors at p = 0.0005. **Not usable as a ceiling**: dose is confounded with plate on this screen, so the two halves carry different doses for 99.7% of conditions and the number is a dose-to-dose correlation. The dose-fixed correction is in the code and had not run when the cluster went down. The noise decomposition never completed |
 | 1 — held-out line | Prediction beating a floor and recovering a planted signal, as a fraction of rung 0 | Not started |
 | 2 — bulk read by a single-cell model | A synthesised population landing near the same material's real single cells, clearing a mismatched-line null | Not started |
 | 3 — cross-platform | Retention separable from a scrambled-line control | Not started |
@@ -33,7 +32,7 @@ A rung closes when its result is promoted with provenance, this table records it
 | Present | Consequence |
 |---|---|
 | Schema, determinism and adapter scaffolding, with tests | The apparatus a rung is added to exists; nothing here yet produces a measurement |
-| No `results/` directory | Rung 0 is the first work to promote a number, and the first to be held to the rules in the spec |
+| One promoted result, `results/rung0-assay-reliability/` | Rung 0 is the first work held to the spec's rules. The number is provisional and its provenance record says why; the rung is not closed |
 | `docs/adapter_contract.md` and `docs/environment.md`, predating this spec | Neither has been reconciled against it. The rung that first depends on either brings it into line rather than a sweep that touches everything at once |
 
 ## Where things live

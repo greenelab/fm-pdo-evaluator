@@ -823,6 +823,18 @@ def check_promotion(task_dir: Path, repo: Path) -> list[Check]:
     byte-identical to the task-side copy the audit read, and the provenance record's
     ``result_sha256`` must recompute from the promoted file.
     """
+    # The promoted copies belong to the real task folder. When the battery is pointed somewhere
+    # else -- an example run, a copy under test -- comparing the repository's promoted tables
+    # against that other directory's tables asks whether two different runs produced the same
+    # bytes, which is not a question about promotion.
+    if task_dir.resolve() != DEFAULT_TASK_DIR.resolve():
+        reason = (
+            f"battery run against {task_dir}, not the task folder the results were promoted from"
+        )
+        return [
+            skipped("promoted copies are byte-identical to the task-side tables", reason),
+            skipped("promoted provenance checksums recompute", reason),
+        ]
     promoted_dir = repo / "results" / TASK
     records = sorted(promoted_dir.glob("*.provenance.json")) if promoted_dir.is_dir() else []
     if not records:

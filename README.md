@@ -60,10 +60,17 @@ or where a rung stands, it updates the README in the same change — see `PROCES
 ## Status
 
 Rung 0 — the reliability ceiling every higher rung is read against — is in progress on the
-`rung0-assay-reliability` branch ([design](docs/tasks/rung0-assay-reliability/design.md)). It
-measures the ceiling at the assay's full extent, every gene and every splittable drug; a higher
-rung reads against a restriction of that ceiling to the genes and drugs it scores, declared
-before it scores. [`docs/STATE.md`](docs/STATE.md) is authoritative.
+`rung0-assay-reliability` branch ([design](docs/tasks/rung0-assay-reliability/design.md),
+[summary](docs/tasks/rung0-assay-reliability/summary.ipynb)). It measures the ceiling at the
+assay's full extent, every gene and every splittable drug; a higher rung reads against a
+restriction of that ceiling to the genes and drugs it scores, declared before it scores.
+
+One result is promoted and it is **provisional**: a dose-pooled split-half of 0.118 over all
+genes and 0.559 over responders. It is not yet usable as a ceiling, because dose turns out to be
+confounded with plate on this screen — the two halves carry different doses for 99.7% of
+conditions, which makes the number a dose-to-dose correlation rather than a test-retest
+reliability. The correction is in the code and awaits a cluster run.
+[`docs/STATE.md`](docs/STATE.md) is authoritative.
 
 ## Quickstart
 
