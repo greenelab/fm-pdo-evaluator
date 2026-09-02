@@ -1261,8 +1261,22 @@ def test_partitioned_noise_equals_one_pass(tmp_path: Path) -> None:
         n_responders=100,
         seed=97,
     )
-    one = dr.noise_aggregate([str(path)], None, None, tmp_path / "d1", "2GB", n_parts=1)
-    many = dr.noise_aggregate([str(path)], None, None, tmp_path / "d2", "2GB", n_parts=7)
+
+    def run(n_parts: int, tag: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+        totals = {"n": 0.0, "frac": 0.0, "sigma2": 0.0, "se2": 0.0, "dominated": 0.0}
+        pers = []
+        for part in range(n_parts):
+            sl = dr.noise_slice(
+                [str(path)], None, None, tmp_path / tag, "2GB", n_parts=n_parts, part=part
+            )
+            o, per = dr.noise_partials(sl, 0.05)
+            pers.append(per)
+            for k in totals:
+                totals[k] += o[k]
+        return dr.combine_noise_partials(totals, pd.concat(pers, ignore_index=True))
+
+    one, c1 = run(1, "d1")
+    many, c7 = run(7, "d2")
     assert int(one["n_gene_conditions"].iloc[0]) == int(many["n_gene_conditions"].iloc[0])
     for col in one.columns:
         np.testing.assert_allclose(
@@ -1273,14 +1287,12 @@ def test_partitioned_noise_equals_one_pass(tmp_path: Path) -> None:
             err_msg=f"{col} differs between one slice and seven",
         )
 
-    c1 = dr.noise_by_condition([str(path)], None, None, tmp_path / "d3", "2GB", n_parts=1)
-    c7 = dr.noise_by_condition([str(path)], None, None, tmp_path / "d4", "2GB", n_parts=7)
-    c1 = c1.sort_values(["patient", "drug"]).reset_index(drop=True)
-    c7 = c7.sort_values(["patient", "drug"]).reset_index(drop=True)
+    c1 = c1.sort_values(list(dr.CONDITION_KEYS)).reset_index(drop=True)
+    c7 = c7.sort_values(list(dr.CONDITION_KEYS)).reset_index(drop=True)
     assert list(c1.columns) == list(c7.columns)
     assert len(c1) == len(c7)
     for col in c1.columns:
-        if col in ("patient", "drug"):
+        if col in dr.CONDITION_KEYS:
             assert list(c1[col]) == list(c7[col])
         else:
             np.testing.assert_allclose(

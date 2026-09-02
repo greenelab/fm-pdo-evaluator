@@ -278,59 +278,95 @@ def _noise_setup(
     return con, repl, sel, grp
 
 
-def noise_aggregate(
+def noise_slice(
     paths: list[str],
     target_names: list[str] | None,
     repl_col: str | None,
     tmp: Path,
     memory_limit: str = "36GB",
     n_parts: int = 1,
+    part: int = 0,
     threads: int | None = None,
 ) -> pd.DataFrame:
-    """The decomposition's reported numbers, aggregated over every gene-condition.
+    """One slice of the per (line, drug, dose, gene) noise table, decomposed.
 
-    This screen groups 4.09 billion rows into roughly 1.4 billion, and DuckDB could not hold
-    that group table at any memory this job can be given -- it failed at 55.8 GiB sharing an
-    allocation with pandas, and again at 139.6 GiB with the machine to itself. So the work is
-    split into ``n_parts`` slices of the GENES and the slices are combined here.
+    Reading the table is what costs: a scan of the 83 GB pool takes about twenty minutes, and
+    the earlier design ran three separate aggregations over it -- overall figures, per-condition
+    figures, and a sample -- each re-scanning every slice. That is 48 scans, sixteen hours, and
+    it timed out at six. Every one of those aggregations is a summary of the SAME per
+    gene-condition rows, so this returns the rows for one slice and the caller computes all
+    three from them in memory. One scan per slice instead of three.
 
-    The combination is exact, not approximate. Every figure reported is a sum or a count over
-    gene-conditions, and sums add; the slices partition the gene-conditions with no overlap and
-    no omission, because the slice key is part of the group key. What comes back is arithmetic
-    identical to the single-pass answer, computed in pieces that fit.
-
-    Returns one row of headline numbers. The median and the stratified view come from the
-    sample instead -- see ``noise_strata_from_sample``.
+    The slice is small even though the table is not: about 11 million rows at sixteen slices,
+    because the two-plate requirement drops 87% of the groups. It is the pre-filter group table,
+    not the result, that does not fit -- which is why the slicing is needed at all.
     """
-    con, _repl, sel, grp = _noise_setup(paths, repl_col, tmp, memory_limit, threads)
+    con, repl, sel, grp = _noise_setup(paths, repl_col, tmp, memory_limit, threads)
     where, drug_params = _drug_predicate(target_names)
-    totals = {"n": 0.0, "frac": 0.0, "sigma2": 0.0, "se2": 0.0, "dominated": 0.0}
-    for part in range(max(1, n_parts)):
-        row = con.execute(
-            f"""
-            WITH g AS ({sel}
-                FROM read_parquet(?)
-                WHERE {_repl} IS NOT NULL{where}{_gene_partition(n_parts, part)}
-                {grp}),
-            d AS (SELECT greatest(var_lfc - mean_se2, 0.0) AS sigma2_plate,
-                         mean_se2,
-                         CASE WHEN var_lfc > 0
-                              THEN greatest(var_lfc - mean_se2, 0.0) / var_lfc END
-                           AS between_plate_fraction
-                  FROM g)
-            SELECT count(*) AS n,
-                   sum(between_plate_fraction) AS frac,
-                   sum(sigma2_plate) AS sigma2,
-                   sum(mean_se2) AS se2,
-                   sum(CASE WHEN between_plate_fraction > 0.5 THEN 1 ELSE 0 END) AS dominated
-            FROM d WHERE between_plate_fraction IS NOT NULL""",
+    frame = _compact_df(
+        con.execute(
+            f"""{sel}
+            FROM read_parquet(?)
+            WHERE {repl} IS NOT NULL{where}{_gene_partition(n_parts, part)}
+            {grp}""",
             [paths, *drug_params],
-        ).fetchone()
-        for key, value in zip(totals, row, strict=True):
-            totals[key] += float(value or 0.0)
-        print(f"  noise slice {part + 1}/{max(1, n_parts)}: {int(row[0]):,} gene-conditions")
+        )
+    )
+    return decompose_noise(frame)
+
+
+def noise_partials(noise: pd.DataFrame, alpha: float) -> tuple[dict[str, float], pd.DataFrame]:
+    """Everything one slice contributes: overall sums, and per-condition sums.
+
+    Sums rather than means, because sums are what combine across slices. The slice key is part
+    of the group key, so the slices partition the gene-conditions exactly -- no overlap, no
+    omission -- and adding them gives the same answer a single pass would.
+    """
+    frac = noise["between_plate_fraction"].to_numpy(dtype=float)
+    ok = np.isfinite(frac)
+    d = noise.loc[ok].copy()
+    fr = frac[ok]
+    overall = {
+        "n": float(ok.sum()),
+        "frac": float(fr.sum()),
+        "sigma2": float(d["sigma2_plate"].to_numpy(dtype=float).sum()),
+        "se2": float(d["mean_se2"].to_numpy(dtype=float).sum()),
+        "dominated": float((fr > 0.5).sum()),
+    }
+    is_resp = np.isfinite(d["padj0"].to_numpy(dtype=float)) & (
+        d["padj0"].to_numpy(dtype=float) < alpha
+    )
+    var = d["var_lfc"].to_numpy(dtype=float)
+    per = (
+        pd.DataFrame(
+            {
+                "patient": d["patient"].to_numpy(),
+                "drug": d["drug"].to_numpy(),
+                "dose": d["dose"].to_numpy(),
+                "n_gene_doses": 1,
+                "s_frac": fr,
+                "s_var": var,
+                "s_sigma2": d["sigma2_plate"].to_numpy(dtype=float),
+                "s_se2": d["mean_se2"].to_numpy(dtype=float),
+                "s_var_resp": np.where(is_resp, var, np.nan),
+                "s_var_non": np.where(is_resp, np.nan, var),
+                "s_frac_resp": np.where(is_resp, fr, np.nan),
+                "n_responder_gene_doses": is_resp.astype(int),
+                "n_nonresponder_gene_doses": (~is_resp).astype(int),
+            }
+        )
+        .groupby(list(CONDITION_KEYS), observed=True, sort=True, dropna=False)
+        .sum(min_count=0)
+    )
+    return overall, per.reset_index()
+
+
+def combine_noise_partials(
+    totals: dict[str, float], per_condition: pd.DataFrame
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Turn accumulated sums into the reported means, once, at the end."""
     n = max(totals["n"], 1.0)
-    return pd.DataFrame(
+    overall = pd.DataFrame(
         [
             {
                 "n_gene_conditions": int(totals["n"]),
@@ -341,6 +377,38 @@ def noise_aggregate(
             }
         ]
     )
+    c = (
+        per_condition.groupby(list(CONDITION_KEYS), observed=True, sort=True, dropna=False)
+        .sum()
+        .reset_index()
+    )
+    n_c = c["n_gene_doses"].to_numpy(dtype=float)
+    n_r = c["n_responder_gene_doses"].to_numpy(dtype=float)
+    n_n = c["n_nonresponder_gene_doses"].to_numpy(dtype=float)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        by_condition = pd.DataFrame(
+            {
+                "patient": c["patient"],
+                "drug": c["drug"],
+                "dose": c["dose"],
+                "n_gene_doses": c["n_gene_doses"].astype(int),
+                "between_plate_fraction_mean": c["s_frac"].to_numpy(dtype=float) / n_c,
+                "var_lfc_mean": c["s_var"].to_numpy(dtype=float) / n_c,
+                "sigma2_plate_mean": c["s_sigma2"].to_numpy(dtype=float) / n_c,
+                "mean_se2_mean": c["s_se2"].to_numpy(dtype=float) / n_c,
+                "var_lfc_mean_responders": np.where(
+                    n_r > 0, c["s_var_resp"].to_numpy(dtype=float) / n_r, np.nan
+                ),
+                "var_lfc_mean_nonresponders": np.where(
+                    n_n > 0, c["s_var_non"].to_numpy(dtype=float) / n_n, np.nan
+                ),
+                "between_plate_fraction_mean_responders": np.where(
+                    n_r > 0, c["s_frac_resp"].to_numpy(dtype=float) / n_r, np.nan
+                ),
+                "n_responder_gene_doses": c["n_responder_gene_doses"].astype(int),
+            }
+        )
+    return overall, by_condition
 
 
 def noise_strata_from_sample(noise: pd.DataFrame) -> pd.DataFrame:
@@ -1408,41 +1476,67 @@ def run_noise(
 ) -> pd.DataFrame:
     """The whole noise decomposition, written to ``out_dir``, returning the figure sample.
 
-    Run as its OWN process (``--only-noise``). It groups 4.09 billion rows into roughly 1.4
-    billion, and the engine needs most of the machine to do that; sharing an allocation with the
-    pandas pivots is what killed the first two full-extent attempts -- once with pandas over the
-    limit, once with the engine over its own. Splitting the phases gives each the room it needs
-    and costs one extra read of a table that is on scratch anyway.
+    One scan of the pool per slice, not three. Reading the table is the entire cost -- about
+    twenty minutes for 83 GB -- and the three things reported (overall figures, per-condition
+    figures, a sample for the figures) are three summaries of the same per gene-condition rows.
+    An earlier version ran them as three separate aggregations, which meant 48 scans and a
+    six-hour timeout after finishing only the first sixteen.
+
+    Each slice's contribution is cached as it completes. A slice is twenty minutes of work whose
+    result is a few megabytes; losing all of them because the job ran out of wall clock is a bad
+    trade, and with the cache a rerun continues instead of restarting.
     """
     tmp = local.parent / "duckdb_tmp"
-    overall = noise_aggregate(
-        paths,
-        names,
-        args.replicate_col,
-        tmp,
-        args.duckdb_memory,
-        n_parts=args.noise_partitions,
-        threads=args.duckdb_threads,
-    )
-    noise_path = out_dir / "rung0_noise_decomposition.csv"
-    noise_summary = {k: float(v) for k, v in overall.iloc[0].items()}
+    parts = max(1, args.noise_partitions)
+    cache_dir = Path(args.noise_cache) if args.noise_cache else out_dir / "noise_slices"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    per_slice_sample = max(1, args.noise_sample_rows // parts)
 
-    by_condition = noise_by_condition(
-        paths,
-        names,
-        args.replicate_col,
-        tmp,
-        args.duckdb_memory,
-        alpha=args.padj_threshold,
-        n_parts=args.noise_partitions,
-        threads=args.duckdb_threads,
-    )
+    totals = {"n": 0.0, "frac": 0.0, "sigma2": 0.0, "se2": 0.0, "dominated": 0.0}
+    per_frames: list[pd.DataFrame] = []
+    samples: list[pd.DataFrame] = []
+    for part in range(parts):
+        tag = f"{FRAME_SCHEMA}_{parts}_{part}"
+        o_path = cache_dir / f"overall_{tag}.json"
+        c_path = cache_dir / f"per_condition_{tag}.parquet"
+        s_path = cache_dir / f"sample_{tag}.parquet"
+        if o_path.exists() and c_path.exists() and s_path.exists():
+            overall_part = json.loads(o_path.read_text())
+            per_frames.append(pd.read_parquet(c_path))
+            samples.append(pd.read_parquet(s_path))
+            print(f"  noise slice {part + 1}/{parts}: reused cached partial")
+        else:
+            noise = noise_slice(
+                paths,
+                names,
+                args.replicate_col,
+                tmp,
+                args.duckdb_memory,
+                n_parts=parts,
+                part=part,
+                threads=args.duckdb_threads,
+            )
+            overall_part, per = noise_partials(noise, args.padj_threshold)
+            sample = noise.sample(
+                min(per_slice_sample, len(noise)), random_state=args.seed
+            ).reset_index(drop=True)
+            o_path.write_text(json.dumps(overall_part) + "\n")
+            per.to_parquet(c_path, index=False)
+            sample.to_parquet(s_path, index=False)
+            per_frames.append(per)
+            samples.append(sample)
+            print(f"  noise slice {part + 1}/{parts}: {int(overall_part['n']):,} gene-conditions")
+        for key in totals:
+            totals[key] += float(overall_part[key])
+
+    overall, by_condition = combine_noise_partials(totals, pd.concat(per_frames, ignore_index=True))
+    noise_summary = {k: float(v) for k, v in overall.iloc[0].items()}
     by_condition.round(6).to_csv(out_dir / "rung0_noise_by_condition.csv", index=False)
-    print(f"per-condition noise: {len(by_condition):,} conditions")
+    print(f"per-condition noise: {len(by_condition):,} dose-conditions")
 
     # The design says the between-plate share is aggregated "over genes within a condition and
-    # over conditions". The engine-side figure is a flat mean over gene-conditions, which weights
-    # a condition by how many of its genes were testable -- and testability varies a lot here,
+    # over conditions". The figure above is a flat mean over gene-conditions, which weights a
+    # condition by how many of its genes were testable -- and testability varies a lot here,
     # since DESeq2 could not test most rows. Both are reported; where they disagree, the gap is
     # uneven gene coverage rather than anything about plates.
     per_cond = by_condition["between_plate_fraction_mean"].to_numpy(dtype=float)
@@ -1451,6 +1545,21 @@ def run_noise(
         float(np.mean(per_cond)), 5
     )
     noise_summary["n_conditions_decomposed"] = int(per_cond.size)
+
+    noise = pd.concat(samples, ignore_index=True)
+    noise.to_csv(out_dir / "rung0_noise_per_gene.csv.gz", index=False)
+    noise_strata_from_sample(noise).round(5).to_csv(out_dir / "rung0_noise_strata.csv", index=False)
+
+    # The median comes from the stratified sample. An exact median over 175 million values means
+    # sorting them; a median from a sample stratified by gene is precise well past the third
+    # decimal it is reported to. The mean beside it is exact over every row.
+    frac_sample = noise["between_plate_fraction"].to_numpy(dtype=float)
+    frac_sample = frac_sample[np.isfinite(frac_sample)]
+    noise_summary["between_plate_fraction_median_sampled"] = (
+        round(float(np.median(frac_sample)), 5) if frac_sample.size else float("nan")
+    )
+
+    noise_path = out_dir / "rung0_noise_decomposition.csv"
     pd.DataFrame([noise_summary]).round(5).to_csv(noise_path, index=False)
     _write_params_sidecar(noise_path, args, extra=noise_summary)
     print(
@@ -1458,30 +1567,6 @@ def run_noise(
         f"{noise_summary['between_plate_fraction_mean']:.4f} over gene-conditions, "
         f"{noise_summary['between_plate_fraction_mean_over_conditions']:.4f} over conditions"
     )
-
-    noise = decompose_noise(
-        build_noise_frame(
-            paths,
-            names,
-            args.replicate_col,
-            tmp,
-            args.duckdb_memory,
-            sample_rows=args.noise_sample_rows,
-            n_parts=args.noise_partitions,
-            threads=args.duckdb_threads,
-        )
-    )
-    noise.to_csv(out_dir / "rung0_noise_per_gene.csv.gz", index=False)
-    # The median comes from the stratified sample, not from the full pass. An exact median over
-    # 1.4 billion values means sorting them, which is one of the operators that could not run
-    # here at all; a median from two million values stratified by gene is precise well past the
-    # third decimal this is reported to. The MEAN beside it is exact over every row.
-    frac_sample = noise["between_plate_fraction"].to_numpy(dtype=float)
-    frac_sample = frac_sample[np.isfinite(frac_sample)]
-    noise_summary["between_plate_fraction_median_sampled"] = (
-        round(float(np.median(frac_sample)), 5) if frac_sample.size else float("nan")
-    )
-    noise_strata_from_sample(noise).round(5).to_csv(out_dir / "rung0_noise_strata.csv", index=False)
     print(f"noise sample for figures: {len(noise):,} gene-conditions")
     return noise
 
@@ -1540,6 +1625,13 @@ def main() -> None:
         action="store_true",
         help="do not compute the noise decomposition; read what an earlier --only-noise pass "
         "wrote into --out-dir, so the figures still show it",
+    )
+    ap.add_argument(
+        "--noise-cache",
+        default=None,
+        help="directory holding each noise slice's partial result. A slice is about twenty "
+        "minutes of work and a few megabytes of output; caching them means a rerun continues "
+        "rather than restarting, and a job that runs out of wall clock loses one slice.",
     )
     ap.add_argument(
         "--noise-partitions",

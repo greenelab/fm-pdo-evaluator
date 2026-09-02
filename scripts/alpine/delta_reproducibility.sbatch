@@ -9,7 +9,7 @@
                                      # the returned frame is tens of times larger, and the
                                      # nodes carry 245G, so headroom is free here and an
                                      # out-of-memory kill costs the whole 40-minute scan
-#SBATCH --time=06:00:00
+#SBATCH --time=20:00:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.out
 #
@@ -72,8 +72,9 @@ python scripts/delta_reproducibility.py \
     --local-dir "/scratch/alpine/$USER/tahoe_pseudobulk_de" \
     --only-noise \
     --duckdb-memory 150GB \
-    --noise-partitions 16 \
+    --noise-partitions 8 \
     --duckdb-threads 4 \
+    --noise-cache "/scratch/alpine/$USER/rung0_noise_slices" \
     --out-dir "$OUT_DIR"
 
 python scripts/delta_reproducibility.py \
