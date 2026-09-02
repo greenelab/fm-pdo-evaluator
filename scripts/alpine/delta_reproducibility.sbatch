@@ -50,6 +50,11 @@ python -c "import duckdb, matplotlib" 2>/dev/null || pip install -q "duckdb>=1.0
 # a rerun that only adds an output or changes a figure skips the scan. Delete the cache dir to
 # force a rebuild from the shards.
 #
+# --duckdb-memory is deliberately well under the job's --mem. The engine and the pandas frames
+# share one allocation, and the first full-extent attempt gave DuckDB 110 GB of 200 GB and was
+# then OOM-killed at 184 GB while pandas held the pivots. DuckDB spills to scratch when it hits
+# its limit; pandas does not, so the engine is the one that should be squeezed.
+#
 # NO --drugs-cid-file and NO --panel-file. Rung 0 measures the reliability of the assay at its
 # full extent: every gene the table carries, every drug with plates enough to split, doses
 # pooled. The superseded rung passed a 32-compound list and a 14,121-gene panel derived from
@@ -60,5 +65,5 @@ OUT_DIR="${OUT_DIR:-docs/tasks/rung0-assay-reliability}"
 python scripts/delta_reproducibility.py \
     --local-dir "/scratch/alpine/$USER/tahoe_pseudobulk_de" \
     --frame-cache "/scratch/alpine/$USER/rung0_frame_cache" \
-    --duckdb-memory 110GB \
+    --duckdb-memory 60GB \
     --out-dir "$OUT_DIR"

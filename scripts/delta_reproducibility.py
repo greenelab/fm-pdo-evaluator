@@ -593,24 +593,35 @@ def responder_overlap_table(de: pd.DataFrame, panel: set[str], alpha: float = 0.
 
     Columns: ``patient``, ``drug``, ``n_first``, ``n_second``, ``n_both``, ``jaccard``.
     """
-    rows, _, mats = dense_pivots(de, panel, ("padj0", "padj1"))
-    a, b = mats["padj0"], mats["padj1"]
-    first = np.isfinite(a) & (a < alpha)
-    second = np.isfinite(b) & (b < alpha)
-    both = first & second
-    union = (first | second).sum(axis=1)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        jaccard = np.where(union > 0, both.sum(axis=1) / union, np.nan)
-    return pd.DataFrame(
-        {
-            "patient": rows.get_level_values(0),
-            "drug": rows.get_level_values(1),
-            "n_first": first.sum(axis=1),
-            "n_second": second.sum(axis=1),
-            "n_both": both.sum(axis=1),
-            "jaccard": np.round(jaccard, 4),
-        }
+    # Counted by grouping the long frame, not by pivoting it. The counts are per condition, so
+    # the two condition-by-gene matrices a pivot would build -- 7 GB each at this screen's size,
+    # on top of everything else alive at this point -- are pure overhead for a per-row sum. The
+    # first full-extent run was killed for memory a few steps after this call.
+    d = de[de["gene_name"].isin(panel)]
+    p0 = d["padj0"].to_numpy(dtype=float)
+    p1 = d["padj1"].to_numpy(dtype=float)
+    first = np.isfinite(p0) & (p0 < alpha)
+    second = np.isfinite(p1) & (p1 < alpha)
+    counts = (
+        pd.DataFrame(
+            {
+                "patient": d["patient"].to_numpy(),
+                "drug": d["drug"].to_numpy(),
+                "n_first": first,
+                "n_second": second,
+                "n_both": first & second,
+                "n_union": first | second,
+            }
+        )
+        .groupby(["patient", "drug"], observed=True, sort=True)
+        .sum()
+        .reset_index()
     )
+    union = counts["n_union"].to_numpy(dtype=float)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        jaccard = np.where(union > 0, counts["n_both"].to_numpy(dtype=float) / union, np.nan)
+    counts["jaccard"] = np.round(jaccard, 4)
+    return counts.drop(columns=["n_union"])
 
 
 def responder_mask(piv_padj0: pd.DataFrame, alpha: float = 0.05) -> np.ndarray:
@@ -1381,6 +1392,10 @@ def main() -> None:
     overlap.to_csv(out_dir / "rung0_responder_overlap.csv", index=False)
     stride = max(1, len(de) // 200_000)
     delta_real = pd.DataFrame({"log2FoldChange": de["lfc0"].to_numpy(dtype=float)[::stride]})
+    # Written out, not just held: every figure in this run is drawn from a table a reader can
+    # open, and the build figure's fold-change panel was the one exception -- it took an
+    # in-memory array that reached no file, so the distribution it showed was uncheckable.
+    delta_real.to_csv(out_dir / "rung0_delta_sample.csv.gz", index=False)
     padj_sample = pd.DataFrame({"padj0": padj.to_numpy(dtype=float).ravel()}).dropna()
     padj_sample = padj_sample.sample(min(200_000, len(padj_sample)), random_state=args.seed)
     padj_sample.to_csv(out_dir / "rung0_padj_sample.csv.gz", index=False)
