@@ -1,0 +1,27 @@
+{
+  "result": "rung0_reliability.csv",
+  "git_sha": "519260613d9eaaf760441ef58ead6a1efde41149",
+  "slurm_job_id": "31995022",
+  "args": {
+    "local_dir": "/scratch/alpine/lgillenwater@xsede.org/tahoe_pseudobulk_de",
+    "drugs_cid_file": "",
+    "drug_names_file": "None",
+    "replicate_col": "None",
+    "min_genes": "50",
+    "padj_threshold": "0.05",
+    "panel_file": "None",
+    "n_perm": "500",
+    "seed": "0",
+    "out_dir": "docs/tasks/rung0-assay-reliability",
+    "frame_cache": "/scratch/alpine/lgillenwater@xsede.org/rung0_frame_cache",
+    "duckdb_memory": "60GB",
+    "noise_sample_rows": "2000000",
+    "skip_noise": "False"
+  },
+  "all_n_pairs": 18329,
+  "responder_n_pairs": 16644,
+  "selection_rule": "padj < threshold in at least one of the first plate group's rows",
+  "gene_inclusion": "every gene the table carries",
+  "drug_inclusion": "every drug with at least two distinct plates",
+  "dose_handling": "pooled for the reliabilities, held fixed for the decomposition"
+}

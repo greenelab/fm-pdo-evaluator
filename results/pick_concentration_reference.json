@@ -1,0 +1,32 @@
+{
+  "n_lines_panel": 50,
+  "n_drugs_panel": 26,
+  "n_drugs_source": 140,
+  "n_lines_source": 658,
+  "whole_panel": {
+    "distinct_top1": 22,
+    "modal_top1_share": 0.6428571428571429,
+    "broad_share_top1": 0.9316109422492401,
+    "broad_share_top3": 0.9969604863221885
+  },
+  "distinct_top1": {
+    "mean": 6.663333333333333,
+    "lo": 2.0,
+    "hi": 13.0
+  },
+  "modal_top1_share": {
+    "mean": 0.635,
+    "lo": 0.3,
+    "hi": 0.94
+  },
+  "broad_share_top1": {
+    "mean": 0.8898666666666666,
+    "lo": 0.48850000000000005,
+    "hi": 1.0
+  },
+  "broad_share_top3": {
+    "mean": 0.9940666666666668,
+    "lo": 0.9495,
+    "hi": 1.0
+  }
+}

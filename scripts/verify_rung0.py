@@ -79,6 +79,13 @@ FIGURES: tuple[str, ...] = (
     "09_per_gene_reliability.png",
 )
 
+#: The table each figure is drawn from. A figure whose source table was never written is a
+#: stage that did not run; a figure missing while its table exists is a broken figure step. The
+#: battery has to tell those apart, or a partial run reports as a defect.
+FIGURE_SOURCES: dict[str, str] = {
+    "05_decompose.png": "rung0_noise_per_gene.csv.gz",
+}
+
 SUMMARY = "rung0_reliability.csv"
 PER_PAIR = "rung0_per_pair_r.csv"
 NULL_DRAWS = "rung0_null_draws.csv"
@@ -90,7 +97,7 @@ TERCILES = "rung0_effect_terciles.csv"
 LEAKAGE = "rung0_leakage_control.csv"
 POOL = "rung0_pool_description.csv"
 CHECKSUMS = "audit_checksums.json"
-SCORE_VALUES = "figures/04_score.values.csv"
+SCORE_VALUES = "figures/04_score.values.csv.gz"
 
 #: How many rows of the per-gene noise table the variance identity is checked on. The
 #: table has one row per (line, drug, dose, gene) and runs to millions on the real screen;
@@ -492,6 +499,17 @@ def check_noise_decomposition(task_dir: Path) -> list[Check]:
     identity are re-derived here; the identity is what makes the fraction a decomposition
     rather than a ratio of two stored numbers.
     """
+    # A stage that did not run skips; it does not crash. The noise decomposition is the last
+    # phase of the job and the one that has failed most, so a battery that raises on its absence
+    # is unusable exactly when it is most needed -- reviewing a partial run.
+    if not (task_dir / NOISE).exists() or not (task_dir / NOISE_PER_GENE).exists():
+        return [
+            skipped(
+                "noise: the decomposition's reported figures",
+                f"{NOISE} / {NOISE_PER_GENE} not written yet",
+            ),
+            skipped("noise: the per-gene variance identity", "the decomposition has not run"),
+        ]
     reported = read_table(task_dir / NOISE).iloc[0]
     n_rows, total, n_finite, worst = _stream_noise(task_dir / NOISE_PER_GENE)
     mean = total / n_finite if n_finite else float("nan")
@@ -570,8 +588,13 @@ def check_figures(task_dir: Path) -> list[Check]:
     the points it drew and the correlation it printed to a companion table, so the number
     on the panel is recomputable from the panel's own data.
     """
+    # Only figures whose source table exists are expected. The rest are reported as stages that
+    # did not run, which is the truth for a partial run and is not the same as a broken step.
+    expected = tuple(
+        f for f in FIGURES if f not in FIGURE_SOURCES or (task_dir / FIGURE_SOURCES[f]).exists()
+    )
     fig_dir = task_dir / "figures"
-    present = [name for name in FIGURES if (fig_dir / name).exists()]
+    present = [name for name in expected if (fig_dir / name).exists()]
     substantial = [
         name
         for name in present
@@ -581,14 +604,20 @@ def check_figures(task_dir: Path) -> list[Check]:
     checks = [
         Check(
             "every figure design.md declares was written, and is a real image",
-            f"{len(FIGURES)} figures, each a PNG over 5 kB",
-            f"{len(present)} present, {len(substantial)} non-trivial"
+            f"{len(expected)} figures expected, each a PNG over 5 kB"
             + (
-                f"; missing: {sorted(set(FIGURES) - set(present))}"
-                if len(present) < len(FIGURES)
+                f" ({len(FIGURES) - len(expected)} not expected: their source tables were "
+                "never written)"
+                if len(expected) < len(FIGURES)
                 else ""
             ),
-            len(substantial) == len(FIGURES),
+            f"{len(present)} present, {len(substantial)} non-trivial"
+            + (
+                f"; missing: {sorted(set(expected) - set(present))}"
+                if len(present) < len(expected)
+                else ""
+            ),
+            len(substantial) == len(expected),
         )
     ]
     values_path = task_dir / SCORE_VALUES
@@ -668,6 +697,13 @@ def check_audit_checksums(task_dir: Path) -> list[Check]:
     so nothing else ties what a reader audited to what a reviewer later pulls. A single
     altered byte in any table moves its hash and fails here.
     """
+    if not (task_dir / CHECKSUMS).exists():
+        return [
+            skipped(
+                "every recorded artifact checksum recomputes from the file it names",
+                f"{CHECKSUMS} not written yet -- the run did not reach the end",
+            )
+        ]
     recorded = json.loads((task_dir / CHECKSUMS).read_text())
     by_name = {p.name: p for p in task_dir.rglob("*") if p.is_file()}
     missing = sorted(name for name in recorded if name not in by_name)

@@ -790,7 +790,11 @@ def fig_score(
         if exported
         else pd.DataFrame({column: [] for column in columns})
     )
-    table.to_csv(written.parent / f"{written.stem}.values.csv", index=False)
+    # Gzipped: this is every plotted point across four examples and two gene sets, which is
+    # 8.9 MB plain on the real screen and about a third of that compressed. It is load-bearing --
+    # the battery recomputes each panel's printed correlation from it -- so it is committed, and
+    # PROCESS section 3 says compress before you subsample.
+    table.to_csv(written.parent / f"{written.stem}.values.csv.gz", index=False)
     return written
 
 

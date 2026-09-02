@@ -281,7 +281,7 @@ def test_fig_score_writes_a_png_and_a_companion_values_csv(tmp_path: Path) -> No
         profiles, index, _per_pair(), _per_pair(n=8), _summary(), tmp_path / "score.png"
     )
     _assert_is_a_png(out)
-    values_csv = tmp_path / "score.values.csv"
+    values_csv = tmp_path / "score.values.csv.gz"
     assert values_csv.exists(), "the printed correlation has no companion table to be checked from"
     exported = pd.read_csv(values_csv)
     assert list(exported.columns) == [
@@ -299,7 +299,7 @@ def test_fig_score_printed_r_recomputes_from_the_points_it_plotted(tmp_path: Pat
     """The design's claim, made checkable: the number on the panel comes from the points drawn."""
     profiles, index = _profiles()
     figures.fig_score(profiles, index, _per_pair(), None, _summary(), tmp_path / "score.png")
-    exported = pd.read_csv(tmp_path / "score.values.csv")
+    exported = pd.read_csv(tmp_path / "score.values.csv.gz")
     for example_id, rows in exported.groupby("example_id"):
         recomputed = float(
             np.corrcoef(rows["lfc0"].to_numpy(dtype=float), rows["lfc1"].to_numpy(dtype=float))[
@@ -342,7 +342,7 @@ def test_fig_score_printed_r_matches_the_planted_correlation(tmp_path: Path) -> 
         ]
     )
     figures.fig_score(profiles, index, _per_pair(), None, _summary(), tmp_path / "planted.png")
-    exported = pd.read_csv(tmp_path / "planted.values.csv")
+    exported = pd.read_csv(tmp_path / "planted.values.csv.gz")
     assert float(exported["r_printed"].to_numpy(dtype=float)[0]) == pytest.approx(planted, abs=1e-4)
 
 
@@ -355,7 +355,7 @@ def test_fig_score_tolerates_no_control_pool_and_no_examples(tmp_path: Path) -> 
         empty_profiles, empty_index, _per_pair(), None, {}, tmp_path / "score_empty.png"
     )
     _assert_is_a_png(out)
-    exported = pd.read_csv(tmp_path / "score_empty.values.csv")
+    exported = pd.read_csv(tmp_path / "score_empty.values.csv.gz")
     assert list(exported.columns) == [
         "example_id",
         "gene_set",
@@ -578,7 +578,7 @@ def test_fig_score_draws_the_examples_over_both_gene_sets(tmp_path: Path) -> Non
     rng = np.random.default_rng(3)
     profiles = profiles.assign(is_responder=rng.random(len(profiles)) < 0.4)
     figures.fig_score(profiles, index, _per_pair(), None, _summary(), tmp_path / "score.png")
-    exported = pd.read_csv(tmp_path / "score.values.csv")
+    exported = pd.read_csv(tmp_path / "score.values.csv.gz")
     assert set(exported["gene_set"]) == {"all genes", "responders"}
     for example_id, part in exported.groupby("example_id"):
         n_all = int((part["gene_set"] == "all genes").sum())
@@ -594,5 +594,5 @@ def test_fig_score_draws_the_examples_over_both_gene_sets(tmp_path: Path) -> Non
 
     # No responder column: one row of scatters, and the companion table says so.
     figures.fig_score(_profiles()[0], index, _per_pair(), None, _summary(), tmp_path / "score2.png")
-    plain = pd.read_csv(tmp_path / "score2.values.csv")
+    plain = pd.read_csv(tmp_path / "score2.values.csv.gz")
     assert set(plain["gene_set"]) == {"all genes"}

@@ -1,0 +1,3 @@
+reference,comparator,metric,n_pairs,n_lines,n_drugs,global,interaction,p_label,perdrug_median_rho,perdrug_frac_pos,n_drugs_scored
+gdscv2,ctrpv2,fit_auc,25028,513,71,0.689,0.466,0.0,0.437,0.986,71
+gdscv2,prism,fit_auc,27443,311,105,0.59,0.307,0.0,0.311,0.933,105
