@@ -86,6 +86,10 @@ def planted_split_half_frame(
         {
             "patient": lines,
             "drug": drugs,
+            # One dose level. Dose is part of the condition key -- the real screen confounds it
+            # with plate -- and a control pool is a single dose by construction, since it plants
+            # replicate structure rather than a dose series.
+            "dose": 0.05,
             "gene_name": genes,
             "lfc0": lfc0.ravel(),
             "lfc1": lfc1.ravel(),

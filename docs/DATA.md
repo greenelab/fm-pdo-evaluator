@@ -64,13 +64,29 @@ manifest, and the provenance record of any promoted result names that content ha
 50 lines and ~1,100 perturbations stated under "What it is" are the atlas's, from the paper. The
 derived `pseudobulk_differential_expression` table this project reads covers less of it, and the
 difference matters for every count a rung reports. Counted on the cluster (job 31979673) rather
-than inferred:
-**4,089,820,780 rows**; **45** cell lines, **391** drugs, **49,040** genes, **3** doses, **14**
-plates. **18,950** (line, drug) conditions, of which **18,350** have plates in both hash groups
-and can be split, and **5,614** split into equal halves. DESeq2 could not test much of it —
-**59%** of rows carry `baseMean` zero and **80%** carry a null `padj` — so the gene set any
-statistic actually scores is far smaller than the gene count above, and the per-condition counts
-in a result are the number to read.
+than inferred. **4,089,820,780 rows** and **3** dose levels (0.05, 0.5, 5.0 uM), both exact.
+**Fifty** cell lines, exact; approximately **391** drugs and **49,040** genes, from HyperLogLog
+sketches and so good to a couple of percent rather than to the digit — an earlier draft of this
+entry reported 45 cell lines from that sketch, which the exact count contradicts.
+
+**18,950** (line, drug) conditions and **56,827** (line, drug, dose) triples, all exact.
+
+**Dose is very nearly confounded with plate, and it governs what rung 0 can measure.** 86.6% of
+dose-conditions (49,186 of 56,827) sit on a **single plate**, so only **7,641** have the two
+plates a split needs — and those are not spread evenly:
+
+| dose | dose-conditions | with >= 2 plates | |
+|---|---|---|---|
+| 0.05 uM | 18,948 | 1,245 | 6.6% |
+| 0.5 uM | 18,929 | 1,000 | 5.3% |
+| 5.0 uM | 18,950 | **5,396** | **28.5%** |
+
+So the replicated base is dominated by the top dose: 71% of it is 5.0 uM. It spans **121 drugs
+and 50 cell lines**, so it is a broad slice of the screen rather than a few compounds.
+
+DESeq2 could not test much of the table — **59%** of rows carry `baseMean` zero and **80%** a
+null `padj` — so the gene set any statistic actually scores is far smaller than the gene count
+above, and the per-condition counts in a result are the number to read.
 
 **Restriction (later rungs, not rung 0).** A delta rung that must line up with GDSC2 reads only
 the drugs shared between Tahoe and GDSC2, matched by PubChem CID: **32 drugs**
@@ -82,14 +98,14 @@ this one.
 
 **Processing after download, per use.**
 
-- *Rung 0 (assay reliability)*: drop rows with no plate identifier, split plates deterministically
-  by `hash(plate) % 2`, average `log2FoldChange` per (line, drug, gene) within each half —
-  collapsing plates and any dose replicates within a half, so the delta is the drug's average
-  response at its screened doses — and correlate the halves per pair, twice: over every gene, and
-  over the genes the first half called differentially expressed by `padj`. Also, per (line, drug,
-  dose, gene), the variance of `log2FoldChange` across plates against the mean `lfcSE²`, splitting
-  replicate noise into its between-plate and within-plate parts. No drug filter and no gene panel:
-  the 32-drug restriction below belongs to the rungs that need it, not to this one.
+- *Rung 0 (assay reliability)*: drop rows with no plate identifier, then work **within one
+  (line, drug, dose)** — dose is part of the key, because pooling it would put different doses in
+  the two halves for 99.7% of conditions. Split that triple's plates by `hash(plate) % 2`,
+  average `log2FoldChange` per gene in each half, and correlate the halves, twice: over every
+  gene, and over the genes the first half called differentially expressed by `padj`. Also, per
+  (line, drug, dose, gene), the variance of `log2FoldChange` across plates against the mean
+  `lfcSE²`, splitting replicate noise into its between-plate and within-plate parts. No drug
+  filter and no gene panel: the 32-drug restriction above belongs to the rungs that need it.
 - *Delta bundle* (arrives with rung 1; its download half is landed as
   `scripts/download_tahoe_pseudobulk_de.py`): the same aggregation without the split —
   mean `log2FoldChange` and `baseMean` per (line, drug, gene) over all plates and doses.

@@ -73,15 +73,24 @@ response size.
   mistaken for.
 - *Cell lines.* Every key in the table, including the one whose DepMap identifier is missing
   and appears as the literal string `NA` — it is a real line's data and carries a consistent key
-  throughout. Measured, not asserted: 45 keys (this clause read "all fifty" until the screen was
-  counted; see `decisions.md`, 2026-09-01).
-- *Doses.* Pooled: the averaging within each plate group runs over the screen's three doses, so
-  a condition means "this drug, at this screen's dose design". A dose-resolved reliability is a
-  different quantity and out of scope.
-- *Replicate unit and split.* The plate. Plates are assigned to groups by `hash(plate) % 2`, one
-  fixed split per condition. Three quarters of conditions have exactly three plates, so their
-  groups are one plate against two — unequal, with only three distinct splits possible. One
-  is used.
+  throughout. Fifty keys, counted exactly (`count(DISTINCT ...)`, job 31996456). An earlier
+  approximate count read 45 and this clause was briefly corrected to it; the approximation was
+  wrong and the original number right. See `decisions.md`, 2026-09-01.
+- *Doses.* **Held fixed.** A scoreable unit is a (cell line, drug, dose) triple, and the plate
+  split happens inside one. Doses were pooled until the screen was counted: 86.6% of (line,
+  drug, dose) combinations sit on a single plate, so splitting a condition's plates while
+  pooling dose put **different doses in the two halves for 99.7% of conditions**. That number is
+  a dose-to-dose correlation, not a test-retest reliability, and it cannot be the ceiling a
+  later rung divides by. Holding dose fixed costs base — 7,641 dose-conditions have two or more
+  plates, against 18,350 splittable conditions when dose was pooled — and buys the quantity the
+  rung is named for. It also gives the reliabilities and the noise decomposition one inclusion
+  rule instead of two.
+- *Replicate unit and split.* The plate, within one dose. Plates are assigned to groups by
+  `hash(plate) % 2`, one fixed split per dose-condition. Most replicated dose-conditions have
+  exactly two plates (7,441 of 7,641), so their groups are one plate against one — equal, which
+  is the case Spearman-Brown's correction is exactly right for. Under the earlier dose-pooled
+  rule the halves were unequal for 70% of conditions; that assumption now holds for nearly all
+  of them.
 
 
 ## Figures, controls and power (project rule 4)

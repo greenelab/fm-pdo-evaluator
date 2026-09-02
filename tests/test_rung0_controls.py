@@ -631,6 +631,7 @@ def test_tercile_control_rises_monotonically_with_planted_effect_size(tmp_path: 
                             "drug": d,
                             "gene_name": genes,
                             "log2FoldChange": signal + rng.normal(0.0, 1.0, len(genes)),
+                            "concentration": 0.05,
                             "plate": p,
                         }
                     )
@@ -677,6 +678,7 @@ def test_per_pair_table_rows_are_keyed_to_their_own_scores(tmp_path: Path) -> No
                             "drug": d,
                             "gene_name": genes,
                             "log2FoldChange": signal + rng.normal(0.0, 1.0, len(genes)),
+                            "concentration": 0.05,
                             "plate": p,
                         }
                     )
@@ -831,6 +833,7 @@ def test_per_gene_reliability_separates_reliable_from_noise_genes(tmp_path: Path
                             "drug": d,
                             "gene_name": genes,
                             "log2FoldChange": signal + rng.normal(0.0, 1.0, 200),
+                            "concentration": 0.05,
                             "plate": p,
                         }
                     )
@@ -1177,7 +1180,7 @@ def test_dense_pivots_match_pivot_table_exactly(tmp_path: Path) -> None:
     index, columns, mats = dr.dense_pivots(de, panel, ("lfc0", "lfc1", "padj0"))
     for col in ("lfc0", "lfc1", "padj0"):
         expected = de[de["gene_name"].isin(panel)].pivot_table(
-            index=["patient", "drug"], columns="gene_name", values=col, observed=True
+            index=list(dr.CONDITION_KEYS), columns="gene_name", values=col, observed=True
         )
         assert list(expected.index) == list(index), f"{col}: condition order differs"
         assert list(expected.columns) == list(columns), f"{col}: gene order differs"

@@ -25,6 +25,17 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+#: The columns that identify one scoreable unit. Dose is part of it: this screen ran 86.6% of
+#: (line, drug, dose) combinations on a single plate, so splitting a condition's plates while
+#: pooling dose puts different doses in the two halves for 99.7% of conditions -- a
+#: dose-to-dose correlation, not a test-retest reliability. See decisions.md, 2026-09-01.
+CONDITION_KEYS = ("patient", "drug", "dose")
+
+#: Bumped whenever the built frame's schema or grouping changes, so a cached frame from an
+#: earlier definition resolves to a different key instead of being silently reused. The
+#: dose-pooled frame and the dose-fixed frame have the same inputs and different meanings.
+FRAME_SCHEMA = "v2-dose-fixed"
+
 TAHOE = "tahoebio/Tahoe-100M"
 DE = "pseudobulk_differential_expression"
 REPL_CANDIDATES = ("plate", "Plate", "plate_barcode", "plate_id", "replicate", "batch")
@@ -201,15 +212,22 @@ def build_split_half_frame(
         padj = "CAST(NULL AS DOUBLE)"
         padj1 = "CAST(NULL AS DOUBLE)"
         print("no padj column in the pool: responder selection is unavailable for this run")
+    dose = next((c for c in DOSE_CANDIDATES if c in cols), None)
+    if dose is None:
+        raise SystemExit(
+            f"no dose column in {cols}. Dose is part of the condition key: on this screen it is "
+            "confounded with plate, so pooling it would compare different doses across the two "
+            "halves. Pass a pool that carries one, or change the design."
+        )
     de = con.execute(
-        f"""SELECT Cell_ID_DepMap AS patient, drug, gene_name,
+        f"""SELECT Cell_ID_DepMap AS patient, drug, {dose} AS dose, gene_name,
                    avg(log2FoldChange) FILTER (WHERE hash({chosen}) % 2 = 0) AS lfc0,
                    avg(log2FoldChange) FILTER (WHERE hash({chosen}) % 2 = 1) AS lfc1,
                    {padj} AS padj0,
                    {padj1} AS padj1
             FROM read_parquet(?)
             WHERE {chosen} IS NOT NULL{where}
-            GROUP BY Cell_ID_DepMap, drug, gene_name
+            GROUP BY Cell_ID_DepMap, drug, {dose}, gene_name
             HAVING count(log2FoldChange) FILTER (WHERE hash({chosen}) % 2 = 0) > 0
                AND count(log2FoldChange) FILTER (WHERE hash({chosen}) % 2 = 1) > 0""",
         [paths, *drug_params],
@@ -401,14 +419,14 @@ def noise_by_condition(
                     FROM read_parquet(?)
                     WHERE {repl} IS NOT NULL{where}{_gene_partition(n_parts, part)}
                     {grp}),
-                d AS (SELECT patient, drug, var_lfc, mean_se2,
+                d AS (SELECT patient, drug, dose, var_lfc, mean_se2,
                              greatest(var_lfc - mean_se2, 0.0) AS sigma2_plate,
                              CASE WHEN var_lfc > 0
                                   THEN greatest(var_lfc - mean_se2, 0.0) / var_lfc END
                                AS between_plate_fraction,
                              (padj0 IS NOT NULL AND padj0 < {alpha}) AS is_responder
                       FROM g)
-                SELECT patient, drug,
+                SELECT patient, drug, dose,
                        count(*) AS n_gene_doses,
                        sum(between_plate_fraction) AS s_frac,
                        sum(var_lfc) AS s_var,
@@ -421,13 +439,13 @@ def noise_by_condition(
                        count(*) FILTER (WHERE is_responder) AS n_responder_gene_doses,
                        count(*) FILTER (WHERE NOT is_responder) AS n_nonresponder_gene_doses
                 FROM d WHERE between_plate_fraction IS NOT NULL
-                GROUP BY patient, drug""",
+                GROUP BY patient, drug, dose""",
                 [paths, *drug_params],
             ).df()
         )
     combined = (
         pd.concat(partials, ignore_index=True)
-        .groupby(["patient", "drug"], observed=True, sort=True)
+        .groupby(list(CONDITION_KEYS), observed=True, sort=True)
         .sum()
         .reset_index()
     )
@@ -439,6 +457,7 @@ def noise_by_condition(
             {
                 "patient": combined["patient"],
                 "drug": combined["drug"],
+                "dose": combined["dose"],
                 "n_gene_doses": combined["n_gene_doses"].astype(int),
                 "between_plate_fraction_mean": combined["s_frac"].to_numpy(dtype=float) / n,
                 "var_lfc_mean": combined["s_var"].to_numpy(dtype=float) / n,
@@ -601,15 +620,21 @@ def dense_pivots(
     p_idx, p_names = codes("patient")
     g_idx, g_names = codes("gene_name")
     d_idx, d_names = codes("drug")
+    s_idx, s_names = codes("dose")
 
-    # One code per (patient, drug), then sorted the way pivot_table sorts: by patient name, then
-    # drug name. The dictionary encoding the build returns orders categories by first appearance,
-    # not lexicographically, so the sort is applied explicitly rather than assumed from the codes.
-    pair = p_idx.astype(np.int64) * d_names.size + d_idx.astype(np.int64)
-    pair_used, cond_idx = np.unique(pair, return_inverse=True)
+    # One code per (patient, drug, dose), then sorted the way pivot_table sorts: by each key in
+    # turn. The dictionary encoding the build returns orders categories by first appearance, not
+    # lexicographically, so the sort is applied explicitly rather than assumed from the codes.
+    # Dose is part of the key because this screen confounds it with plate -- see CONDITION_KEYS.
+    triple = (
+        p_idx.astype(np.int64) * d_names.size + d_idx.astype(np.int64)
+    ) * s_names.size + s_idx.astype(np.int64)
+    used, cond_idx = np.unique(triple, return_inverse=True)
+    cond_dose = s_names[used % s_names.size]
+    pair_used = used // s_names.size
     cond_patient = p_names[pair_used // d_names.size]
     cond_drug = d_names[pair_used % d_names.size]
-    cond_order = np.lexsort((cond_drug, cond_patient))
+    cond_order = np.lexsort((cond_dose, cond_drug, cond_patient))
     cond_rank = np.empty_like(cond_order)
     cond_rank[cond_order] = np.arange(cond_order.size)
     rows = cond_rank[cond_idx]
@@ -620,7 +645,8 @@ def dense_pivots(
     # axis is therefore arbitrary but consistent -- which is all the scorer needs, since it
     # intersects the two halves' columns before correlating anything.
     index = pd.MultiIndex.from_arrays(
-        [cond_patient[cond_order], cond_drug[cond_order]], names=["patient", "drug"]
+        [cond_patient[cond_order], cond_drug[cond_order], cond_dose[cond_order]],
+        names=list(CONDITION_KEYS),
     )
     columns = pd.Index(g_names, name="gene_name")
 
@@ -697,13 +723,14 @@ def responder_overlap_table(de: pd.DataFrame, panel: set[str], alpha: float = 0.
             {
                 "patient": d["patient"].to_numpy(),
                 "drug": d["drug"].to_numpy(),
+                "dose": d["dose"].to_numpy(),
                 "n_first": first,
                 "n_second": second,
                 "n_both": first & second,
                 "n_union": first | second,
             }
         )
-        .groupby(["patient", "drug"], observed=True, sort=True)
+        .groupby(list(CONDITION_KEYS), observed=True, sort=True)
         .sum()
         .reset_index()
     )
@@ -753,6 +780,7 @@ def per_pair_table(
         {
             "patient": piv0.index.get_level_values(0),
             "drug": piv0.index.get_level_values(1),
+            "dose": piv0.index.get_level_values(2),
             "n_genes_scored": n,
             "mean_abs_delta": np.round(mean_abs, 4),
             "r": np.round(r, 4),
@@ -872,9 +900,11 @@ def example_pair_profiles(
     a, b = piv0.to_numpy(dtype=float), piv1.to_numpy(dtype=float)
     lines = piv0.index.get_level_values(0).to_numpy(dtype=str)
     drugs = piv0.index.get_level_values(1).to_numpy(dtype=str)
+    doses = piv0.index.get_level_values(2).to_numpy(dtype=str)
     order = np.flatnonzero(np.isfinite(r))[np.argsort(r[np.isfinite(r)])]
     if order.size == 0:
-        index_cols = ["example_id", "kind", "patient0", "drug0", "patient1", "drug1"]
+        index_cols = ["example_id", "kind", "patient0", "drug0", "dose0"]
+        index_cols += ["patient1", "drug1", "dose1"]
         index_cols += ["n_genes_full", "r_full", "n_genes_shown", "r_shown"]
         index_cols += ["n_responders_shown", "r_responder_full"]
         return pd.DataFrame(
@@ -937,8 +967,10 @@ def example_pair_profiles(
                 "kind": kind,
                 "patient0": lines[i],
                 "drug0": drugs[i],
+                "dose0": doses[i],
                 "patient1": lines[j],
                 "drug1": drugs[j],
+                "dose1": doses[j],
                 "n_genes_full": int(shared.size),
                 "r_full": round(r_full, 4),
                 "n_genes_shown": int(shown.size),
@@ -1082,7 +1114,6 @@ def pool_description(
         con.execute("DESCRIBE SELECT * FROM read_parquet(?) LIMIT 0", [paths]).df()["column_name"]
     )
     dose = next((c for c in DOSE_CANDIDATES if c in cols), None)
-    dose_expr = f"count(DISTINCT {dose})" if dose else "NULL"
     # The share of this condition's rows DESeq2 could not test (baseMean zero, so a null fold
     # change). Measured per condition because it is large and uneven here -- 59 percent of the
     # screen's rows overall -- and a reader comparing gene counts across conditions needs to
@@ -1091,18 +1122,19 @@ def pool_description(
         "avg(CASE WHEN baseMean = 0 THEN 1.0 ELSE 0.0 END)" if "baseMean" in cols else "NULL"
     )
     where, drug_params = _drug_predicate(target_names)
+    if dose is None:
+        raise SystemExit("no dose column in the pool; dose is part of the condition key")
     return con.execute(
-        f"""SELECT Cell_ID_DepMap AS patient, drug,
+        f"""SELECT Cell_ID_DepMap AS patient, drug, {dose} AS dose,
                    count(*) AS n_rows,
                    count(DISTINCT {repl}) AS n_plates,
                    count(DISTINCT {repl}) % 2 = 0 AS n_plates_even,
                    count(DISTINCT {repl}) FILTER (WHERE hash({repl}) % 2 = 0) AS n_plates_half0,
                    count(DISTINCT {repl}) FILTER (WHERE hash({repl}) % 2 = 1) AS n_plates_half1,
-                   {dose_expr} AS n_dose_levels,
                    {untestable} AS frac_untestable
             FROM read_parquet(?)
             WHERE {repl} IS NOT NULL{where}
-            GROUP BY Cell_ID_DepMap, drug ORDER BY patient, drug""",
+            GROUP BY Cell_ID_DepMap, drug, {dose} ORDER BY patient, drug, dose""",
         [paths, *drug_params],
     ).df()
 
@@ -1175,8 +1207,24 @@ def frame_cache_key(paths: list[str], names: list[str] | None, replicate_col: st
     replicate column resolves to a different file rather than silently reusing the wrong frame.
     """
     drug_key = ["<all drugs>"] if not names else sorted(names)
-    payload = "\n".join([*sorted(paths), "--", *drug_key, "--", str(replicate_col)])
+    payload = "\n".join(
+        [*sorted(paths), "--", *drug_key, "--", str(replicate_col), "--", FRAME_SCHEMA]
+    )
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
+def _normalise_keys(de: pd.DataFrame) -> pd.DataFrame:
+    """Give the key columns the dictionary-encoded dtype the builder produces.
+
+    Parquet stores a dictionary-encoded float back as a plain float, so a frame read from cache
+    had ``dose`` as float64 where a freshly built one had it as a Categorical. Everything
+    downstream coped with either, which is precisely the kind of difference that goes unnoticed
+    until something does not -- so the two paths are made to agree here instead.
+    """
+    for col in KEY_COLUMNS:
+        if col in de.columns and not isinstance(de[col].dtype, pd.CategoricalDtype):
+            de[col] = de[col].astype("category")
+    return de
 
 
 def _build_or_load_frame(
@@ -1197,7 +1245,7 @@ def _build_or_load_frame(
         cache = cache_dir / f"split_half_{key}.parquet"
         sidecar = cache.with_suffix(".json")
         if cache.exists() and sidecar.exists():
-            de = pd.read_parquet(cache)
+            de = _normalise_keys(pd.read_parquet(cache))
             repl = str(json.loads(sidecar.read_text())["replicate_col"])
             print(f"loaded the split-half frame from {cache} ({len(de):,} rows, replicate {repl})")
             return de, repl
@@ -1596,10 +1644,17 @@ def main() -> None:
 
     # --- pool composition, and the equal-halves subset ---------------------------------------
     pool = pool_description(paths, names, repl, local.parent / "duckdb_tmp")
-    even_by_key = dict(
-        zip(zip(pool["patient"], pool["drug"], strict=True), pool["n_plates_even"], strict=True)
+    # Joined on the full condition key, dose included. The pool description is keyed the same
+    # way, so a stale two-part key here would silently mark the wrong conditions as equal-half.
+    even_by_key = {
+        (str(p), str(d), str(x)): bool(v)
+        for p, d, x, v in zip(
+            pool["patient"], pool["drug"], pool["dose"], pool["n_plates_even"], strict=True
+        )
+    }
+    even_mask = np.array(
+        [even_by_key.get((str(p), str(d), str(x)), False) for p, d, x in piv0.index], dtype=bool
     )
-    even_mask = np.array([bool(even_by_key.get((p, d), False)) for p, d in piv0.index], dtype=bool)
     print(f"{int(even_mask.sum())} of {even_mask.size} conditions split into equal halves")
 
     # --- nulls, both gene sets ---------------------------------------------------------------
