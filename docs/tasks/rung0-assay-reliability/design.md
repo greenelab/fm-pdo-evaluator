@@ -268,12 +268,13 @@ stratum — measures the dependence the bootstrap ignores and reports it as a de
 
 A chain of three cluster jobs, no gene or drug file (`scripts/alpine/submit_rung0_chain.sh`):
 `rung0_assign.sbatch` scans the key columns once and writes the split assignment;
-`rung0_slice.sbatch`, a sixteen-task job array, has each task scan the table once for its slice
+`rung0_slice.sbatch`, a thirty-two-task job array, has each task scan the table once for its slice
 of the genes and aggregate that slice by (line, drug, dose, gene) in one pass that serves both
 the reliabilities and the noise decomposition, caching its slice on scratch; `rung0_combine.sbatch`
 reads every slice and does everything that needs the whole frame at once. The scan is the whole
-cost, so sixteen slices on sixteen nodes make the wall clock one scan rather than sixteen, and
-each task holds a sixteenth of the group table. Slicing by gene is exact because gene is in every
+cost, so thirty-two slices in flight make the wall clock one scan rather than thirty-two, and
+each task holds a thirty-second of the group table -- small enough to be billed as a fraction of
+a node and slot into the queue, which sixteen slices of 120 GB did not. Slicing by gene is exact because gene is in every
 group key. Then `scripts/permutation_null.py` reads the same cache for the permutation check.
 Outputs land in the task folder. Three
 results are promoted with `scripts/promote_result.py` — the all-gene reliability and the

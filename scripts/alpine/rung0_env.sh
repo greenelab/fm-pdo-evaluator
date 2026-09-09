@@ -21,6 +21,6 @@ python -c "import duckdb, matplotlib" 2>/dev/null || pip install -q "duckdb>=1.0
 # speed optimisation, not the reproduction chain -- the pinned tranche plus the committed code
 # is that -- and scratch is purged. The slice count is the job array's size.
 export RUNG0_CACHE="${RUNG0_CACHE:-/scratch/alpine/$USER/rung0_cache_v3}"
-export RUNG0_SLICES="${RUNG0_SLICES:-16}"
+export RUNG0_SLICES="${RUNG0_SLICES:-32}"
 export OUT_DIR="${OUT_DIR:-docs/tasks/rung0-assay-reliability}"
 mkdir -p logs
