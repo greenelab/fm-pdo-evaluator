@@ -5,7 +5,10 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
+#SBATCH --mem=120G                   # the first attempt at 64G with the engine at 48G was
+                                     # OOM-killed by the cgroup (job 32341467): the parquet
+                                     # readers and the group keys sit outside the engine's
+                                     # limit, so the job needs twice the engine's allowance
 #SBATCH --time=02:00:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.out
@@ -28,6 +31,6 @@ python scripts/delta_reproducibility.py \
     --local-dir "/scratch/alpine/$USER/tahoe_pseudobulk_de" \
     --stage assign \
     --cache-dir "$RUNG0_CACHE" \
-    --duckdb-memory 48GB \
-    --duckdb-threads 8 \
+    --duckdb-memory 60GB \
+    --duckdb-threads 4 \
     --out-dir "$OUT_DIR"

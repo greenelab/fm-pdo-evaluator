@@ -104,3 +104,21 @@ per `docs/PROCESS.md` §1 and SPEC project rule 2.
   Wall clock is one scan; each task holds a sixteenth of the group table. A task that finds its
   completion record skips, so a failed index is resubmitted alone. Recorded in `docs/PROCESS.md`
   §2 as the way a scan-bound job is run on the cluster.
+- **2026-09-09** — The decompose figure's control sits beside panel (a) only, recorded here
+  because the audit's D70 asked where the change was stated. The original bullet promised every
+  decompose panel its control pool; the pooled estimator changed what the panels are. Panel (a)
+  is the per-gene signed share with the pooled share marked, and its control plants a share of
+  0.5 at two plates so the estimator has a known answer to recover; the scatter of variance
+  across plates against sampling variance has an identity line rather than a control, since the
+  line IS the null; and the two strata panels read the committed strata table, whose pooled
+  shares the verifier recomputes. A planted control for a stratified share would test pandas'
+  `qcut`, not the assay.
+- **2026-09-09** — The functions added to `scripts/delta_reproducibility.py` on the port, named
+  here because the design's "Ported apparatus" row points to this file for the list and the
+  audit's D109 found four of them named nowhere: `_drug_predicate` and `resolve_drug_names` (the
+  build's drug admission), `_compact_df` (Arrow dictionary encoding of the key columns),
+  `mde_curve_table` (power against condition count), `effect_size_tercile_table` (the
+  empirical control with intervals), `spearman_brown_or_nan` (the correction's guard at r = -1),
+  `write_audit_checksums` (the audit interface). Added on 2026-09-09: `split_assignment`,
+  `slice_aggregate`, `frame_from_slice`, `noise_from_slice`, `pooled_plate_variance`,
+  `dose_strata_table`, `run_slice`, `load_slices`, `write_noise_outputs`.

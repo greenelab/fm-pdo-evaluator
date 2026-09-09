@@ -569,9 +569,9 @@ def main() -> None:
             pd.DataFrame({"perm_mean": perm_means}),
             pd.read_csv(draws_path),
             {**rel, **summary_row},
-            fig_dir / f"10_permutation_vs_bootstrap{suffix}.png",
+            fig_dir / f"11_permutation_vs_bootstrap{suffix}.png",
         )
-        print(f"wrote {fig_dir}/10_permutation_vs_bootstrap{suffix}.png")
+        print(f"wrote {fig_dir}/11_permutation_vs_bootstrap{suffix}.png")
     else:
         print(
             "skipping the design-effect figure: it is drawn from rung0_null_draws.csv and "

@@ -11,7 +11,7 @@
 #SBATCH --error=logs/%x-%j.out
 #
 # Rung-0 permutation-based exact permutation null (docs/tasks/rung0-assay-reliability/design.md,
-# decision history). Reuses the same DuckDB split-half build as delta_reproducibility.sbatch,
+# decision history). Reads the split-half frame the rung0_slice array cached,
 # then runs THREE permutation-based nulls over the half-profile pivots, carrying the
 # half-profile-sharing dependence the bootstrapped p-values had to assume away by construction
 # in each case: any-pair (a permutation with no fixed points, validating the pooled aggregate),
@@ -30,7 +30,7 @@ cd "$REPO"
 # the dependence the bootstrap ignores for each of them -- a design effect established on the
 # all-gene statistic says nothing about the responder one, whose draws reuse a different and
 # smaller set of genes per condition. No drug list and no panel, for the reason given in
-# delta_reproducibility.sbatch.
+# rung0_combine.sbatch. Submitted by submit_rung0_chain.sh after the combine job.
 source scripts/alpine/rung0_env.sh
 for GENE_SET in all responder; do
     echo "=== permutation null, gene set: $GENE_SET ==="

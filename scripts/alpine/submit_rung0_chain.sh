@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Submit rung 0's three stages as a dependency chain: assign -> slice array -> combine.
+# Submit rung 0's stages as a dependency chain: assign -> slice array -> combine -> permutation.
 #
 # Run from the repository root on the LOCAL machine; every submission goes through ralpine so
 # the boundary it enforces holds (PROCESS section 2). Each job id is read from sbatch's own
@@ -7,15 +7,16 @@
 # `ralpine jobinfo` -- a chain that silently drops its dependency runs immediately and out of
 # order (PROCESS section 2, "Chained jobs").
 #
-#   scripts/alpine/submit_rung0_chain.sh            # all three stages
-#   scripts/alpine/submit_rung0_chain.sh --from slice   # the array and the combine only
-#   scripts/alpine/submit_rung0_chain.sh --from combine # the combine only
+#   scripts/alpine/submit_rung0_chain.sh                    # all four stages
+#   scripts/alpine/submit_rung0_chain.sh --from slice       # from the array on
+#   scripts/alpine/submit_rung0_chain.sh --from combine     # the combine and the permutation
+#   scripts/alpine/submit_rung0_chain.sh --from permutation # the permutation check only
 set -euo pipefail
 
 RALPINE="$(dirname "${BASH_SOURCE[0]}")/ralpine"
 FROM="assign"
 if [[ "${1:-}" == "--from" ]]; then
-  FROM="${2:?--from needs a stage: assign, slice or combine}"
+  FROM="${2:?--from needs a stage: assign, slice, combine or permutation}"
 fi
 
 job_id() { grep -oE '[0-9]+$' <<<"$1" | tail -1; }
@@ -44,8 +45,15 @@ if [[ "$FROM" == "assign" || "$FROM" == "slice" ]]; then
   [[ -n "$DEP" ]] && check_dependency "$SLICE" "afterok:$ASSIGN"
   DEP="--dependency=afterok:$SLICE"
 fi
-out="$("$RALPINE" submit scripts/alpine/rung0_combine.sbatch ${DEP:+"$DEP"})"
-COMBINE="$(job_id "$out")"
-echo "combine: job $COMBINE"
-[[ -n "$DEP" ]] && check_dependency "$COMBINE" "afterok:"
+if [[ "$FROM" != "permutation" ]]; then
+  out="$("$RALPINE" submit scripts/alpine/rung0_combine.sbatch ${DEP:+"$DEP"})"
+  COMBINE="$(job_id "$out")"
+  echo "combine: job $COMBINE"
+  [[ -n "$DEP" ]] && check_dependency "$COMBINE" "afterok:"
+  DEP="--dependency=afterok:$COMBINE"
+fi
+out="$("$RALPINE" submit scripts/alpine/permutation_null.sbatch ${DEP:+"$DEP"})"
+PERM="$(job_id "$out")"
+echo "permutation: job $PERM"
+[[ -n "$DEP" ]] && check_dependency "$PERM" "afterok:"
 echo "watch with: scripts/alpine/ralpine sq"

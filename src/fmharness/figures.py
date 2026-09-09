@@ -489,6 +489,29 @@ def fig_select(
         fontsize=9,
     )
 
+    if overlap is not None:
+        ax_overlap = axes[3]
+        jaccard = _finite(overlap, "jaccard")
+        if jaccard.size:
+            ax_overlap.hist(jaccard, bins=_even_bins(0.0, 1.0, 40), color=_REAL_COLOR, alpha=0.85)
+            ax_overlap.axvline(
+                float(np.median(jaccard)),
+                color="k",
+                lw=1.4,
+                linestyle="--",
+                label=f"median {float(np.median(jaccard)):.2f} over {jaccard.size:,} conditions",
+            )
+        else:
+            _note_empty(ax_overlap, "no conditions with a responder in either half")
+        ax_overlap.set_xlabel("Jaccard overlap of the two halves' responder sets")
+        ax_overlap.set_ylabel("conditions (count)")
+        ax_overlap.set_title(
+            "(d) how far the halves agree on who responded\n(diagnostic; never an input to "
+            "selection)",
+            fontsize=9,
+        )
+        _legend(ax_overlap, fontsize=8)
+
     fig.suptitle("select: responders chosen from the first half alone", fontsize=11)
     return _finish(fig, out)
 

@@ -143,6 +143,12 @@ def promote(
     code_commit: str | None = None,
 ) -> Path:
     repo = repo.resolve()
+    if audit_checksums is None and (result.parent / "audit_checksums.json").exists():
+        # The audit's record sits beside the run's artifacts. Checking against it is the default
+        # whenever it is there, not an option a caller has to remember: the refusal it enables is
+        # what closes the window between what was audited and what gets committed.
+        audit_checksums = result.parent / "audit_checksums.json"
+        print(f"checking {result.name} against the audit record {audit_checksums}")
     _refuse_if_checksums_moved(result, audit_checksums)
     code_commit, job_id = _producing_commit(result, code_commit, job_id)
     if not (repo / script).exists():
@@ -235,9 +241,10 @@ def main() -> None:
         "--audit-checksums",
         type=Path,
         default=None,
-        help="the audit's checksum record (audit_checksums.json beside the artifacts). When "
-        "given, promotion refuses if the artifact's checksum has moved since the audit read "
-        "it, which is what closes the window opened by auditing uncommitted artifacts.",
+        help="the audit's checksum record. Defaults to audit_checksums.json beside the result "
+        "when that file exists; promotion then refuses if the artifact's checksum has moved "
+        "since the audit read it, which is what closes the window opened by auditing "
+        "uncommitted artifacts.",
     )
     ap.add_argument("--job-id", default=None, help="defaults to the sidecar's slurm_job_id")
     ap.add_argument(

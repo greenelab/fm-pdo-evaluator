@@ -78,6 +78,8 @@ FIGURES: tuple[str, ...] = (
     "08_power.png",
     "09_per_gene_reliability.png",
     "10_dose.png",
+    "11_permutation_vs_bootstrap.png",
+    "11_permutation_vs_bootstrap_responder.png",
 )
 
 #: The table each figure is drawn from. A figure whose source table was never written is a
@@ -85,6 +87,8 @@ FIGURES: tuple[str, ...] = (
 #: battery has to tell those apart, or a partial run reports as a defect.
 FIGURE_SOURCES: dict[str, str] = {
     "05_decompose.png": "rung0_noise_per_gene.csv.gz",
+    "11_permutation_vs_bootstrap.png": "rung0_permutation_summary.csv",
+    "11_permutation_vs_bootstrap_responder.png": "rung0_permutation_summary_responder.csv",
 }
 
 SUMMARY = "rung0_reliability.csv"
@@ -108,6 +112,8 @@ KEYS = ("patient", "drug", "dose")
 #: at two plates, so the pooled share must come back at one half.
 PLANTED_CONTROL_SHARE = 0.5
 PROFILES = "rung0_example_pair_profiles.csv.gz"
+MDE_CURVE = "rung0_mde_curve.csv"
+OVERLAP = "rung0_responder_overlap.csv"
 PROFILE_INDEX = "rung0_example_pair_index.csv"
 TERCILES = "rung0_effect_terciles.csv"
 LEAKAGE = "rung0_leakage_control.csv"
@@ -680,6 +686,55 @@ def _pearson_by_group(frame: pd.DataFrame, key: str, x: str, y: str) -> dict[str
     return out
 
 
+def check_exports(task_dir: Path) -> list[Check]:
+    """The two evidence tables only the summary reads, checked against what they summarise.
+
+    The MDE curve's observed row must be the summary row's own count and minimum detectable
+    effect against the different-drug floor; the responder-overlap table must obey the set
+    identities its columns assert, one row per scored condition.
+    """
+    row = summary_row(task_dir)
+    curve = read_table(task_dir / MDE_CURVE)
+    per_pair = read_table(task_dir / PER_PAIR)
+    checks: list[Check] = []
+    for label, _ in GENE_SETS:
+        observed = curve[(curve["gene_set"].astype(str) == label) & _bool_column(curve, "observed")]
+        n = int(observed["n_pairs"].iloc[0]) if len(observed) else -1
+        mde = float(observed["mde"].iloc[0]) if len(observed) else float("nan")
+        checks.append(
+            Check(
+                f"{label}: the MDE curve's observed row is the summary's count and MDE",
+                f"reported n_pairs {int(row[f'{label}_n_pairs'])}, "
+                f"mde_80_vs_diff_drug {row[f'{label}_mde_80_vs_diff_drug']}",
+                f"{MDE_CURVE}: {len(observed)} observed row(s), n_pairs {n}, mde {mde}",
+                len(observed) == 1
+                and n == int(row[f"{label}_n_pairs"])
+                and _close(float(row[f"{label}_mde_80_vs_diff_drug"]), mde, 4),
+            )
+        )
+    overlap = read_table(task_dir / OVERLAP)
+    first = overlap["n_first"].to_numpy(dtype=float)
+    second = overlap["n_second"].to_numpy(dtype=float)
+    both = overlap["n_both"].to_numpy(dtype=float)
+    union = first + second - both
+    with np.errstate(invalid="ignore", divide="ignore"):
+        jaccard = np.where(union > 0, both / union, np.nan)
+    reported = overlap["jaccard"].to_numpy(dtype=float)
+    agree = np.isfinite(jaccard) == np.isfinite(reported)
+    agree &= ~np.isfinite(jaccard) | (np.abs(jaccard - reported) <= 0.5e-4 + 1e-12)
+    identities = bool(np.all(both <= np.minimum(first, second)) and np.all(agree))
+    checks.append(
+        Check(
+            "the responder-overlap table obeys its set identities, one row per condition",
+            "n_both <= min(n_first, n_second); jaccard = n_both / (n_first + n_second - n_both); "
+            f"{len(per_pair)} scored conditions",
+            f"{len(overlap)} rows; identities " + ("hold on every row" if identities else "FAIL"),
+            identities and len(overlap) == len(per_pair) and len(overlap) > 0,
+        )
+    )
+    return checks
+
+
 def check_example_profiles(task_dir: Path) -> list[Check]:
     """Each example scatter reproduces the correlation its index records for it.
 
@@ -1177,6 +1232,7 @@ def run_all_checks(task_dir: Path = DEFAULT_TASK_DIR, repo: Path = REPO) -> list
         *check_effect_size_terciles(task_dir),
         *check_leakage_control(task_dir),
         *check_noise_decomposition(task_dir),
+        *check_exports(task_dir),
         *check_example_profiles(task_dir),
         *check_figures(task_dir),
         *check_pool_arithmetic(task_dir),

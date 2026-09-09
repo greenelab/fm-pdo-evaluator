@@ -5,8 +5,8 @@
   "ingestion_date": "2026-07-24",
   "patient_count": 0,
   "sample_count": 50,
-  "drug_count": 32,
+  "drug_count": 391,
   "subtypes": [],
   "content_hash": "9a8797a5698e2c56ec1b61bdd3d5f68d18a972e227e86b64ac341ef507f73dd6",
-  "description": "Tahoe-100M pseudobulk DE shards on scratch; sample_count = cell lines (no patients in a cell-line corpus); drug_count = the declared drug panel. See docs/DATA.md."
+  "description": "Tahoe-100M pseudobulk DE shards on scratch; sample_count = cell lines (no patients in a cell-line corpus), counted exactly (job 31996456); drug_count = distinct drugs in the table, from a HyperLogLog sketch good to a couple of percent (job 31979673), not a declared panel -- rung 0 scores every drug with a replicated (line, drug, dose) triple. See docs/DATA.md."
 }

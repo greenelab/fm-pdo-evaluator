@@ -5,7 +5,9 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=80G
+#SBATCH --mem=120G                   # twice the engine's limit: what sits outside it (parquet
+                                     # readers, the returned Arrow table, pandas) killed the
+                                     # assign job at 64G/48G (job 32341467)
 #SBATCH --time=04:00:00
 #SBATCH --array=0-15
 #SBATCH --output=logs/%x-%A_%a.out
