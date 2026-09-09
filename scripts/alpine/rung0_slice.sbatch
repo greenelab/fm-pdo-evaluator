@@ -7,8 +7,10 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=72G                    # Alpine charges memory per core at 3,840 MB, so memory IS
                                      # the core request: 120G was billed as 32 cores and sat in
-                                     # the queue. A sixteenth slice peaked at 98G (job
-                                     # 32341611_0); a thirty-second is about half that
+                                     # the queue. Peak RSS runs 35-40G ABOVE the engine's own
+                                     # limit whatever the slice size (98G at 60G, job
+                                     # 32341611_0; 75G at 40G, job 32345592_0, killed), so the
+                                     # engine limit below is what keeps a task inside this
 #SBATCH --time=01:30:00              # short enough to backfill into the scheduler's gaps; a
                                      # sixteenth slice took 51 min at 4 threads
 #SBATCH --array=0-31
@@ -39,7 +41,7 @@ python scripts/delta_reproducibility.py \
     --slices "$RUNG0_SLICES" \
     --slice-index "$SLURM_ARRAY_TASK_ID" \
     --cache-dir "$RUNG0_CACHE" \
-    --duckdb-memory 40GB \
-    --duckdb-threads 8 \
+    --duckdb-memory 28GB \
+    --duckdb-threads 4 \
     --noise-sample-rows 2000000 \
     --out-dir "$OUT_DIR"
