@@ -65,8 +65,9 @@ manifest, and the provenance record of any promoted result names that content ha
 derived `pseudobulk_differential_expression` table this project reads covers less of it, and the
 difference matters for every count a rung reports. Counted on the cluster (job 31979673) rather
 than inferred. **4,089,820,780 rows** and **3** dose levels (0.05, 0.5, 5.0 uM), both exact.
-**Fifty** cell lines, exact; approximately **391** drugs and **49,040** genes, from HyperLogLog
-sketches and so good to a couple of percent rather than to the digit — an earlier draft of this
+**Fifty** cell lines, exact; **379** drugs with a plate id, exact (the split-assignment scan,
+job 32341610, 2026-09-09 — the HyperLogLog sketch had read 391, which is the couple of percent
+it is good to); approximately **49,040** genes, still from the sketch. An earlier draft of this
 entry reported 45 cell lines from that sketch, which the exact count contradicts.
 
 **18,950** (line, drug) conditions and **56,827** (line, drug, dose) triples, all exact.
