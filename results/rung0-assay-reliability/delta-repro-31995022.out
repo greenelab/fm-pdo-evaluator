@@ -1,0 +1,29 @@
+all drugs (no drug list given); reading 1026 DE parquet files ...
+loaded the split-half frame from /scratch/alpine/lgillenwater@xsede.org/rung0_frame_cache/split_half_eec9bb7743e5d17e.parquet (451,305,265 rows, replicate plate)
+built 451,305,265 rows; 451,305,265 have both plate halves
+scoring every gene the table carries: 48972
+all-gene: 18329 conditions scored; responder: 16644 conditions, 1722 genes each on average
+5593 of 18329 conditions split into equal halves
+null[all       any_pair  ] median r = +0.041 over 500 draws
+null[all       diff_drug ] median r = +0.039 over 500 draws
+null[all       same_drug ] median r = +0.070 over 500 draws
+null[responder any_pair  ] median r = +0.169 over 463 draws
+null[responder diff_drug ] median r = +0.174 over 455 draws
+null[responder same_drug ] median r = +0.373 over 455 draws
+wrote /projects/lgillenwater@xsede.org/repositories/fm-pdo-evaluator/docs/tasks/rung0-assay-reliability/rung0_reliability.params.json
+leakage control: [{'rule': 'one-sided', 'mean_r': -0.0033, 'genes_per_condition': 98}, {'rule': 'pooled', 'mean_r': 0.6837, 'genes_per_condition': 98}]
+Traceback (most recent call last):
+  File "/projects/lgillenwater@xsede.org/repositories/fm-pdo-evaluator/scripts/delta_reproducibility.py", line 1587, in <module>
+    main()
+  File "/projects/lgillenwater@xsede.org/repositories/fm-pdo-evaluator/scripts/delta_reproducibility.py", line 1496, in main
+    overall, strata = noise_aggregate(
+  File "/projects/lgillenwater@xsede.org/repositories/fm-pdo-evaluator/scripts/delta_reproducibility.py", line 268, in noise_aggregate
+    overall = con.execute(
+_duckdb.OutOfMemoryException: Out of Memory Error: failed to pin block of size 256.0 KiB (55.8 GiB/55.8 GiB used)
+
+Possible solutions:
+* Reducing the number of threads (SET threads=X)
+* Disabling insertion-order preservation (SET preserve_insertion_order=false)
+* Increasing the memory limit (SET memory_limit='...GB')
+
+See also https://duckdb.org/docs/stable/guides/performance/how_to_tune_workloads

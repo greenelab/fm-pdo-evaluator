@@ -1,0 +1,16 @@
+# Generated evidence: committed so a reviewer can re-derive promoted numbers without
+# cluster access (the task's verification battery recomputes from these), but not review
+# material. linguist-generated collapses them in the GitHub diff view.
+# The review surface / generated evidence split is defined in PROCESS §1.
+docs/tasks/**/*.csv linguist-generated=true
+docs/tasks/**/*.csv.gz linguist-generated=true binary
+docs/tasks/**/figures/*.csv.gz linguist-generated=true binary
+docs/tasks/**/*.params.json linguist-generated=true
+docs/tasks/**/*.provenance.json linguist-generated=true
+docs/tasks/**/figures/** linguist-generated=true
+results/**/*.csv linguist-generated=true
+results/**/*.out linguist-generated=true
+results/**/*.provenance.json linguist-generated=true
+results/**/figures/** linguist-generated=true
+data/tranches/*.manifest.txt linguist-generated=true
+uv.lock linguist-generated=true

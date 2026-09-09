@@ -1,0 +1,7 @@
+example_id,kind,patient0,drug0,patient1,drug1,n_genes_full,r_full,n_genes_shown,r_shown,n_responders_shown,r_responder_full
+matched_q05,matched,ACH-000389,Entecavir (monohydrate),ACH-000389,Entecavir (monohydrate),21176,0.0266,21176,0.0266,32,0.856
+matched_q25,matched,NA,Simotinib,NA,Simotinib,19003,0.0738,19003,0.0738,44,-0.2111
+matched_q50,matched,ACH-000750,Doxorubicin (hydrochloride),ACH-000750,Doxorubicin (hydrochloride),24415,0.1096,24415,0.1096,664,0.4864
+matched_q95,matched,ACH-000628,Dinaciclib,ACH-000628,Dinaciclib,5424,0.2322,5424,0.2322,0,
+same_drug_mismatch,same_drug_mismatch,ACH-000750,Doxorubicin (hydrochloride),ACH-000120,Doxorubicin (hydrochloride),16648,0.0974,16648,0.0974,650,0.433
+diff_drug_mismatch,diff_drug_mismatch,ACH-000750,Doxorubicin (hydrochloride),ACH-000120,(R)-Verapamil (hydrochloride),18552,0.0396,18552,0.0396,651,0.115

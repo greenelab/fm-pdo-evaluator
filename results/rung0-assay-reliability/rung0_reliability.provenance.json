@@ -1,0 +1,33 @@
+{
+  "result": "results/rung0-assay-reliability/rung0_reliability.csv",
+  "result_sha256": "ae8295bda63c289fe34f3c59e2e225747ab92ab68eef9a6384cb6611d9e58957",
+  "task": "rung0-assay-reliability",
+  "script": "scripts/delta_reproducibility.py",
+  "args": {
+    "tranche_id": "tahoe100m-pseudobulk-de.v1",
+    "gene_inclusion": "every gene the table carries",
+    "drug_inclusion": "every drug with a plate in each hash group",
+    "dose_handling": "POOLED -- superseded; dose is confounded with plate on this screen, so the two halves carry different doses for 99.7% of conditions. Not a test-retest reliability and not a ceiling a later rung may divide by.",
+    "selection_rule": "padj < 0.05 in at least one of the first plate group's rows",
+    "status": "provisional; the dose-fixed rerun had not completed when the cluster went down"
+  },
+  "inputs": {
+    "tranche_manifest": "9a8797a5698e2c56ec1b61bdd3d5f68d18a972e227e86b64ac341ef507f73dd6"
+  },
+  "log": "results/rung0-assay-reliability/delta-repro-31995022.out",
+  "log_sha256": "2f126b8b17e7064216c0e8bbb88cb3d875a0af54efa04a97d24bc36d4da06247",
+  "job_id": "31995022",
+  "clean_tree": true,
+  "environment": {
+    "code_commit": "92407c162f3f60bd1f4a80382468ad6f11aca83d",
+    "python_version": "3.13.5",
+    "seed": 0,
+    "cuda_deterministic": false,
+    "data_commit": "9a8797a5698e2c56ec1b61bdd3d5f68d18a972e227e86b64ac341ef507f73dd6",
+    "container_digest": null,
+    "torch_version": null,
+    "cuda_version": null,
+    "model_weights_hash": null
+  },
+  "promoted_at": "2026-09-02T15:34:31.802127Z"
+}

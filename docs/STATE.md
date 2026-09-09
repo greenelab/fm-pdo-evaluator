@@ -1,0 +1,47 @@
+# Project state
+
+**Reads against** [`docs/SPEC.md`](SPEC.md).
+The spec says what each rung must establish and what a passing result means; this document says where each one stands.
+It carries no history: a rung's result belongs here, how it came to be belongs in git and in that rung's spec.
+
+**As of** 2026-09-02.
+
+A number not carried here with its provenance record is not evidence.
+Promotion means a result in `results/<task-slug>/` with a `<result>.provenance.json` beside it recording the commit, job and inputs that produced it — project rule 1.
+Rung 0 has promoted one result, and it is provisional: a dose-pooled reliability that measures a dose-to-dose correlation rather than a test-retest reliability, promoted so the run is traceable rather than because it settles the rung. Its provenance record says so in its own `dose_handling` field. No rung is closed.
+
+---
+
+## Ladder status
+
+| Rung | What the spec requires | Status |
+|---|---|---|
+| 0 — assay reliability | Two reproducibility ceilings clearing their nulls at the assay's full extent — all genes, and each condition's responders — with replicate noise decomposed into plate and cell-sampling parts | **Provisional result promoted, rung not closed.** Dose-pooled run on branch `rung0-assay-reliability` ([design](tasks/rung0-assay-reliability/design.md) · [summary](tasks/rung0-assay-reliability/summary.ipynb) · [result](../results/rung0-assay-reliability/rung0_reliability.csv)): all-gene split-half **0.118** (Spearman-Brown **0.210**) over 18,329 conditions, responders **0.559** (**0.717**) over 16,644, both clearing their floors at p = 0.0005. **Not usable as a ceiling**: dose is confounded with plate on this screen, so the two halves carry different doses for 99.7% of conditions and the number is a dose-to-dose correlation. The dose-fixed correction is in the code and had not run when the cluster went down. The noise decomposition never completed |
+| 1 — held-out line | Prediction beating a floor and recovering a planted signal, as a fraction of rung 0 | Not started |
+| 2 — bulk read by a single-cell model | A synthesised population landing near the same material's real single cells, clearing a mismatched-line null | Not started |
+| 3 — cross-platform | Retention separable from a scrambled-line control | Not started |
+| 4 — GDSC2 viability | Interaction above zero after correction, against the screen-agreement ceiling | Not started |
+| 5 — organoid viability | The transfer number, on a frozen embargoed holdout | Not started |
+| 6 — prospective | A registered prediction holding on organoids screened afterwards | Not started |
+
+A rung closes when its result is promoted with provenance, this table records it, and the project-rule tests for the steps it touches pass.
+
+
+## What this repository holds today
+
+| Present | Consequence |
+|---|---|
+| Schema, determinism and adapter scaffolding, with tests | The apparatus a rung is added to exists; nothing here yet produces a measurement |
+| One promoted result, `results/rung0-assay-reliability/` | Rung 0 is the first work held to the spec's rules. The number is provisional and its provenance record says why; the rung is not closed |
+| `docs/adapter_contract.md` and `docs/environment.md`, predating this spec | Neither has been reconciled against it. The rung that first depends on either brings it into line rather than a sweep that touches everything at once |
+
+## Where things live
+
+- **Results** `results/<task-slug>/<result>.csv` with `<result>.provenance.json` beside it. No provenance record, no evidence.
+- **Figures** produced by a run into `docs/tasks/<slug>/figures/`, never drawn by hand, each drawn from a committed table and shown beside its control; declared per step in that task's `design.md`, pointed at from `verification.md`, and walked through in `summary.ipynb`. A figure the project cites is promoted alongside its table.
+- **The reviewer's two notebooks** `summary.ipynb` explains the finding step by step with its figures; `verify.ipynb` recomputes every promoted claim inline from the committed artifacts. Both are committed without outputs.
+- **Audits** `docs/tasks/<slug>/audit.md`, following the repository standard in [`docs/audit.md`](audit.md).
+- **Rung and task specs** `docs/tasks/<slug>/design.md`, one folder per task, arriving with the work it specifies.
+- **Decisions** dated and appended to the bottom of the task's own `design.md` and `plan.md`, so a reversal travels with the document it reverses.
+- **Rules and their tests** `docs/SPEC.md` and `tests/test_project_rules.py`.
+- **The summary a reader opens first** `README.md`, which restates this document's status line and the ladder from `docs/SPEC.md`. It moves whenever either does.
