@@ -4,9 +4,9 @@
 
 ## The question
 
-Foundation models trained on cell-line transcriptomic data claim generalization to out-of-distribution tasks. 
-This repo builds the infrastructure to find the boundary of those claims. 
-This repo will test whether model prediction survives the move to an unseen cell line, across platforms, in a new modality, and on prospective experimental data. 
+Foundation models trained on cell-line transcriptomic data claim generalization to out-of-distribution tasks.
+This repo builds the infrastructure to find the boundary of those claims.
+This repo will test whether model prediction survives the move to an unseen cell line, across platforms, in a new modality, and on prospective experimental data.
 
 ## The generalization boundary ladder
 

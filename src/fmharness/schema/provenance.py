@@ -82,3 +82,8 @@ class PromotedResult(BaseModel):
     clean_tree: bool
     environment: EnvironmentSnapshot
     promoted_at: datetime
+    #: The commit promotion happened at. ``environment.code_commit`` is the commit the RUN was
+    #: made at, read from the run's own parameter sidecar; the two differ whenever code lands
+    #: between a run and its promotion, and recording only the second was how a promoted record
+    #: came to name a commit that could not reproduce its result (review of PR #9, 2026-09-02).
+    promotion_commit: str | None = Field(default=None, min_length=7)

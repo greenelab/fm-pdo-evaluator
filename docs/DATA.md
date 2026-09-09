@@ -110,4 +110,3 @@ this one.
   `scripts/download_tahoe_pseudobulk_de.py`): the same aggregation without the split —
   mean `log2FoldChange` and `baseMean` per (line, drug, gene) over all plates and doses.
   Consumed by rung 1 ([docs/SPEC.md](SPEC.md)) when that rung arrives.
-

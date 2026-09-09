@@ -7,6 +7,12 @@ clean, the producing commit, and the artifact's checksum. Promotion REFUSES when
 task-side copy and an existing promoted copy differ -- an artifact must not change under
 its claim.
 
+The producing commit is the commit the RUN was made at, read from the ``<result>.params.json``
+sidecar every run writes beside its result (``git_sha``), or given as ``--code-commit`` when a
+result has no sidecar. It is never the commit promotion happens at: code lands between a run
+and its promotion, and a record naming the later commit names code that cannot reproduce the
+result. The promotion commit is recorded too, separately, as ``promotion_commit``.
+
 Usage (rung 0):
     uv run python scripts/promote_result.py \
         --task rung0-assay-reliability \
@@ -91,6 +97,35 @@ def _refuse_if_checksums_moved(result: Path, audit_checksums: Path | None) -> No
         )
 
 
+def _producing_commit(
+    result: Path, given: str | None, job_id: str | None
+) -> tuple[str, str | None]:
+    """The commit that produced ``result``, and the job that ran it, from the run's sidecar.
+
+    Every run writes ``<result>.params.json`` beside its result with the ``git_sha`` it ran at
+    and its Slurm job id. That record is the only thing that knows the producing commit; the
+    commit at promotion time is a different fact and is recorded under its own name. An
+    explicit ``given`` commit overrides the sidecar (a result computed by hand, or a sidecar
+    known to be wrong); with neither, promotion refuses rather than guessing.
+    """
+    sidecar = result.with_suffix(".params.json")
+    recorded = json.loads(sidecar.read_text()) if sidecar.exists() else {}
+    commit = given or str(recorded.get("git_sha") or "")
+    if not commit or commit == "unknown":
+        raise SystemExit(
+            f"the commit that produced {result.name} is not known: no git_sha in "
+            f"{sidecar.name} beside it and no --code-commit given. A record that names the "
+            "promotion commit instead would name code that cannot reproduce the result."
+        )
+    if given and recorded.get("git_sha") and given != recorded["git_sha"]:
+        print(
+            f"note: --code-commit {given[:12]} overrides the sidecar's {recorded['git_sha'][:12]}"
+        )
+    if job_id is None and recorded.get("slurm_job_id") not in (None, "local"):
+        job_id = str(recorded["slurm_job_id"])
+    return commit, job_id
+
+
 def promote(
     *,
     task: str,
@@ -105,9 +140,11 @@ def promote(
     repo: Path,
     input_labels: dict[Path, str] | None = None,
     audit_checksums: Path | None = None,
+    code_commit: str | None = None,
 ) -> Path:
     repo = repo.resolve()
     _refuse_if_checksums_moved(result, audit_checksums)
+    code_commit, job_id = _producing_commit(result, code_commit, job_id)
     if not (repo / script).exists():
         raise SystemExit(
             f"--script {script} is not in the repo; a result whose producing script "
@@ -129,7 +166,7 @@ def promote(
     # meaningless. What this flag records is whether the tracked code and docs carried
     # uncommitted modifications at promotion time.
     clean_tree_status = _git(repo, "status", "--porcelain", "-uno") == ""
-    code_commit = _git(repo, "rev-parse", "HEAD")
+    promotion_commit = _git(repo, "rev-parse", "HEAD")
 
     out_dir = repo / "results" / task
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -169,6 +206,7 @@ def promote(
             data_commit=data_commit,
         ),
         promoted_at=datetime.now(UTC),
+        promotion_commit=promotion_commit,
     )
     record_path.write_text(record.model_dump_json(indent=2) + "\n")
     print(f"promoted -> {dest.relative_to(repo)}")
@@ -201,7 +239,13 @@ def main() -> None:
         "given, promotion refuses if the artifact's checksum has moved since the audit read "
         "it, which is what closes the window opened by auditing uncommitted artifacts.",
     )
-    ap.add_argument("--job-id", default=None)
+    ap.add_argument("--job-id", default=None, help="defaults to the sidecar's slurm_job_id")
+    ap.add_argument(
+        "--code-commit",
+        default=None,
+        help="the commit the RUN was made at. Read from <result>.params.json beside the result "
+        "when not given; never the commit promotion happens at.",
+    )
     ap.add_argument("--log", type=Path, default=None)
     ap.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[1])
     ns = ap.parse_args()
@@ -228,6 +272,7 @@ def main() -> None:
         repo=ns.repo,
         input_labels=input_labels,
         audit_checksums=ns.audit_checksums,
+        code_commit=ns.code_commit,
     )
 
 

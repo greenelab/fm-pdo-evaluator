@@ -32,7 +32,7 @@ sys.modules["delta_reproducibility"] = dr
 _SPEC.loader.exec_module(dr)
 
 
-def _write_fixture_pool(
+def write_fixture_pool(
     tmp: Path,
     n_lines: int = 4,
     n_drugs: int = 3,
@@ -46,6 +46,7 @@ def _write_fixture_pool(
     doses: tuple[float, ...] = (0.05,),
     plate_offset_sd: float = 0.0,
     se: float | None = None,
+    signal_sd_by_drug: tuple[float, ...] | None = None,
 ) -> Path:
     """A synthetic replicate pool in the DE table's own shape, one parquet file.
 
@@ -71,6 +72,9 @@ def _write_fixture_pool(
                       truth for this generator: each row's deviation from its condition mean is
                       drawn at sd ``noise_sd``, so a standard error of ``noise_sd`` is what a
                       correctly calibrated DESeq2 would report.
+    ``signal_sd_by_drug``  one signal sd per drug, overriding ``signal_sd``, so effect size is
+                      graded across drugs while the noise stays fixed -- the shape the
+                      effect-size control needs something to find in.
     """
     rng = np.random.default_rng(seed)
     lines = [f"L{i}" for i in range(n_lines)]
@@ -80,9 +84,12 @@ def _write_fixture_pool(
     plate_off = {p: rng.normal(0.0, plate_offset_sd, 1)[0] for p in plates}
     lfc_se = noise_sd if se is None else se
     rows = []
+    if signal_sd_by_drug is not None and len(signal_sd_by_drug) != n_drugs:
+        raise ValueError("signal_sd_by_drug needs one entry per drug")
     for li in lines:
-        for d in drugs:
-            signal = rng.normal(0.0, signal_sd, n_genes) + drug_eff[d]
+        for j, d in enumerate(drugs):
+            sd = signal_sd if signal_sd_by_drug is None else signal_sd_by_drug[j]
+            signal = rng.normal(0.0, sd, n_genes) + drug_eff[d]
             for p in plates:
                 for dose in doses:
                     lfc = signal + rng.normal(0.0, noise_sd, n_genes) + plate_off[p]
@@ -117,7 +124,7 @@ def _write_fixture_pool(
 
 
 def test_build_positive_planted_pool_comes_out_with_the_planted_shape(tmp_path: Path) -> None:
-    path = _write_fixture_pool(tmp_path)
+    path = write_fixture_pool(tmp_path)
     de, chosen = dr.build_split_half_frame(
         [str(path)], ["D0", "D1", "D2"], None, tmp_path / "duck", memory_limit="2GB"
     )
@@ -133,7 +140,7 @@ def test_build_negative_no_replication_yields_no_scoreable_pairs(tmp_path: Path)
     """Negative control for split as well as build: with one plate there is no second group,
     so no condition is scoreable. Marked for both steps because it is the evidence for both --
     `-m step_split` selecting nothing is a step whose controls cannot be run on demand."""
-    path = _write_fixture_pool(tmp_path, plates=("P1",))  # one plate: one half stays empty
+    path = write_fixture_pool(tmp_path, plates=("P1",))  # one plate: one half stays empty
     de, _ = dr.build_split_half_frame(
         [str(path)], ["D0", "D1", "D2"], None, tmp_path / "duck", memory_limit="2GB"
     )
@@ -146,7 +153,7 @@ def test_build_edge_unmatched_target_drugs_return_an_empty_frame(tmp_path: Path)
     mechanism in the real loader: `build_split_half_frame`'s WHERE clause filters on
     `target_names`, so both reduce to requesting drugs the pool does not contain. Read off the
     real function rather than assumed: it returns an empty DataFrame, not an error."""
-    path = _write_fixture_pool(tmp_path)  # the fixture pool only ever has drugs D0, D1, D2
+    path = write_fixture_pool(tmp_path)  # the fixture pool only ever has drugs D0, D1, D2
     de, chosen = dr.build_split_half_frame(
         [str(path)], ["ZZZ_NOT_A_REAL_DRUG"], None, tmp_path / "duck", memory_limit="2GB"
     )
@@ -160,7 +167,7 @@ def test_build_edge_all_nan_pair_drops_out_after_the_dropna_path(tmp_path: Path)
     directly, not NULL -- so this is a distinct code path from a pair simply absent from the
     data) and is then removed by the `dropna(subset=["lfc0", "lfc1"])` every caller applies
     before scoring."""
-    path = _write_fixture_pool(tmp_path)
+    path = write_fixture_pool(tmp_path)
     df = pd.read_parquet(path)
     nan_mask = (df["Cell_ID_DepMap"] == "L0") & (df["drug"] == "D0")
     assert nan_mask.any(), "fixture must actually contain the (L0, D0) pair to NaN out"
@@ -184,7 +191,7 @@ def test_build_admits_every_drug_when_no_drug_list_is_given(tmp_path: Path) -> N
     ``target_names=None`` is what "no drug file" means at the SQL level, and it must admit the
     whole pool rather than silently matching nothing.
     """
-    path = _write_fixture_pool(tmp_path)
+    path = write_fixture_pool(tmp_path)
     de, chosen = dr.build_split_half_frame(
         [str(path)], None, None, tmp_path / "duck", memory_limit="2GB"
     )
@@ -198,7 +205,7 @@ def test_build_carries_the_first_groups_minimum_padj(tmp_path: Path) -> None:
     """The selection rule is "significant in AT LEAST ONE of the first group's rows", so the
     aggregate that decides it is the MINIMUM adjusted p-value over those rows, not their mean.
     A mean would let one strongly significant row be averaged away by its neighbours."""
-    path = _write_fixture_pool(tmp_path)
+    path = write_fixture_pool(tmp_path)
     df = pd.read_parquet(path)
     # Which plates land in the first group is the split rule -- sorted plate ids, alternating --
     # read off the assignment the build itself uses rather than re-derived here.
@@ -223,7 +230,7 @@ def test_build_leaves_untestable_genes_null(tmp_path: Path) -> None:
     """A gene DESeq2 could not test carries baseMean 0 and null in every statistic column.
     Such genes must fall out by the finiteness rule the scorer already applies -- not by a
     filter of ours, which would be a second, undeclared inclusion rule."""
-    path = _write_fixture_pool(tmp_path)
+    path = write_fixture_pool(tmp_path)
     df = pd.read_parquet(path)
     dead = df["gene_name"] == "G7"
     df.loc[dead, ["log2FoldChange", "lfcSE", "padj"]] = np.nan
@@ -265,7 +272,7 @@ def test_split_alternates_over_sorted_plates_so_every_replicated_triple_splits(
     two-plate triple sat on one side whenever its two ids hashed to the same parity, and the
     design's claim that most triples split one plate against one was never counted.
     """
-    path = _write_fixture_pool(tmp_path, n_lines=1, n_drugs=1, n_genes=20, plates=("P2", "P1"))
+    path = write_fixture_pool(tmp_path, n_lines=1, n_drugs=1, n_genes=20, plates=("P2", "P1"))
     df = pd.read_parquet(path)
     two = df.copy()
     three = df.copy()
@@ -305,7 +312,7 @@ def test_split_alternates_over_sorted_plates_so_every_replicated_triple_splits(
 def test_partitioned_frame_equals_one_pass(tmp_path: Path) -> None:
     """Slicing the genes must be arithmetic for the frame as it is for the noise sums: the same
     rows, in the same values, whether built in one pass or in five."""
-    path = _write_fixture_pool(tmp_path, n_genes=200, doses=(0.01, 0.1), seed=23)
+    path = write_fixture_pool(tmp_path, n_genes=200, doses=(0.01, 0.1), seed=23)
     one, _ = dr.build_split_half_frame([str(path)], None, None, tmp_path / "d1", "2GB")
     five, _ = dr.build_split_half_frame([str(path)], None, None, tmp_path / "d5", "2GB", n_parts=5)
     keys = list(dr.KEY_COLUMNS)
@@ -341,7 +348,7 @@ def _scored(path: Path, tmp: Path, min_genes: int = 50):
 def test_selection_recovers_the_planted_responder_set(tmp_path: Path) -> None:
     """Positive control for select: responders planted in a known gene subset, with padj
     planted to match, come back as exactly that subset -- read from the first group alone."""
-    path = _write_fixture_pool(tmp_path, n_genes=300, n_responders=80)
+    path = write_fixture_pool(tmp_path, n_genes=300, n_responders=80)
     _, _, piv0, _, mask = _scored(path, tmp_path)
     responders = {f"G{k}" for k in range(80)}
     for row in range(mask.shape[0]):
@@ -358,7 +365,7 @@ def test_responder_reliability_exceeds_all_gene_reliability_on_a_planted_pool(
     true by construction."""
     # Responders get a real per-condition signal; non-responders get none (signal_sd applies to
     # all genes, so plant the difference through padj AND through the signal by zeroing it).
-    path = _write_fixture_pool(tmp_path, n_genes=300, n_responders=80, seed=3)
+    path = write_fixture_pool(tmp_path, n_genes=300, n_responders=80, seed=3)
     df = pd.read_parquet(path)
     non = df["gene_name"].isin([f"G{k}" for k in range(80, 300)])
     rng = np.random.default_rng(11)
@@ -393,7 +400,7 @@ def test_selection_admits_no_more_than_the_nominal_rate_on_signal_free_data(
     the responder statistic is diluted toward the all-gene one rather than inflated away from
     it. Pinned here so the day someone changes the aggregate, the rate moves and this fails.
     """
-    path = _write_fixture_pool(
+    path = write_fixture_pool(
         tmp_path, n_genes=2000, signal_sd=0.0, noise_sd=1.0, n_responders=None, seed=5
     )
     n_first_group_rows = len(_first_group_plates(path, tmp_path))  # one dose in this fixture
@@ -425,7 +432,7 @@ def test_pooled_selection_inflates_a_signal_free_correlation(tmp_path: Path) -> 
     truncating ``|a|`` and ``|b|`` independently leaves their signs independent. The distinction
     matters, so the test states which variant it is demonstrating.
     """
-    path = _write_fixture_pool(
+    path = write_fixture_pool(
         tmp_path, n_genes=2000, signal_sd=0.0, noise_sd=1.0, n_responders=None, seed=7
     )
     de, _ = dr.build_split_half_frame([str(path)], None, None, tmp_path / "duck", "2GB")
@@ -457,7 +464,7 @@ def test_pooled_selection_inflates_a_signal_free_correlation(tmp_path: Path) -> 
 def test_select_none_reproduces_the_unselected_scorer_exactly(tmp_path: Path) -> None:
     """The selection keyword must be inert when absent -- otherwise the all-gene reliability
     silently changes meaning the day the responder statistic arrives."""
-    path = _write_fixture_pool(tmp_path)
+    path = write_fixture_pool(tmp_path)
     de, _ = dr.build_split_half_frame([str(path)], None, None, tmp_path / "duck", "2GB")
     de = de.dropna(subset=["lfc0", "lfc1"])
     panel = set(de["gene_name"].unique())
@@ -483,7 +490,7 @@ def test_decompose_recovers_a_planted_plate_variance(tmp_path: Path) -> None:
     the mean squared standard error must return the planted plate variance.
     """
     plate_sd, noise_sd = 0.6, 0.4
-    path = _write_fixture_pool(
+    path = write_fixture_pool(
         tmp_path,
         n_genes=400,
         signal_sd=0.0,
@@ -526,7 +533,7 @@ def test_decompose_pooled_estimate_is_zero_at_two_plates_with_no_plate_effect(
     signed per-gene column must show the spread that pooling averages out.
     """
     noise_sd = 0.5
-    path = _write_fixture_pool(
+    path = write_fixture_pool(
         tmp_path,
         n_lines=6,
         n_drugs=4,
@@ -561,7 +568,7 @@ def test_decompose_pooled_estimate_recovers_a_planted_plate_effect_at_two_plates
     """Positive control at two plates: the pooled estimator must recover a planted component
     from one-degree-of-freedom per-gene estimates, because expectation is linear."""
     plate_sd, noise_sd = 0.5, 0.5
-    path = _write_fixture_pool(
+    path = write_fixture_pool(
         tmp_path,
         n_lines=8,
         n_drugs=4,
@@ -590,7 +597,7 @@ def test_noise_partials_pool_the_responder_sums_too(tmp_path: Path) -> None:
     """The responder share needs the responders' squared standard errors summed as well as
     their variances; the earlier partials carried only the variances, so the responder share
     could not be corrected without a rescan."""
-    path = _write_fixture_pool(
+    path = write_fixture_pool(
         tmp_path, n_genes=200, n_responders=60, plates=("P1", "P2"), plate_offset_sd=0.4, seed=31
     )
     d = _decomposed(path, tmp_path)
@@ -616,7 +623,7 @@ def test_decompose_does_not_charge_a_dose_effect_to_plate_noise(tmp_path: Path) 
     """Dose is a grouping key, not pooled. If the decomposition pooled over dose, a screen
     where each dose has a different mean response would report that dose effect as plate
     noise -- and the design's claim about what the ceiling is made of would be wrong."""
-    path = _write_fixture_pool(
+    path = write_fixture_pool(
         tmp_path,
         n_genes=400,
         signal_sd=0.0,
@@ -645,7 +652,7 @@ def test_decompose_does_not_charge_a_dose_effect_to_plate_noise(tmp_path: Path) 
 def test_score_positive_planted_reliability_is_recovered(tmp_path: Path) -> None:
     # signal_sd = noise_sd = 1, 8 plates -> 4 per half; half-mean noise sd^2 = 1/4.
     # Expected r = 1 / (1 + 0.25) = 0.8.
-    path = _write_fixture_pool(tmp_path, n_genes=600, signal_sd=1.0, noise_sd=1.0)
+    path = write_fixture_pool(tmp_path, n_genes=600, signal_sd=1.0, noise_sd=1.0)
     de, _ = dr.build_split_half_frame(
         [str(path)], ["D0", "D1", "D2"], None, tmp_path / "duck", memory_limit="2GB"
     )
@@ -656,7 +663,7 @@ def test_score_positive_planted_reliability_is_recovered(tmp_path: Path) -> None
 
 
 def test_score_negative_zero_signal_returns_null(tmp_path: Path) -> None:
-    path = _write_fixture_pool(tmp_path, signal_sd=0.0, noise_sd=1.0)
+    path = write_fixture_pool(tmp_path, signal_sd=0.0, noise_sd=1.0)
     de, _ = dr.build_split_half_frame(
         [str(path)], ["D0", "D1", "D2"], None, tmp_path / "duck", memory_limit="2GB"
     )
@@ -676,7 +683,7 @@ def test_restrict_positive_panel_subset_scores_exactly_the_subset(tmp_path: Path
     Exercises the real restrict step: `score_split_half`'s `panel` argument is exactly what
     a `--panel-file` resolves to in `main()`, so a fixture set here stands in for one.
     """
-    path = _write_fixture_pool(tmp_path)  # default: 300 genes, G0..G299
+    path = write_fixture_pool(tmp_path)  # default: 300 genes, G0..G299
     de, _ = dr.build_split_half_frame(
         [str(path)], ["D0", "D1", "D2"], None, tmp_path / "duck", memory_limit="2GB"
     )
@@ -695,7 +702,7 @@ def test_restrict_negative_disjoint_panel_scores_nothing(tmp_path: Path) -> None
     result -- so this asserts that honestly; `main()` is what turns an empty result into a
     `SystemExit` (the "aborts the run" behavior design.md's restrict control describes).
     """
-    path = _write_fixture_pool(tmp_path)
+    path = write_fixture_pool(tmp_path)
     de, _ = dr.build_split_half_frame(
         [str(path)], ["D0", "D1", "D2"], None, tmp_path / "duck", memory_limit="2GB"
     )
@@ -709,7 +716,7 @@ def test_restrict_negative_disjoint_panel_scores_nothing(tmp_path: Path) -> None
 def test_null_positive_planted_components_recover_the_stratum_ordering(tmp_path: Path) -> None:
     # Drug-shared + line-specific components: matched pairs share both, same-drug
     # mismatches share only the drug component, diff-drug mismatches share nothing.
-    path = _write_fixture_pool(
+    path = write_fixture_pool(
         tmp_path, n_lines=6, n_drugs=4, signal_sd=0.7, drug_sd=0.7, noise_sd=0.7
     )
     de, _ = dr.build_split_half_frame(
@@ -770,7 +777,7 @@ def test_same_drug_null_pairs_only_conditions_at_the_same_dose(tmp_path: Path) -
 
 
 def test_null_negative_signal_free_strata_sit_at_their_floors(tmp_path: Path) -> None:
-    path = _write_fixture_pool(tmp_path, signal_sd=0.0, drug_sd=0.0, noise_sd=1.0)
+    path = write_fixture_pool(tmp_path, signal_sd=0.0, drug_sd=0.0, noise_sd=1.0)
     de, _ = dr.build_split_half_frame(
         [str(path)], ["D0", "D1", "D2"], None, tmp_path / "duck", memory_limit="2GB"
     )
@@ -926,7 +933,7 @@ def test_per_pair_table_rows_are_keyed_to_their_own_scores(tmp_path: Path) -> No
 def test_null_draw_table_carries_the_draws_its_means_summarize(tmp_path: Path) -> None:
     # The exported floor distributions must BE the draws the summary's floor means average:
     # per-stratum counts and means recomputed from the table must match the dict it came from.
-    path = _write_fixture_pool(tmp_path, n_lines=6, n_drugs=4, signal_sd=0.7, drug_sd=0.7)
+    path = write_fixture_pool(tmp_path, n_lines=6, n_drugs=4, signal_sd=0.7, drug_sd=0.7)
     de, _ = dr.build_split_half_frame(
         [str(path)], ["D0", "D1", "D2", "D3"], None, tmp_path / "duck", memory_limit="2GB"
     )
@@ -952,7 +959,7 @@ def test_null_draw_table_carries_the_draws_its_means_summarize(tmp_path: Path) -
 def test_example_profiles_reproduce_their_own_correlations(tmp_path: Path) -> None:
     # The scatter data must be the scatter the reported r came from: recomputing Pearson
     # from each example's exported two columns must return that example's index r.
-    path = _write_fixture_pool(tmp_path, n_lines=6, n_drugs=4, signal_sd=0.7, drug_sd=0.7)
+    path = write_fixture_pool(tmp_path, n_lines=6, n_drugs=4, signal_sd=0.7, drug_sd=0.7)
     de, _ = dr.build_split_half_frame(
         [str(path)], ["D0", "D1", "D2", "D3"], None, tmp_path / "duck", memory_limit="2GB"
     )
@@ -1004,7 +1011,7 @@ def test_frame_cache_returns_the_built_frame_and_never_the_wrong_one(tmp_path: P
     # resolve to the same cache entry -- that would silently score the wrong pool.
     import argparse
 
-    path = _write_fixture_pool(tmp_path)
+    path = write_fixture_pool(tmp_path)
     paths, names = [str(path)], ["D0", "D1", "D2"]
     args = argparse.Namespace(
         replicate_col=None,
@@ -1087,7 +1094,7 @@ def test_spearman_brown_round_trips_a_planted_full_data_reliability(
     """
     n_plates = 16
     noise_sd = float(np.sqrt(n_plates * (1.0 - full_reliability) / full_reliability))
-    path = _write_fixture_pool(
+    path = write_fixture_pool(
         tmp_path,
         n_genes=1500,
         signal_sd=1.0,
@@ -1113,7 +1120,7 @@ def test_zero_signal_returns_null_and_the_correction_leaves_zero_at_zero(tmp_pat
     """Negative control for score. A correction that manufactured a ceiling out of nothing
     would be worse than no correction at all, so the identity 2*0/(1+0) = 0 is asserted on the
     real function and on a real signal-free pool."""
-    path = _write_fixture_pool(tmp_path, n_genes=600, signal_sd=0.0, noise_sd=1.0, seed=29)
+    path = write_fixture_pool(tmp_path, n_genes=600, signal_sd=0.0, noise_sd=1.0, seed=29)
     r_all, _, _, _, _ = _scored(path, tmp_path)
     mean = float(np.nanmean(r_all))
     assert abs(mean) < 0.05, f"signal-free pool read {mean:.3f}"
@@ -1258,7 +1265,7 @@ def test_main_writes_every_declared_artifact_on_a_synthetic_pool(
     the design declares. A missing table or figure fails by name here, in seconds, rather than
     at the end of a forty-minute cluster job.
     """
-    path = _write_fixture_pool(
+    path = write_fixture_pool(
         tmp_path,
         n_lines=6,
         n_drugs=4,
@@ -1356,7 +1363,7 @@ def test_responder_mask_cannot_read_the_second_group(tmp_path: Path) -> None:
     complement, leaving the first group's untouched, and require the mask to be identical. If
     selection ever reads the second group, this fails.
     """
-    path = _write_fixture_pool(tmp_path, n_genes=300, n_responders=90, seed=53)
+    path = write_fixture_pool(tmp_path, n_genes=300, n_responders=90, seed=53)
     de, _ = dr.build_split_half_frame([str(path)], None, None, tmp_path / "duck", "2GB")
     de = de.dropna(subset=["lfc0", "lfc1"])
     panel = set(de["gene_name"].unique())
@@ -1389,9 +1396,7 @@ def test_dense_pivots_match_pivot_table_exactly(tmp_path: Path) -> None:
     more memory than the matrices it produces -- and a faster path that quietly reorders rows or
     columns would misalign every correlation without changing a single shape.
     """
-    path = _write_fixture_pool(
-        tmp_path, n_lines=5, n_drugs=3, n_genes=120, n_responders=40, seed=61
-    )
+    path = write_fixture_pool(tmp_path, n_lines=5, n_drugs=3, n_genes=120, n_responders=40, seed=61)
     de, _ = dr.build_split_half_frame([str(path)], None, None, tmp_path / "duck", "2GB")
     de = de.dropna(subset=["lfc0", "lfc1"])
     panel = set(de["gene_name"].unique())
@@ -1421,7 +1426,7 @@ def test_the_staged_run_produces_the_same_artifacts_as_one_process(
     finding what the previous one wrote, or a slice missing from the combine -- so the combine
     is also required to refuse when a slice is absent.
     """
-    path = _write_fixture_pool(
+    path = write_fixture_pool(
         tmp_path,
         n_lines=5,
         n_drugs=3,
@@ -1491,7 +1496,7 @@ def test_partitioned_noise_equals_one_pass(tmp_path: Path) -> None:
     and no omission, and sums add. If that reasoning were wrong the numbers would still look
     plausible, which is why this compares them exactly rather than approximately.
     """
-    path = _write_fixture_pool(
+    path = write_fixture_pool(
         tmp_path,
         n_lines=4,
         n_drugs=3,

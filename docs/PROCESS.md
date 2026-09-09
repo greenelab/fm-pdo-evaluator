@@ -207,7 +207,7 @@ The rules these serve are in [`docs/SPEC.md`](SPEC.md); this is what they requir
 - A change to what the project asks, how work is done, or where a rung stands = `README.md` updated in the same change.
   The README is the only document most readers open, so it is the one that goes stale first and the one that misleads most when it does. Update the summary, not just the document it summarises.
 - A number change = `docs/STATE.md` updated in the same change that produced it, and that entry carries its three links: **spec** (the task's `design.md`), **code** (the commits or files that changed), **outputs** (the promoted artifacts + their provenance record).
-  A status claim with no link to the spec that motivated it, the code that produced it, and the artifact it came from is a claim a future session has to re-derive from git log. 
+  A status claim with no link to the spec that motivated it, the code that produced it, and the artifact it came from is a claim a future session has to re-derive from git log.
 - **Landed documents reference only landed work.**
   A rung above the current one is referenced in the sense of `docs/SPEC.md` — what the ladder will ask — never through unlanded code or documents a reviewer of this repository cannot open.
   Work from the archived development lineage is cited only by its archive branch or archive file, labeled as archive.

@@ -232,3 +232,6 @@ containers/*.sif      # built Apptainer images
 # Untracked run outputs ralpine update moved aside on Alpine so a fast-forward could land
 # a commit that adds the same paths. Never committed; the committed copies are the record.
 _moved_aside/
+
+# macOS folder metadata, never source
+.DS_Store

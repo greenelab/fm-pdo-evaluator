@@ -28,12 +28,12 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-# `_write_fixture_pool` lives in tests/test_rung0_controls.py; the leading underscore marks it
+# `write_fixture_pool` lives in tests/test_rung0_controls.py; the leading underscore marks it
 # as private to that module, not a boundary this sibling test file needs to respect -- both
 # test the same rung 0 task, and re-declaring the fixture builder here would be the duplication
 # PROCESS §3 tells tests not to reintroduce. The suppression covers importing a sibling test
 # module's private helper for exactly that reason.
-from tests.test_rung0_controls import _write_fixture_pool  # pyright: ignore[reportPrivateUsage]
+from tests.test_rung0_controls import write_fixture_pool  # pyright: ignore[reportPrivateUsage]
 
 pytestmark = pytest.mark.known_answer
 
@@ -64,7 +64,7 @@ def test_planted_signal_pool_clears_the_permutation_null(tmp_path: Path) -> None
     # Mismatching the pairing via a permutation destroys that pair-specific signal entirely
     # (drug_sd = 0.0, the default -- no drug-shared component survives a mismatch either), so
     # the permutation null should sit near zero while the observed mean sits near 0.8.
-    path = _write_fixture_pool(tmp_path, signal_sd=1.0, noise_sd=1.0)
+    path = write_fixture_pool(tmp_path, signal_sd=1.0, noise_sd=1.0)
     de, _ = dn.dr.build_split_half_frame(
         [str(path)], ["D0", "D1", "D2"], None, tmp_path / "duck", memory_limit="2GB"
     )
@@ -85,7 +85,7 @@ def test_zero_signal_pool_is_not_significant(tmp_path: Path) -> None:
     # generative process, so the permutation null and the observed mean should sit at the
     # same (near-zero) place. Deterministic under the pinned seed; if this ever flips the
     # failure message below records the actual p rather than a bare assertion.
-    path = _write_fixture_pool(tmp_path, signal_sd=0.0, noise_sd=1.0)
+    path = write_fixture_pool(tmp_path, signal_sd=0.0, noise_sd=1.0)
     de, _ = dn.dr.build_split_half_frame(
         [str(path)], ["D0", "D1", "D2"], None, tmp_path / "duck", memory_limit="2GB"
     )
@@ -129,7 +129,7 @@ def test_design_effect_sits_in_a_sane_band_on_near_independent_rows(tmp_path: Pa
     factor -- the failure mode the write-up caveat in verification.md was worried about --
     while tolerating ordinary Monte Carlo noise at this sample size.
     """
-    path = _write_fixture_pool(tmp_path, signal_sd=0.0, noise_sd=1.0)
+    path = write_fixture_pool(tmp_path, signal_sd=0.0, noise_sd=1.0)
     de, _ = dn.dr.build_split_half_frame(
         [str(path)], ["D0", "D1", "D2"], None, tmp_path / "duck", memory_limit="2GB"
     )
@@ -198,7 +198,7 @@ def test_stratified_null_drug_effects_survive_within_drug_die_across_drugs(
     component (same drug, different line), while a cross permutation's mismatched pairs share
     nothing (different drug AND different line). The within-drug permutation-null MEAN must
     therefore sit above the cross permutation-null MEAN."""
-    path = _write_fixture_pool(
+    path = write_fixture_pool(
         tmp_path, n_lines=6, n_drugs=4, signal_sd=0.7, drug_sd=0.7, noise_sd=0.7
     )
     de, _ = dn.dr.build_split_half_frame(
@@ -217,7 +217,7 @@ def test_stratified_zero_signal_pool_is_not_significant(tmp_path: Path) -> None:
     """Zero-signal negative control for both stratified nulls, and the same design-effect
     sanity band as `test_design_effect_sits_in_a_sane_band_on_near_independent_rows`, applied
     to each stratum."""
-    path = _write_fixture_pool(tmp_path, signal_sd=0.0, noise_sd=1.0)
+    path = write_fixture_pool(tmp_path, signal_sd=0.0, noise_sd=1.0)
     de, _ = dn.dr.build_split_half_frame(
         [str(path)], ["D0", "D1", "D2"], None, tmp_path / "duck", memory_limit="2GB"
     )
@@ -241,7 +241,7 @@ def test_stratified_zero_signal_pool_is_not_significant(tmp_path: Path) -> None:
 def test_stratified_planted_signal_clears_both_nulls(tmp_path: Path) -> None:
     """Planted-signal positive control for both stratified nulls, at n_perm=99 -- the same
     fixture as `test_planted_signal_pool_clears_the_permutation_null`."""
-    path = _write_fixture_pool(tmp_path, signal_sd=1.0, noise_sd=1.0)
+    path = write_fixture_pool(tmp_path, signal_sd=1.0, noise_sd=1.0)
     de, _ = dn.dr.build_split_half_frame(
         [str(path)], ["D0", "D1", "D2"], None, tmp_path / "duck", memory_limit="2GB"
     )
@@ -265,7 +265,7 @@ def test_stratified_summary_reports_transfer_scope_and_diff_drug_observed_mean(
     is excluded and the two counts coincide. `observed_mean_diff_drug_rows` is recorded per
     stratum purely so the summary is self-describing -- by construction (the diff-drug stratum
     excludes no rows) it equals the global observed mean exactly."""
-    path = _write_fixture_pool(tmp_path, signal_sd=1.0, noise_sd=1.0)
+    path = write_fixture_pool(tmp_path, signal_sd=1.0, noise_sd=1.0)
     de, _ = dn.dr.build_split_half_frame(
         [str(path)], ["D0", "D1", "D2"], None, tmp_path / "duck", memory_limit="2GB"
     )
@@ -287,7 +287,7 @@ def test_stratified_design_effect_is_nan_when_the_matching_pool_is_too_small(
     fragile ratio built on too few draws. n_perm=5 caps both the permutation draws AND
     `stratified_null_draws`' pool size at <=5 for every stratum, regardless of how many
     candidate mismatched pairs the fixture actually has."""
-    path = _write_fixture_pool(tmp_path, signal_sd=0.0, noise_sd=1.0)
+    path = write_fixture_pool(tmp_path, signal_sd=0.0, noise_sd=1.0)
     de, _ = dn.dr.build_split_half_frame(
         [str(path)], ["D0", "D1", "D2"], None, tmp_path / "duck", memory_limit="2GB"
     )

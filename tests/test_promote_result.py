@@ -63,9 +63,38 @@ def _promote(repo: Path, **kw: object) -> Path:
         job_id="123",
         log=None,
         repo=repo,
+        code_commit="a" * 40,
     )
     defaults.update(kw)
     return pr.promote(**defaults)
+
+
+def _head(repo: Path) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+
+def test_promotion_records_the_run_commit_from_the_sidecar_not_head(repo: Path) -> None:
+    """The producing commit is the one the RUN was made at. The pooled-dose promotion of
+    2026-09-02 recorded HEAD at promotion time -- a commit whose code held dose fixed -- so a
+    reader checking out the recorded commit could not reproduce the promoted number."""
+    import json
+
+    run_sha = "b" * 40
+    (repo / "result.params.json").write_text(
+        json.dumps({"result": "result.csv", "git_sha": run_sha, "slurm_job_id": "999"}) + "\n"
+    )
+    record_path = _promote(repo, code_commit=None, job_id=None)
+    record = PromotedResult.model_validate_json(record_path.read_text())
+    assert record.environment.code_commit == run_sha, "the sidecar's commit, not HEAD"
+    assert record.promotion_commit == _head(repo), "and the promotion commit, separately"
+    assert record.job_id == "999", "the job id defaults from the sidecar too"
+
+
+def test_promotion_refuses_when_no_producing_commit_is_known(repo: Path) -> None:
+    with pytest.raises(SystemExit, match="not known"):
+        _promote(repo, code_commit=None)
 
 
 def test_promotion_writes_a_schema_valid_record_beside_the_result(repo: Path) -> None:

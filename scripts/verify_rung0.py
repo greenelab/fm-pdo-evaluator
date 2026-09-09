@@ -39,10 +39,10 @@ What is NOT checkable locally, stated rather than hidden:
   reporting on the calendar rather than on the evidence.
 * The permutation check is a separate cluster job. When its outputs are absent those
   checks are SKIPPED the same way.
-* Per-gene noise rows number in the millions on the real screen, so the between-plate
-  fraction is accumulated in a streaming pass and the variance identity is checked on a
-  bounded prefix of the rows rather than on all of them. The mean is exact; the identity
-  is a sample, and says so.
+* The committed per-gene noise table is a bounded sample (two million rows of 175 million).
+  No promoted number is read from it: the pooled between-plate share is recomputed from the
+  per-condition sums the run committed for every condition, and the sample serves the
+  row-wise identity check, the strata table, and the figures.
 """
 
 from __future__ import annotations
@@ -77,6 +77,7 @@ FIGURES: tuple[str, ...] = (
     "07_terciles.png",
     "08_power.png",
     "09_per_gene_reliability.png",
+    "10_dose.png",
 )
 
 #: The table each figure is drawn from. A figure whose source table was never written is a
@@ -91,6 +92,21 @@ PER_PAIR = "rung0_per_pair_r.csv"
 NULL_DRAWS = "rung0_null_draws.csv"
 NOISE = "rung0_noise_decomposition.csv"
 NOISE_PER_GENE = "rung0_noise_per_gene.csv.gz"
+NOISE_BY_CONDITION = "rung0_noise_by_condition.csv"
+NOISE_STRATA = "rung0_noise_strata.csv"
+CONTROL_NOISE = "rung0_control_noise.csv.gz"
+SPLIT = "rung0_split_assignment.csv"
+DOSE_STRATA = "rung0_dose_strata.csv"
+PARAMS = "rung0_reliability.params.json"
+
+#: The full condition key. A merge on fewer columns than these matches every dose of a
+#: (line, drug) pair against every other, which is how the dose-pooled run's checks passed
+#: on a dose-fixed table.
+KEYS = ("patient", "drug", "dose")
+
+#: What the decompose control pool plants: a plate variance equal to the sampling variance,
+#: at two plates, so the pooled share must come back at one half.
+PLANTED_CONTROL_SHARE = 0.5
 PROFILES = "rung0_example_pair_profiles.csv.gz"
 PROFILE_INDEX = "rung0_example_pair_index.csv"
 TERCILES = "rung0_effect_terciles.csv"
@@ -98,12 +114,6 @@ LEAKAGE = "rung0_leakage_control.csv"
 POOL = "rung0_pool_description.csv"
 CHECKSUMS = "audit_checksums.json"
 SCORE_VALUES = "figures/04_score.values.csv.gz"
-
-#: How many rows of the per-gene noise table the variance identity is checked on. The
-#: table has one row per (line, drug, dose, gene) and runs to millions on the real screen;
-#: the identity is algebraic and holds row-wise or not at all, so a bounded prefix settles
-#: it while keeping the battery to about a minute on a laptop.
-IDENTITY_SAMPLE = 200_000
 
 
 @dataclass
@@ -412,24 +422,60 @@ def check_significance(task_dir: Path) -> list[Check]:
 
 
 def check_effect_size_terciles(task_dir: Path) -> list[Check]:
-    """The design's empirical in-run control: reproducibility rises with effect size.
+    """The design's empirical in-run control: reproducibility rises with effect size, cross-fit.
 
-    Conditions are cut into thirds by response size and the split-half mean must rise
-    across the thirds. An assay that cannot find more reproducibility where there is more
-    signal is broken, so a failure here is a finding about the screen -- not a bug in this
-    battery.
+    Conditions are cut into thirds by ONE half's response size and the correlation of the pair
+    is averaged within each third; then the halves swap roles. Both rankings are recomputed here
+    from the committed per-condition table, which carries each half's magnitude, and both must
+    rise. Ranking by one half is what makes this a control: under no signal the other half is
+    independent of the ranking and every tercile sits at zero, whereas ranking by the sum of the
+    halves selects conditions whose halves happened to agree and pure noise rises.
     """
-    terciles = read_table(task_dir / TERCILES).sort_values("tercile")
-    means = terciles["mean_r"].to_numpy(dtype=float)
-    rises = bool(means.size == 3 and np.all(np.diff(means) > 0))
-    return [
-        Check(
-            "reproducibility rises with effect size (empirical control)",
-            "tercile 1 < tercile 2 < tercile 3 of the split-half mean",
-            " -> ".join(f"{m:.4f}" for m in means) + ("" if rises else "  [does not rise]"),
-            rises,
+    terciles = read_table(task_dir / TERCILES)
+    per_pair = read_table(task_dir / PER_PAIR)
+    r = per_pair["r"].to_numpy(dtype=float)
+    checks: list[Check] = []
+    for ranked_by in ("half0", "half1"):
+        magnitude = per_pair[f"mean_abs_{ranked_by}"].to_numpy(dtype=float)
+        finite = np.isfinite(r) & np.isfinite(magnitude)
+        recomputed: list[float] = []
+        if finite.any():
+            edges = np.quantile(magnitude[finite], [1 / 3, 2 / 3])
+            for t in (1, 2, 3):
+                lo = -np.inf if t == 1 else edges[t - 2]
+                hi = np.inf if t == 3 else edges[t - 1]
+                sel = finite & (magnitude > lo) & (magnitude <= hi)
+                recomputed.append(float(np.mean(r[sel])) if sel.any() else float("nan"))
+        reported = (
+            terciles[terciles["ranked_by"].astype(str) == ranked_by]
+            .sort_values("tercile")["mean_r"]
+            .to_numpy(dtype=float)
         )
-    ]
+        agree = (
+            len(reported) == 3
+            and len(recomputed) == 3
+            and all(_close(a, b, 4) for a, b in zip(reported, recomputed, strict=True))
+        )
+        rises = len(recomputed) == 3 and bool(np.all(np.diff(recomputed) > 0))
+        checks.append(
+            Check(
+                f"terciles ranked by {ranked_by}: the means recompute from the per-condition table",
+                "reported " + " -> ".join(f"{m:.4f}" for m in reported),
+                "recomputed " + " -> ".join(f"{m:.4f}" for m in recomputed),
+                agree,
+            )
+        )
+        checks.append(
+            Check(
+                f"reproducibility rises with effect size, ranked by {ranked_by} (empirical "
+                "control)",
+                "tercile 1 < tercile 2 < tercile 3 of the split-half mean",
+                " -> ".join(f"{m:.4f}" for m in recomputed)
+                + ("" if rises else "  [does not rise]"),
+                rises,
+            )
+        )
+    return checks
 
 
 def check_leakage_control(task_dir: Path) -> list[Check]:
@@ -457,85 +503,165 @@ def check_leakage_control(task_dir: Path) -> list[Check]:
     ]
 
 
-def _stream_noise(path: Path, cap: int = IDENTITY_SAMPLE) -> tuple[int, float, int, float]:
-    """(rows, sum of finite between-plate fractions, their count, worst identity deviation).
-
-    Read in chunks: the per-gene noise table has one row per (line, drug, dose, gene) and
-    is the only artifact large enough to matter on a laptop. The fraction's mean is
-    accumulated exactly over every row; the variance identity is checked on the first
-    ``cap`` rows, which is enough for an algebraic identity that holds row-wise or not at
-    all.
-    """
-    n_rows = 0
-    total = 0.0
-    n_finite = 0
-    worst = 0.0
-    seen = 0
-    columns = ["var_lfc", "mean_se2", "sigma2_plate", "between_plate_fraction"]
-    for chunk in pd.read_csv(path, usecols=columns, chunksize=200_000):
-        n_rows += len(chunk)
-        frac = _finite(chunk["between_plate_fraction"].to_numpy(dtype=float))
-        total += float(frac.sum())
-        n_finite += int(frac.size)
-        if seen < cap:
-            take = min(cap - seen, len(chunk))
-            head = chunk.iloc[:take]
-            expected = np.maximum(
-                head["var_lfc"].to_numpy(dtype=float) - head["mean_se2"].to_numpy(dtype=float), 0.0
-            )
-            deviation = np.abs(expected - head["sigma2_plate"].to_numpy(dtype=float))
-            worst = max(worst, float(np.nanmax(deviation)) if deviation.size else 0.0)
-            seen += take
-    return n_rows, total, n_finite, worst
+def _pooled_share(var_mean: np.ndarray, se2_mean: np.ndarray, n: np.ndarray) -> float:
+    """The between-plate share pooled over conditions from their per-condition means and counts:
+    max(sum(n var) / sum(n) - sum(n se2) / sum(n), 0) / (sum(n var) / sum(n))."""
+    keep = np.isfinite(var_mean) & np.isfinite(se2_mean) & (n > 0)
+    if not keep.any():
+        return float("nan")
+    total = float(np.sum(n[keep]))
+    var = float(np.sum(n[keep] * var_mean[keep]) / total)
+    se2 = float(np.sum(n[keep] * se2_mean[keep]) / total)
+    return max(var - se2, 0.0) / var if var > 0 else float("nan")
 
 
 def check_noise_decomposition(task_dir: Path) -> list[Check]:
-    """What kind of noise the ceiling is made of, recomputed from the per-gene rows.
+    """What kind of noise the ceiling is made of, recomputed from the per-condition sums.
 
     ``lfcSE`` is the standard error of one plate's treated-versus-control contrast and sees
     cell-sampling error only. Across plates at a fixed dose the fold change varies by that
-    plus a plate component, so ``sigma2_plate = var_lfc - mean(lfcSE^2)`` floored at zero
-    estimates the plate component alone. Both the reported between-plate fraction and that
-    identity are re-derived here; the identity is what makes the fraction a decomposition
-    rather than a ratio of two stored numbers.
+    plus a plate component. The estimator is POOLED: the mean over gene-conditions of the
+    variance across plates, minus the mean squared standard error, floored at zero once --
+    never per gene, where at two plates the floor alone would report a share of 0.15 with no
+    plate effect at all. The run commits every condition's counts and means, so the pooled
+    share for all genes, for the responders, and the mean over conditions of each condition's
+    own share all recompute here exactly. The per-gene sample serves the row-wise identity, the
+    strata table, and a control pool with a planted share of one half.
     """
-    # A stage that did not run skips; it does not crash. The noise decomposition is the last
-    # phase of the job and the one that has failed most, so a battery that raises on its absence
-    # is unusable exactly when it is most needed -- reviewing a partial run.
-    if not (task_dir / NOISE).exists() or not (task_dir / NOISE_PER_GENE).exists():
-        # One skip per check the full path runs, under the SAME names. A battery whose shape
-        # changes with which stages completed cannot have its coverage asserted -- the count
-        # test and the layer test both read the names, and a partial run would silently look
-        # like a battery missing a check rather than a stage that has not happened.
-        why = f"{NOISE} / {NOISE_PER_GENE} not written yet"
-        return [
-            skipped("noise: the per-gene table has the row count the summary reports", why),
-            skipped("noise: between-plate fraction is the mean of the per-gene fractions", why),
-            skipped("noise: sigma2_plate = max(var_lfc - mean_se2, 0) row by row", why),
-        ]
+    names = (
+        "noise: n_gene_conditions is the sum of the per-condition gene counts",
+        "noise: the pooled between-plate share recomputes from the per-condition sums",
+        "noise: the responders' pooled share recomputes from the responders' sums",
+        "noise: the over-conditions share is the mean of the per-condition pooled shares",
+        "noise: sigma2_plate_signed = var_lfc - mean_se2 on every committed sample row",
+        "noise: each stratum's pooled share recomputes from the committed sample",
+        "noise: the control pool's pooled share recovers the planted one half",
+    )
+    required = (NOISE, NOISE_BY_CONDITION, NOISE_PER_GENE, NOISE_STRATA)
+    if not all((task_dir / f).exists() for f in required):
+        why = "the noise tables were not written yet"
+        return [skipped(name, why) for name in names]
     reported = read_table(task_dir / NOISE).iloc[0]
-    n_rows, total, n_finite, worst = _stream_noise(task_dir / NOISE_PER_GENE)
-    mean = total / n_finite if n_finite else float("nan")
-    return [
+    by_cond = read_table(task_dir / NOISE_BY_CONDITION)
+    n = by_cond["n_gene_doses"].to_numpy(dtype=float)
+    share = _pooled_share(
+        by_cond["var_lfc_mean"].to_numpy(dtype=float),
+        by_cond["mean_se2_mean"].to_numpy(dtype=float),
+        n,
+    )
+    share_resp = _pooled_share(
+        by_cond["var_lfc_mean_responders"].to_numpy(dtype=float),
+        by_cond["mean_se2_mean_responders"].to_numpy(dtype=float),
+        by_cond["n_responder_gene_doses"].to_numpy(dtype=float),
+    )
+    per_cond = by_cond["between_plate_fraction_pooled"].to_numpy(dtype=float)
+    per_cond = per_cond[np.isfinite(per_cond)]
+    over_conditions = float(np.mean(per_cond)) if per_cond.size else float("nan")
+
+    sample = pd.read_csv(
+        task_dir / NOISE_PER_GENE,
+        usecols=["var_lfc", "mean_se2", "sigma2_plate_signed", "base_mean", "mean_lfc"],
+    )
+    var = sample["var_lfc"].to_numpy(dtype=float)
+    se2 = sample["mean_se2"].to_numpy(dtype=float)
+    signed = sample["sigma2_plate_signed"].to_numpy(dtype=float)
+    finite = np.isfinite(var) & np.isfinite(se2)
+    worst = float(np.max(np.abs((var - se2)[finite] - signed[finite]))) if finite.any() else 0.0
+    n_sample = int(reported["n_sample_rows"]) if "n_sample_rows" in reported else len(sample)
+
+    strata = read_table(task_dir / NOISE_STRATA)
+    ok = finite & (var > 0)
+    d = sample.loc[ok].copy()
+    d["abs_lfc"] = d["mean_lfc"].abs()
+    d["expression_quartile"] = pd.qcut(
+        d["base_mean"].rank(method="first"), 4, labels=[1, 2, 3, 4]
+    ).astype(int)
+    d["response_quartile"] = pd.qcut(
+        d["abs_lfc"].rank(method="first"), 4, labels=[1, 2, 3, 4]
+    ).astype(int)
+    grouped = d.groupby(["expression_quartile", "response_quartile"]).agg(
+        n=("var_lfc", "size"), var_mean=("var_lfc", "mean"), se2_mean=("mean_se2", "mean")
+    )
+    strata_agree = len(strata) == len(grouped) and len(strata) > 0
+    if strata_agree:
+        for _, row in strata.iterrows():
+            key = (int(row["expression_quartile"]), int(row["response_quartile"]))
+            if key not in grouped.index:
+                strata_agree = False
+                break
+            g = grouped.loc[key]
+            recomputed = max(float(g["var_mean"]) - float(g["se2_mean"]), 0.0) / float(
+                g["var_mean"]
+            )
+            if int(g["n"]) != int(row["n"]) or not _close(
+                float(row["between_plate_fraction_pooled"]), recomputed, 4
+            ):
+                strata_agree = False
+                break
+
+    checks = [
         Check(
-            "noise: the per-gene table has the row count the summary reports",
+            names[0],
             f"reported n_gene_conditions {int(reported['n_gene_conditions'])}",
-            f"{n_rows} rows in {NOISE_PER_GENE}",
-            n_rows == int(reported["n_gene_conditions"]),
+            f"sum over {len(by_cond)} conditions: {int(n.sum())}",
+            int(n.sum()) == int(reported["n_gene_conditions"]),
         ),
         Check(
-            "noise: between-plate fraction is the mean of the per-gene fractions",
-            f"reported between_plate_fraction_mean {reported['between_plate_fraction_mean']}",
-            f"mean of {n_finite} finite per-gene fractions: {mean:.6f}",
-            _close(float(reported["between_plate_fraction_mean"]), mean, 4),
+            names[1],
+            f"reported between_plate_fraction_pooled {reported['between_plate_fraction_pooled']}",
+            f"from the per-condition means and counts: {share:.6f}",
+            _close(float(reported["between_plate_fraction_pooled"]), share, 4),
         ),
         Check(
-            "noise: sigma2_plate = max(var_lfc - mean_se2, 0) row by row",
-            f"the identity holds on every one of the first {IDENTITY_SAMPLE:,} rows",
-            f"worst absolute deviation {worst:.3e}",
-            worst < 1e-9,
+            names[2],
+            "reported between_plate_fraction_pooled_responders "
+            f"{reported['between_plate_fraction_pooled_responders']}",
+            f"from the responders' means and counts: {share_resp:.6f}",
+            _close(float(reported["between_plate_fraction_pooled_responders"]), share_resp, 4),
+        ),
+        Check(
+            names[3],
+            "reported between_plate_fraction_pooled_over_conditions "
+            f"{reported['between_plate_fraction_pooled_over_conditions']}",
+            f"mean of {per_cond.size} per-condition pooled shares: {over_conditions:.6f}",
+            _close(
+                float(reported["between_plate_fraction_pooled_over_conditions"]),
+                over_conditions,
+                4,
+            ),
+        ),
+        Check(
+            names[4],
+            f"{n_sample} committed sample rows, the identity on every one",
+            f"{len(sample)} rows read; worst absolute deviation {worst:.3e}",
+            len(sample) == n_sample and worst < 1e-9,
+        ),
+        Check(
+            names[5],
+            f"{len(strata)} strata rows, each a count and a pooled share",
+            "every stratum's count and pooled share recompute"
+            if strata_agree
+            else "a stratum's count or share does not recompute",
+            strata_agree,
         ),
     ]
+    control_path = task_dir / CONTROL_NOISE
+    if control_path.exists():
+        control = pd.read_csv(control_path, usecols=["var_lfc", "mean_se2"])
+        c_var = control["var_lfc"].to_numpy(dtype=float)
+        c_se2 = control["mean_se2"].to_numpy(dtype=float)
+        c_share = _pooled_share(c_var, c_se2, np.ones(c_var.size))
+        checks.append(
+            Check(
+                names[6],
+                f"planted share {PLANTED_CONTROL_SHARE} at two plates",
+                f"pooled over {c_var.size} control rows: {c_share:.4f}",
+                abs(c_share - PLANTED_CONTROL_SHARE) < 0.03,
+            )
+        )
+    else:
+        checks.append(skipped(names[6], f"{CONTROL_NOISE} not written"))
+    return checks
 
 
 # ------------------------------------------------------------------------------------------
@@ -654,37 +780,176 @@ def check_figures(task_dir: Path) -> list[Check]:
 
 
 def check_pool_arithmetic(task_dir: Path) -> list[Check]:
-    """The scored conditions re-derived from the measured composition of the pool.
+    """The scored conditions re-derived from the split assignment and the pool description.
 
-    ``rung0_pool_description.csv`` is the screen as it arrived: one row per candidate
-    (line, drug) with its plate counts per half. A condition reaches the per-condition
-    table exactly when both halves are non-empty, so the two tables' counts must agree by
-    subtraction rather than by assertion, and the equal-halves flag must be the same flag
-    in both -- it is what the Spearman-Brown even-plate subset is defined by.
+    ``rung0_split_assignment.csv`` is the split itself: one row per (line, drug, dose, plate)
+    with the half the plate went to. ``rung0_pool_description.csv`` is its summary, one row per
+    triple. The rule is checked directly -- plates sorted by id within a triple alternate 0, 1,
+    0, 1 -- and the counts it implies must be the pool's; a triple reaches the per-condition
+    table exactly when it has two or more plates; and the equal-halves flag must be the same
+    flag in both tables on the FULL key, and must mean exactly an even plate count.
     """
     pool = read_table(task_dir / POOL)
     per_pair = read_table(task_dir / PER_PAIR)
-    unsplittable = pool[(pool["n_plates_half0"] == 0) | (pool["n_plates_half1"] == 0)]
-    merged = pool.merge(
-        per_pair[["patient", "drug", "n_plates_even"]],
-        on=["patient", "drug"],
-        suffixes=("_pool", "_pair"),
-    )
+    split = read_table(task_dir / SPLIT)
+    keys = list(KEYS)
+    replicated = pool[pool["n_plates"] >= 2]
+    merged = pool.merge(per_pair[[*keys, "n_plates_even"]], on=keys, suffixes=("_pool", "_pair"))
     agree = _bool_column(merged, "n_plates_even_pool") == _bool_column(merged, "n_plates_even_pair")
+    half0 = pool["n_plates_half0"].to_numpy(dtype=int)
+    half1 = pool["n_plates_half1"].to_numpy(dtype=int)
+    even = _bool_column(pool, "n_plates_even")
+    even_means_equal = bool(np.all(even == (half0 == half1)))
+    even_means_parity = bool(np.all(even == (pool["n_plates"].to_numpy(dtype=int) % 2 == 0)))
+
+    ordered = split.sort_values([*keys, "plate"], kind="stable").reset_index(drop=True)
+    rank = ordered.groupby(keys, sort=False).cumcount().to_numpy()
+    alternates = bool(np.all(ordered["half"].to_numpy(dtype=int) == rank % 2))
+    counts = (
+        ordered.groupby(keys)["half"]
+        .agg(
+            n_plates="size",
+            half0=lambda h: int((h == 0).sum()),
+            half1=lambda h: int((h == 1).sum()),
+        )
+        .reset_index()
+    )
+    joined = pool.merge(counts, on=keys, suffixes=("", "_split"))
+    counts_agree = (
+        len(joined) == len(pool) == len(counts)
+        and bool(
+            np.all(
+                joined["n_plates"].to_numpy(dtype=int)
+                == joined["n_plates_split"].to_numpy(dtype=int)
+            )
+        )
+        and bool(
+            np.all(
+                joined["n_plates_half0"].to_numpy(dtype=int) == joined["half0"].to_numpy(dtype=int)
+            )
+        )
+        and bool(
+            np.all(
+                joined["n_plates_half1"].to_numpy(dtype=int) == joined["half1"].to_numpy(dtype=int)
+            )
+        )
+    )
     return [
         Check(
-            "the scored conditions are the splittable ones, by subtraction",
-            f"{len(pool)} candidate conditions - {len(unsplittable)} with an empty half",
-            f"{len(pool) - len(unsplittable)} splittable; {len(per_pair)} rows in {PER_PAIR}",
-            len(pool) - len(unsplittable) == len(per_pair) and len(merged) == len(per_pair),
+            "the split alternates over sorted plate ids within every triple",
+            f"{len(split)} (triple, plate) rows: half = rank of the plate within its triple, mod 2",
+            "every row obeys the rule" if alternates else "a row breaks the rule",
+            alternates and len(split) > 0,
+        ),
+        Check(
+            "the pool's plate counts per half are the split assignment's",
+            f"{len(pool)} triples in {POOL}",
+            f"{len(counts)} triples in {SPLIT}; counts "
+            + ("agree on every one" if counts_agree else "DISAGREE"),
+            counts_agree,
+        ),
+        Check(
+            "the scored conditions are the replicated triples, on the full key",
+            f"{len(replicated)} triples with two or more plates",
+            f"{len(per_pair)} rows in {PER_PAIR}, {len(merged)} joined on (line, drug, dose)",
+            len(replicated) == len(per_pair) == len(merged),
         ),
         Check(
             "the equal-halves flag agrees between the pool and the per-condition table",
-            "n_plates_even is one flag, recorded twice",
+            "n_plates_even is one flag, recorded twice, joined on the full key",
             f"{int(agree.sum())} of {len(merged)} conditions agree",
             bool(agree.all()) and len(merged) > 0,
         ),
+        Check(
+            "the equal-halves flag means equal halves, which is an even plate count",
+            "n_plates_even == (n_plates_half0 == n_plates_half1) == (n_plates is even)",
+            f"equal halves: {even_means_equal}; even count: {even_means_parity}",
+            even_means_equal and even_means_parity,
+        ),
     ]
+
+
+def check_dose_strata(task_dir: Path) -> list[Check]:
+    """Every candidate ceiling in the dose-strata table recomputes from the per-triple table.
+
+    Holding dose fixed made the scoreable unit a triple, and the screen did not replicate its
+    doses evenly, so what the summary row's mean weights is a declared choice. The strata
+    table carries every candidate -- each dose level alone, all triples equally, each
+    (line, drug) pair once -- so the choice is read off committed numbers; here each row is
+    re-derived, and the summary row's mean is required to be the all-triples row.
+    """
+    strata = read_table(task_dir / DOSE_STRATA)
+    per_pair = read_table(task_dir / PER_PAIR)
+    row = summary_row(task_dir)
+    doses = per_pair["dose"].astype(str).to_numpy()
+    checks: list[Check] = []
+    for label, column in GENE_SETS:
+        r = per_pair[column].to_numpy(dtype=float)
+        finite = np.isfinite(r)
+        subset = strata[strata["gene_set"].astype(str) == label]
+        bad: list[str] = []
+        for _, s in subset.iterrows():
+            dose, weighting = str(s["dose"]), str(s["weighting"])
+            if weighting == "per_line_drug":
+                vals = (
+                    pd.DataFrame({"p": per_pair["patient"], "d": per_pair["drug"], "r": r})
+                    .loc[finite]
+                    .groupby(["p", "d"])["r"]
+                    .mean()
+                    .to_numpy(dtype=float)
+                )
+            elif dose == "all":
+                vals = r[finite]
+            else:
+                same = np.array([_same_dose(a, dose) for a in doses])
+                vals = r[finite & same]
+            mean = float(np.mean(vals)) if vals.size else float("nan")
+            if not (
+                int(s["n_pairs"]) == vals.size
+                and _close(float(s["splithalf_mean_r"]), mean, 4)
+                and _close(
+                    float(s["splithalf_median_r"]),
+                    float(np.median(vals)) if vals.size else float("nan"),
+                    4,
+                )
+                and _close(
+                    float(s["spearman_brown_full"]),
+                    2 * mean / (1 + mean) if vals.size else float("nan"),
+                    4,
+                )
+            ):
+                bad.append(f"{dose}/{weighting}")
+        checks.append(
+            Check(
+                f"{label}: every dose-strata row recomputes from the per-condition table",
+                f"{len(subset)} rows (per dose level, all triples, per line-drug)",
+                f"{len(subset) - len(bad)} of {len(subset)} recompute"
+                + (f"; disagreeing: {bad}" if bad else ""),
+                not bad and len(subset) > 0,
+            )
+        )
+        pooled = subset[
+            (subset["dose"].astype(str) == "all")
+            & (subset["weighting"].astype(str) == "per_triple")
+        ]
+        pooled_mean = float(pooled["splithalf_mean_r"].iloc[0]) if len(pooled) else float("nan")
+        checks.append(
+            Check(
+                f"{label}: the summary row's mean is the all-triples, equal-weight row",
+                f"reported splithalf_mean_r {row[f'{label}_splithalf_mean_r']}",
+                f"dose strata all/per_triple: {pooled_mean}",
+                _close(float(row[f"{label}_splithalf_mean_r"]), pooled_mean, 3),
+            )
+        )
+    return checks
+
+
+def _same_dose(a: str, b: str) -> bool:
+    """Two dose labels name the same level, whether the CSV round-tripped them as 5.0 or 5."""
+    try:
+        return float(a) == float(b)
+    except ValueError:
+        return a == b
 
 
 # ------------------------------------------------------------------------------------------
@@ -837,6 +1102,7 @@ def check_promotion(task_dir: Path, repo: Path) -> list[Check]:
         return [
             skipped("promoted copies are byte-identical to the task-side tables", reason),
             skipped("promoted provenance checksums recompute", reason),
+            skipped("promoted provenance names the commit the run was made at", reason),
         ]
     promoted_dir = repo / "results" / TASK
     records = sorted(promoted_dir.glob("*.provenance.json")) if promoted_dir.is_dir() else []
@@ -845,6 +1111,7 @@ def check_promotion(task_dir: Path, repo: Path) -> list[Check]:
         return [
             skipped("promoted copies are byte-identical to the task-side tables", reason),
             skipped("promoted provenance checksums recompute", reason),
+            skipped("promoted provenance names the commit the run was made at", reason),
         ]
     identical: list[str] = []
     differ: list[str] = []
@@ -860,6 +1127,21 @@ def check_promotion(task_dir: Path, repo: Path) -> list[Check]:
         promoted = repo / str(record["result"])
         ok = promoted.exists() and sha256_of(promoted) == record["result_sha256"]
         (hash_ok if ok else hash_bad).append(promoted.name)
+    # The producing commit. Every run writes <result>.params.json beside its result with the
+    # git_sha it ran at; the record's code_commit must be THAT commit, not the commit promotion
+    # happened at. The 2026-09-02 promotion recorded the latter, which held different code.
+    commit_ok: list[str] = []
+    commit_bad: list[str] = []
+    for record_path in records:
+        record = json.loads(record_path.read_text())
+        promoted = repo / str(record["result"])
+        sidecar = task_dir / promoted.with_suffix(".params.json").name
+        run_sha = json.loads(sidecar.read_text()).get("git_sha") if sidecar.exists() else None
+        recorded = str(record.get("environment", {}).get("code_commit", ""))
+        ok = bool(run_sha) and recorded == run_sha and bool(record.get("promotion_commit"))
+        (commit_ok if ok else commit_bad).append(
+            f"{promoted.name} (record {recorded[:7]}, run {str(run_sha)[:7]})"
+        )
     return [
         Check(
             "promoted copies are byte-identical to the task-side tables",
@@ -872,6 +1154,13 @@ def check_promotion(task_dir: Path, repo: Path) -> list[Check]:
             "each record's result_sha256 is the sha256 of the file it names",
             f"{len(hash_ok)} recompute" + (f"; MISMATCH: {hash_bad}" if hash_bad else ""),
             not hash_bad,
+        ),
+        Check(
+            "promoted provenance names the commit the run was made at",
+            "each record's code_commit is the git_sha in the run's params sidecar, and the "
+            "promotion commit is recorded separately",
+            f"{len(commit_ok)} agree" + (f"; WRONG COMMIT: {commit_bad}" if commit_bad else ""),
+            not commit_bad,
         ),
     ]
 
@@ -891,6 +1180,7 @@ def run_all_checks(task_dir: Path = DEFAULT_TASK_DIR, repo: Path = REPO) -> list
         *check_example_profiles(task_dir),
         *check_figures(task_dir),
         *check_pool_arithmetic(task_dir),
+        *check_dose_strata(task_dir),
         *check_audit_checksums(task_dir),
         *check_tranche_content_hash(repo),
         *check_permutation(task_dir),
@@ -906,8 +1196,9 @@ Not checkable here, stated rather than hidden:
   - Anything marked SKIP above is a stage that has not happened yet in this working tree
     (a promoted copy before gate 2, the permutation job before it has run), not a check
     that was waived.
-  - The per-gene variance identity is checked on a bounded prefix of the noise table; the
-    between-plate fraction it feeds is the exact mean over every row.
+  - The committed per-gene noise table is a sample. Every promoted noise number is
+    recomputed from the per-condition sums, which cover every gene-condition; the sample
+    serves the row-wise identity, the strata, the control and the figures.
 """
 
 

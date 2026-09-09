@@ -1633,7 +1633,7 @@ def leakage_table(min_genes: int, seed: int = 0) -> pd.DataFrame:
 AUDIT_SUMS = "audit_checksums.json"
 
 
-def write_audit_checksums(out_dir: Path) -> Path:
+def write_audit_checksums(out_dir: Path, exclude: Path | None = None) -> Path:
     """The sha256 of every table this run wrote, for the audit to cite and promotion to check.
 
     The audit reads these artifacts in the working tree, before they are committed (PROCESS
@@ -1642,10 +1642,16 @@ def write_audit_checksums(out_dir: Path) -> Path:
     """
     import hashlib as _h
 
+    # The slice cache is scratch, not evidence: it may sit under the output directory when no
+    # cache directory is given, and nothing in it is an artifact a reader opens.
+    excluded = exclude.resolve() if exclude is not None else None
     sums = {
         p.name: _h.sha256(p.read_bytes()).hexdigest()
         for p in sorted(out_dir.rglob("*"))
-        if p.is_file() and p.suffix in {".csv", ".gz", ".png", ".json"} and p.name != AUDIT_SUMS
+        if p.is_file()
+        and p.suffix in {".csv", ".gz", ".png", ".json"}
+        and p.name != AUDIT_SUMS
+        and not (excluded is not None and p.resolve().is_relative_to(excluded))
     }
     path = out_dir / AUDIT_SUMS
     path.write_text(json.dumps(sums, indent=2, sort_keys=True) + "\n")
@@ -2081,7 +2087,7 @@ def main() -> None:
     write_per_gene_figure(per_gene, fig_dir / "09_per_gene_reliability.png")
     fg.fig_dose(per_pair, dose_strata, fig_dir / "10_dose.png")
 
-    write_audit_checksums(out_dir)
+    write_audit_checksums(out_dir, exclude=cache_dir)
 
     print("\n=== rung 0: the reliability of the assay ===")
     for k, v in summary.items():

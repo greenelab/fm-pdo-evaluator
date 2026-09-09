@@ -11,14 +11,14 @@ How much of a measured drug response is signal rather than assay noise. A model 
 these responses cannot agree with the measurement better than the measurement agrees with
 itself, so this number is the ceiling every later score is read against.
 
-This task supersedes the unmerged branch `rung0-replicate-ceiling`. That branch chose gene- and drug- pools from an archived lineage. 
+This task supersedes the unmerged branch `rung0-replicate-ceiling`. That branch chose gene- and drug- pools from an archived lineage.
 
 ## Data
 
 One tranche: the Tahoe-100M pseudobulk differential-expression table, registered as
 `tahoe100m-pseudobulk-de.v1` with a content hash over all 1,026 downloaded files
 (`data/tranches/`; described in [docs/DATA.md](../../DATA.md)). Per cell line, drug, dose, and
-plate it carries each gene's log2 fold change against plate-matched solvent controls. 
+plate it carries each gene's log2 fold change against plate-matched solvent controls.
 
 Each row is one DESeq2 result. This rung reads four of its statistics — `log2FoldChange`, its
 standard error `lfcSE`, the Benjamini-Hochberg adjusted p-value `padj`, and `baseMean` — keyed by
@@ -86,7 +86,7 @@ and stratified by expression (`baseMean`) and by response size, each stratum poo
   correlation when it has a finite value in both groups.A condition is scored when at least 50
   genes qualify.
 - *Responder Genes* in addition to having a finite value in each group, the first group also called it differentially expressed (padj < .05). A condition is scored when at least 50
-  genes qualify. 
+  genes qualify.
 - *Drugs.* Every drug with a (line, drug, dose) triple on two or more distinct plates. Under the
   split rule below, two plates is exactly what makes a split exist — the two land one on each
   side — so the reliabilities and the noise decomposition share this one inclusion rule.
@@ -262,7 +262,7 @@ each reliability against the second and third. A mismatched draw for the respond
 uses the genes the *first* condition's first group selected, intersected with the genes finite in
 the second condition's second group: the same selection rule as the matched pair. Because mismatched draws reuse the same half-profiles,
 an exact permutation check — 500 permutations of the pairing, once pooled and once within each
-stratum — measures the dependence the bootstrap ignores and reports it as a design effect. 
+stratum — measures the dependence the bootstrap ignores and reports it as a design effect.
 
 ## Run and promotion
 
@@ -294,10 +294,10 @@ artifacts and imports nothing from this project's own code.
 
 ## Expected result
 
-- The correlations between plates of differential expression over all genes will be low, since most genes are not affected by the drugs. 
-- Correlations between genes that were significantly different (responders) in group 1 will be higher than the correlations over all genes. 
+- The correlations between plates of differential expression over all genes will be low, since most genes are not affected by the drugs.
+- Correlations between genes that were significantly different (responders) in group 1 will be higher than the correlations over all genes.
 - The noise will be higher in cell line - drug combinations with lower correlations over either all genes or the differentially expressed genes.
-- The aggregate noise will be higher in the differentially expressed genes (responders) than over all genes. 
+- The aggregate noise will be higher in the differentially expressed genes (responders) than over all genes.
 
 ## Ported apparatus
 
@@ -318,4 +318,4 @@ that exercise it.
 ## Out of scope
 
 Sensitivity of either reliability (all or responders) to the choice of split; an external deposit
-of the half-profile matrix. 
+of the half-profile matrix.

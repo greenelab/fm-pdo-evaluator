@@ -21,13 +21,17 @@ from __future__ import annotations
 
 import csv
 import importlib.util
+import json
 import os
 import shutil
 import sys
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 import pytest
+
+from tests.test_rung0_controls import dr, write_fixture_pool
 
 pytestmark = pytest.mark.step_document
 
@@ -39,46 +43,80 @@ vr: Any = importlib.util.module_from_spec(_SPEC)
 sys.modules["verify_rung0"] = vr
 _SPEC.loader.exec_module(vr)
 
-#: The battery is exercised against a real directory of run artifacts. In order: whatever
-#: RUNG0_EXAMPLE_RUN points at, the task's own folder once the cluster run has been pulled into
-#: it, then the synthetic-data example run kept in this session's scratch. Artifacts are
-#: uncommitted between the run and promotion (PROCESS, "What reaches GitHub, and when"), so on a
-#: checkout where none of the three exists these tests skip with the reason rather than fail.
-_SCRATCH = Path(
-    "/private/tmp/claude-502/-Users-gillenlu-Repositories-fm-pdo-evaluator"
-    "/ba328f82-4da7-4056-b76c-dc939ce15d8a/scratchpad/synthrun/out"
-)
-_CANDIDATES = [
-    Path(os.environ["RUNG0_EXAMPLE_RUN"]) if os.environ.get("RUNG0_EXAMPLE_RUN") else None,
-    REPO / "docs" / "tasks" / "rung0-assay-reliability",
-    _SCRATCH,
-]
+#: The battery is exercised against a run the test session makes itself: the real ``main`` over
+#: a synthetic pool with planted plate effects, two dose levels and responders, in three gene
+#: slices. That run always exists, so the battery's arithmetic is tested on every checkout;
+#: the committed cluster run is checked separately below, and only when its parameter sidecar
+#: says it was produced under the schema this battery reads. RUNG0_EXAMPLE_RUN overrides the
+#: synthetic run with a directory of a real run's artifacts.
+TASK_DIR = REPO / "docs" / "tasks" / "rung0-assay-reliability"
 
 #: Both the summary table's trust map and this task's pull-request description quote the size of
 #: the battery. Pinning it here means adding or removing a check forces those transcriptions to be
 #: revisited rather than quietly going stale -- the one number in the wave that nothing else
 #: guards. Skipped checks are counted: whether the permutation job has run changes what can be
 #: checked, never how many claims the battery is answerable for.
-EXPECTED_CHECKS = 59
+EXPECTED_CHECKS = 74
 
 
-def _example_run() -> Path:
-    for candidate in _CANDIDATES:
-        if candidate is not None and (candidate / "rung0_reliability.csv").exists():
-            return candidate
-    pytest.skip(
-        "no rung 0 run to verify: none of "
-        f"{[str(c) for c in _CANDIDATES if c is not None]} holds rung0_reliability.csv"
+@pytest.fixture(scope="session")
+def synthetic_run(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """One run of the real ``main`` on a synthetic pool, shared by every test in this file."""
+    override = os.environ.get("RUNG0_EXAMPLE_RUN")
+    if override and (Path(override) / "rung0_reliability.csv").exists():
+        return Path(override)
+    root = tmp_path_factory.mktemp("synthetic_run")
+    pool = write_fixture_pool(
+        root,
+        n_lines=6,
+        n_drugs=4,
+        n_genes=400,
+        n_responders=120,
+        doses=(0.05, 5.0),
+        plates=("P1", "P2", "P3", "P4", "P5", "P6"),
+        plate_offset_sd=0.3,
+        signal_sd_by_drug=(0.3, 0.6, 1.0, 2.0),
+        seed=41,
     )
+    out = root / "out"
+    argv = [
+        "delta_reproducibility.py",
+        "--local-dir",
+        str(pool.parent.parent),
+        "--out-dir",
+        str(out),
+        "--min-genes",
+        "20",
+        "--n-perm",
+        "40",
+        "--slices",
+        "3",
+    ]
+    with mock.patch.object(sys, "argv", argv):
+        dr.main()
+    return out
 
 
 @pytest.fixture
-def artifacts(tmp_path: Path) -> Path:
-    """A private copy of one run's artifacts, so a test may perturb them without harm."""
-    source = _example_run()
+def artifacts(tmp_path: Path, synthetic_run: Path) -> Path:
+    """A private copy of the run's artifacts, so a test may perturb them without harm."""
     destination = tmp_path / "run"
-    shutil.copytree(source, destination)
+    shutil.copytree(synthetic_run, destination, ignore=shutil.ignore_patterns("cache"))
     return destination
+
+
+def test_the_committed_cluster_run_verifies() -> None:
+    """The run pulled into the task folder passes the battery -- once it is a run this battery
+    reads. The parameter sidecar records the split rule from the 2026-09-09 code on; artifacts
+    from before it are a different schema and are skipped by name rather than failed."""
+    sidecar = TASK_DIR / "rung0_reliability.params.json"
+    if not sidecar.exists():
+        pytest.skip("no cluster run in the task folder")
+    if "split_rule" not in json.loads(sidecar.read_text()):
+        pytest.skip("the task folder holds a run from before the alternating split (2026-09-09)")
+    checks = vr.run_all_checks(TASK_DIR)
+    failures = _failures(checks)
+    assert not failures, "the committed run and its documents disagree:\n" + "\n".join(failures)
 
 
 def _failures(checks: list[Any]) -> list[str]:
@@ -110,12 +148,19 @@ def test_the_check_battery_covers_every_layer(artifacts: Path) -> None:
         "Spearman-Brown",
         "floor recomputes from its draws",
         "minimum detectable effects",
-        "rises with effect size",
+        "rises with effect size, ranked by half0",
+        "rises with effect size, ranked by half1",
         "two-sided selection inflates",
-        "sigma2_plate = max(var_lfc - mean_se2, 0)",
+        "pooled between-plate share recomputes",
+        "responders' pooled share",
+        "sigma2_plate_signed = var_lfc - mean_se2",
+        "control pool's pooled share",
         "example scatter reproduces",
         "every figure design.md declares",
-        "scored conditions are the splittable ones",
+        "split alternates over sorted plate ids",
+        "scored conditions are the replicated triples",
+        "dose-strata row recomputes",
+        "commit the run was made at",
         "checksum recomputes from the file it names",
         "tranche content hash",
         "permutation",
