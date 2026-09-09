@@ -1,6 +1,6 @@
 # Rung 0 — decision lineage
 
-**As of** 2026-09-01.
+**As of** 2026-09-09.
 
 This task's dated decision entries, one section per source document, oldest first within each,
 per `docs/PROCESS.md` §1 and SPEC project rule 2.
@@ -41,3 +41,66 @@ per `docs/PROCESS.md` §1 and SPEC project rule 2.
 - **2026-09-01** — Per-step **figures** declared in the design, at Lucas's direction, and the section renamed from "Controls and power" to "Figures, controls and power", each step now reading positive / negative / figures. Reason: a reviewer who cannot see the data cannot check the claim, and figures chosen after a run are chosen from what looked good. Declaring them per step before the run makes the figure list part of what the audit checks. Two rules bind every figure: it is drawn from a committed table, so its value is recomputable rather than trapped inside a run; and it shows its planted-answer control beside it on shared axes where a control exists, since real data alone shows what the screen looks like but not whether the machinery reads it correctly. The `promote` and `document` steps declare no figures and say why, rather than inventing one for symmetry. Project-level figure rules in `docs/PROCESS.md` §3 and `docs/decisions.md` at this date.
 - **2026-09-01** — "Derangement" renamed to "permutation" throughout, at Lucas's direction ("The word 'derangement' is unknown to me or our lab group"). A derangement is a permutation that leaves no element in place; the check is a permutation check and the stricter name bought nothing a lab reader could use. On the port from the superseded branch the files are renamed with it: `scripts/derangement_null.py` to `scripts/permutation_null.py`, `scripts/alpine/derangement_null.sbatch` to `scripts/alpine/permutation_null.sbatch`, `tests/test_derangement_null.py` to `tests/test_permutation_null.py`, and the `rung0_derangement_*` output names to `rung0_permutation_*`. Recorded per PROCESS §7: the old name survives in the superseded branch's files and in the 2026-08-28 entry in `docs/decisions.md`, and this entry is the forward pointer that keeps those readable.
 - **2026-09-01** — "Headline" dropped as a term for this rung's promoted numbers, at Lucas's direction. It presumed one primary result with variants; there are two results answering two questions, and the contrast that matters is unrestricted versus restricted, not primary versus secondary. The design, `docs/SPEC.md` §Frame and `docs/STATE.md`'s ladder row are worded accordingly. The word survives in earlier decision entries, which are history and are not rewritten.
+
+- **2026-09-09** — **The split is alternating over sorted plate ids, not `hash(plate) % 2`**, at
+  Lucas's direction after the review of PR #9. Within each (line, drug, dose) triple the distinct
+  plate ids are sorted and assigned alternately, and the assignment is written as a table the
+  aggregations join against (`rung0_split_assignment.csv`). Reasons: a two-plate triple splits
+  only if its two plates land on opposite sides, 7,441 of the 7,641 replicated triples have
+  exactly two plates, and under the hash rule how many of them split was never counted — the
+  design's "one plate against one" was assumed, not measured. Alternation makes every replicated
+  triple splittable, makes the equal-halves flag exactly "an even plate count" (the reviewer's
+  P2: `n_plates_even` was the parity of the total, so four plates hashed 3:1 were flagged as
+  equal), and collapses the reliabilities' and the decomposition's inclusion rules into one
+  (another P2: one required a plate in each hash half, the other any two plates). The frame
+  schema token moves to `v3-dose-fixed-alternating`, so the v2 cache cannot be reused; the
+  promoted number changes and is not comparable to the v2 run's.
+- **2026-09-09** — **The noise estimator pools before it floors**, after the reviewer's P1. The
+  shipped estimator floored `var - se^2` at zero for every gene and averaged the floored values.
+  At two plates the variance across plates has one degree of freedom, and the floored mean with no
+  plate effect at all is `0.25 * E[max(chi2_1 - 1, 0)] = 0.121` for a within-plate variance of
+  0.25 — a share of 0.15 and a third of genes positive, which is the reviewer's simulation and
+  is confirmed analytically. The dose-fixed run that finished on 2026-09-02 (job 31998062)
+  reported a share of 0.192, most of which is that truncation. The estimator is now
+  `max(mean(var) - mean(se^2), 0)`, floored once after averaging over gene-conditions; the
+  per-gene column is kept signed for the figures. The responder share needs the responders'
+  squared standard errors summed, which the cached partials did not carry, so the noise pass is
+  rerun rather than recombined — in the job array, so it costs one scan of wall clock rather
+  than seven hours. The 24-plate negative control that concealed the bias is replaced by one at
+  two plates that also shows what the per-gene floor would have reported.
+- **2026-09-09** — **The effect-size control ranks by one half's magnitude and cross-fits**,
+  after the reviewer's P1. Ranking conditions by the magnitude of the two halves' sum selects
+  conditions whose halves happened to agree, so pure noise rose monotonically through the
+  terciles and the verifier's monotone criterion passed on nothing — the same mechanism this
+  task's own 2026-09-01 leakage-control entry describes for responder selection, applied without
+  noticing to the control. The per-triple table now carries each half's mean absolute delta
+  separately; the control ranks by one, scores the correlation of the pair, then swaps, and both
+  rankings must rise. A signal-free pool comes out flat under the shipped ranking and is shown to
+  rise under the old one, as a pinned test. The control is recomputable from the committed
+  per-triple table, so the battery re-derives it rather than trusting the run's table.
+- **2026-09-09** — **The same-drug null holds dose fixed**, after the reviewer's P2. The
+  line-specificity floor paired same-drug conditions at any dose; a same-drug pair at different
+  doses is partly a dose contrast, which lowers the floor below the specificity it is meant to
+  measure. The stratum is now same drug, same dose, different line. The different-drug stratum
+  is unchanged. The example scatter's same-drug mismatch follows the same rule.
+- **2026-09-09** — **The per-triple table is the primary artifact and the weighting is chosen
+  from it**, at Lucas's direction ("before I decide on one metric, I'd like to know the pattern of
+  correlations across the 3 doses"). Every candidate ceiling — each dose level on its own, all
+  triples with equal weight, each (line, drug) pair weighted once — is an aggregate of the
+  committed per-triple table, so the run commits that table and a dose-strata table carrying all
+  three, and the choice is made after the dose figure is read and recorded here with the figure
+  as its evidence. Stated plainly: choosing the aggregate after seeing the data is a post-hoc
+  choice, and the honest form of it is to promote the table itself, report every candidate beside
+  the one declared, and let a later rung's restriction be a subset of the promoted triples under
+  the same weighting. Pending until the run lands.
+- **2026-09-09** — **The run is a chain of three jobs, the middle one an array**, at Lucas's
+  direction ("is there a way to parallelize this process that doesn't use as much memory and runs
+  faster?"). The scan over the table is the entire cost; the earlier job ran the eight noise
+  slices one after another in one process (seven hours) and the unsliced frame build exhausted
+  40 GB of engine memory on the dose-fixed grouping. Now: one key-column scan writes the split
+  assignment; sixteen array tasks each scan the table once for their slice of the genes, in ONE
+  group-by that serves both the reliabilities and the decomposition (the two group by the same
+  key, so a second scan bought nothing), and cache the slice; one combine job reads the slices.
+  Wall clock is one scan; each task holds a sixteenth of the group table. A task that finds its
+  completion record skips, so a failed index is resubmitted alone. Recorded in `docs/PROCESS.md`
+  §2 as the way a scan-bound job is run on the cluster.

@@ -40,6 +40,7 @@ from typing import Any, cast
 import matplotlib
 import numpy as np
 import pandas as pd
+from matplotlib import colors as mcolors
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 
@@ -51,8 +52,10 @@ import matplotlib.pyplot as plt
 
 __all__ = [
     "SCORING_THRESHOLD",
+    "dose_palette",
     "fig_build",
     "fig_decompose",
+    "fig_dose",
     "fig_null",
     "fig_permutation_vs_bootstrap",
     "fig_power",
@@ -223,58 +226,6 @@ def _category_bar(ax: Axes, frame: pd.DataFrame, column: str, xlabel: str) -> No
         ax.set_xticklabels([])
         xlabel = f"{xlabel} ({unique.size} levels, labels omitted)"
     ax.set_xlabel(xlabel)
-
-
-def _quartile_profile(
-    quantity: np.ndarray, stratifier: np.ndarray
-) -> tuple[list[str], np.ndarray, np.ndarray, np.ndarray]:
-    """Mean, standard error and count of ``quantity`` within quartiles of ``stratifier``.
-
-    Returns empty arrays when there are too few rows, or too few distinct stratifier values, to
-    cut into quartiles at all -- a stratification of three rows is not a stratification.
-    """
-    keep = np.isfinite(quantity) & np.isfinite(stratifier)
-    quantity, stratifier = quantity[keep], stratifier[keep]
-    empty = np.empty(0, dtype=float)
-    if quantity.size < 4 or np.unique(stratifier).size < 2:
-        return [], empty, empty, empty
-    frame = pd.DataFrame({"quantity": quantity, "stratifier": stratifier})
-    quartile = cast(Any, pd.qcut(cast(Any, frame)["stratifier"], 4, duplicates="drop"))
-    grouped = cast(Any, frame).groupby(quartile, observed=True)["quantity"]
-    aggregated = grouped.agg(["mean", "sem", "size"])
-    labels = [f"{edge.left:.3g} to {edge.right:.3g}" for edge in aggregated.index]
-    means = np.asarray(aggregated["mean"].to_numpy(dtype=float), dtype=float)
-    sems = np.asarray(aggregated["sem"].to_numpy(dtype=float), dtype=float)
-    counts = np.asarray(aggregated["size"].to_numpy(dtype=float), dtype=float)
-    return labels, means, np.nan_to_num(sems, nan=0.0), counts
-
-
-def _quartile_panel(
-    ax: Axes,
-    labels: list[str],
-    means: np.ndarray,
-    sems: np.ndarray,
-    counts: np.ndarray,
-    xlabel: str,
-    title: str,
-) -> None:
-    """Mean between-plate share within each quartile, with its standard error."""
-    if means.size:
-        positions = np.arange(means.size, dtype=float)
-        ax.errorbar(
-            positions, means, yerr=sems, fmt="o-", color=_REAL_COLOR, capsize=3, lw=1.2, ms=5
-        )
-        ax.set_xticks(positions)
-        ticks = [
-            f"{label}\nn={int(count)}"
-            for label, count in zip(labels, counts.tolist(), strict=False)
-        ]
-        ax.set_xticklabels(ticks, fontsize=6)
-    else:
-        _note_empty(ax, "too few rows to cut into quartiles")
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel("mean between-plate share of variance")
-    ax.set_title(title, fontsize=9)
 
 
 def _finish(fig: Figure, out: Path) -> Path:
@@ -803,21 +754,98 @@ def fig_score(
 # --------------------------------------------------------------------------------------------
 
 
-def _fraction_hist(ax: Axes, fraction: np.ndarray, color: str, label: str, title: str) -> None:
-    """One between-plate-fraction histogram, on the fixed zero-to-one axis both panels share."""
-    if fraction.size:
-        ax.hist(fraction, bins=_even_bins(0.0, 1.0, 40), color=color, alpha=0.85, label=label)
+def _pooled_share(var_lfc: np.ndarray, mean_se2: np.ndarray) -> tuple[float, int]:
+    """The share pooled over rows, floored once: max(mean var - mean se2, 0) / mean var."""
+    ok = np.isfinite(var_lfc) & (var_lfc > 0.0) & np.isfinite(mean_se2)
+    if not ok.any():
+        return float("nan"), 0
+    mean_var = float(np.mean(var_lfc[ok]))
+    sigma2 = max(mean_var - float(np.mean(mean_se2[ok])), 0.0)
+    return sigma2 / mean_var, int(ok.sum())
+
+
+def _signed_share_hist(
+    ax: Axes, share: np.ndarray, pooled: float, n: int, color: str, label: str, title: str
+) -> None:
+    """One histogram of the per-gene SIGNED between-plate share, with the pooled share marked.
+
+    The per-gene share is (var - se^2) / var with one degree of freedom at two plates, so it
+    scatters far either side of zero even when there is no plate effect. The pooled share --
+    the number the run reports -- is drawn as a vertical line, so the reader sees both what
+    the per-gene estimates look like and what the estimator actually concludes from them.
+    """
+    if share.size:
+        clipped = np.clip(share, -3.0, 1.0)
+        ax.hist(clipped, bins=_even_bins(-3.0, 1.0, 48), color=color, alpha=0.85, label=label)
+        ax.axvline(0.0, color="k", lw=0.8)
+        if np.isfinite(pooled):
+            ax.axvline(
+                pooled,
+                color="k",
+                lw=1.6,
+                linestyle="--",
+                label=f"pooled share {pooled:.3f} (n = {n:,})",
+            )
     else:
         _note_empty(ax, "no decomposed gene-condition rows")
-    ax.set_xlabel("between-plate share of the fold-change variance (0 = none, 1 = all)")
+    ax.set_xlabel("per-gene signed between-plate share, (var - se^2) / var (clipped at -3)")
     ax.set_ylabel("gene-condition rows (count)")
     ax.set_title(title, fontsize=9)
     _legend(ax, fontsize=8)
 
 
+def _strata_share_by(strata: pd.DataFrame, column: str) -> tuple[list[str], np.ndarray, np.ndarray]:
+    """The pooled share within each level of one stratifier, from the strata table.
+
+    The table carries one row per (expression quartile, response quartile) with that cell's
+    row count and mean variance and mean squared standard error; pooling across the other
+    stratifier is a count-weighted mean of each, then the same floor-once share.
+    """
+    if strata.empty or column not in strata.columns:
+        return [], np.empty(0), np.empty(0)
+    n = _numeric(strata, "n")
+    var = _numeric(strata, "var_lfc_mean")
+    se2 = _numeric(strata, "mean_se2_mean")
+    level = _numeric(strata, column)
+    keep = np.isfinite(n) & np.isfinite(var) & np.isfinite(se2) & np.isfinite(level)
+    labels: list[str] = []
+    shares: list[float] = []
+    counts: list[float] = []
+    for value in np.unique(level[keep]):
+        sel = keep & (level == value)
+        weight = n[sel]
+        mean_var = float(np.sum(weight * var[sel]) / np.sum(weight))
+        mean_se2 = float(np.sum(weight * se2[sel]) / np.sum(weight))
+        labels.append(f"Q{int(value)}")
+        shares.append(max(mean_var - mean_se2, 0.0) / mean_var if mean_var > 0 else float("nan"))
+        counts.append(float(np.sum(weight)))
+    return labels, np.asarray(shares, dtype=float), np.asarray(counts, dtype=float)
+
+
+def _share_panel(
+    ax: Axes, labels: list[str], shares: np.ndarray, counts: np.ndarray, xlabel: str, title: str
+) -> None:
+    """The pooled between-plate share across the levels of one stratifier."""
+    if shares.size:
+        positions = np.arange(shares.size, dtype=float)
+        ax.plot(positions, shares, "o-", color=_REAL_COLOR, lw=1.2, ms=5)
+        ax.set_xticks(positions)
+        ax.set_xticklabels(
+            [f"{lab}\nn={int(c):,}" for lab, c in zip(labels, counts.tolist(), strict=True)],
+            fontsize=6,
+        )
+        ax.set_ylim(bottom=0.0)
+    else:
+        _note_empty(ax, "no strata table")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("pooled between-plate share of variance")
+    ax.set_title(title, fontsize=9)
+
+
 def fig_decompose(
     noise: pd.DataFrame,
     control_noise: pd.DataFrame | None,
+    strata: pd.DataFrame | None,
     out: Path,
 ) -> Path:
     """What the reliability ceiling is made of: plate effects, or cell sampling.
@@ -828,55 +856,62 @@ def fig_decompose(
     fold changes carry sampling error, which DESeq2 already reports as ``lfcSE``. Which of the
     two dominates decides what would actually raise the ceiling: more plates, or deeper plates.
 
-    Panel (a) is the between-plate share of the total. Panel (b) is the same comparison one gene
-    at a time, plate variance against mean squared standard error, with the identity line drawn:
-    points above the line are rows whose disagreement is batch, points below are rows whose
-    disagreement is counting. Reading which side of that line the mass sits on is the whole
-    purpose of the panel, so both axes are log-scaled over the positive rows, where variances
-    span orders of magnitude.
-
-    Panels (c) and (d) ask whether that share is constant across the screen or depends on where
-    in it you stand -- lowly expressed genes are sampling-limited, and strongly responding genes
-    have more real signal for a batch offset to be measured against. A control pool with a
-    planted split, when supplied, is drawn beside panel (a) on shared axes: a decomposition that
-    cannot recover a known split is not evidence about the real one.
+    Panel (a) is the per-gene SIGNED share with the pooled share marked: at two plates each
+    gene's estimate has one degree of freedom, so the histogram is wide and straddles zero, and
+    the pooled line is the number the run reports. The control pool beside it plants a known
+    share of 0.5 at two plates, so the reader sees both the spread the estimator faces and that
+    it recovers the planted value from it. Panel (b) is the variance across plates against the
+    mean squared standard error, gene by gene, with the identity line drawn: mass above the
+    line is disagreement that sampling error alone does not explain. Panels (c) and (d) ask
+    whether the pooled share depends on where in the screen you stand -- lowly expressed genes
+    are sampling-limited, and strongly responding genes have more real signal for a batch
+    offset to be measured against -- read from the committed strata table.
     """
-    # Row-aligned for the stratified panels, filtered only for the histogram: panels (c) and (d)
-    # pair each row's fraction with that same row's expression and response size, so dropping
-    # rows column by column would silently mismatch them.
-    fraction_by_row = _numeric(noise, "between_plate_fraction")
-    fraction = fraction_by_row[np.isfinite(fraction_by_row)]
-    control_fraction = (
-        _finite(control_noise, "between_plate_fraction") if control_noise is not None else None
-    )
-    n_cols = 3 if control_fraction is not None else 2
+    var = _numeric(noise, "var_lfc")
+    se2 = _numeric(noise, "mean_se2")
+    share = _numeric(noise, "between_plate_fraction_signed")
+    share = share[np.isfinite(share)]
+    pooled, n_pooled = _pooled_share(var, se2)
+    has_control = control_noise is not None
+    n_cols = 3 if has_control else 2
     fig = plt.figure(figsize=(5.2 * n_cols, 8.6), layout="constrained")
     grid = fig.add_gridspec(2, n_cols)
 
-    ax_fraction = fig.add_subplot(grid[0, 0])
-    _fraction_hist(
-        ax_fraction, fraction, _REAL_COLOR, "real screen", "(a) between-plate share, real screen"
+    ax_share = fig.add_subplot(grid[0, 0])
+    _signed_share_hist(
+        ax_share,
+        share,
+        pooled,
+        n_pooled,
+        _REAL_COLOR,
+        "real screen",
+        "(a) per-gene signed share, real screen; pooled share marked",
     )
 
-    if control_fraction is not None:
-        ax_control = fig.add_subplot(grid[0, 1], sharex=ax_fraction, sharey=ax_fraction)
-        _fraction_hist(
+    if control_noise is not None:
+        c_share = _numeric(control_noise, "between_plate_fraction_signed")
+        c_share = c_share[np.isfinite(c_share)]
+        c_pooled, c_n = _pooled_share(
+            _numeric(control_noise, "var_lfc"), _numeric(control_noise, "mean_se2")
+        )
+        ax_control = fig.add_subplot(grid[0, 1], sharex=ax_share, sharey=ax_share)
+        _signed_share_hist(
             ax_control,
-            control_fraction,
+            c_share,
+            c_pooled,
+            c_n,
             _CONTROL_COLOR,
-            "control pool (planted split)",
-            "(a, control) between-plate share, control pool",
+            "control pool (planted 0.5)",
+            "(a, control) planted share 0.5 at two plates; pooled must land there",
         )
         ax_scatter = fig.add_subplot(grid[0, 2])
     else:
         ax_scatter = fig.add_subplot(grid[0, 1])
 
-    plate_var = _numeric(noise, "sigma2_plate")
-    sampling_var = _numeric(noise, "mean_se2")
-    finite = np.isfinite(plate_var) & np.isfinite(sampling_var)
-    positive = finite & (plate_var > 0.0) & (sampling_var > 0.0)
+    finite = np.isfinite(var) & np.isfinite(se2)
+    positive = finite & (var > 0.0) & (se2 > 0.0)
     drawn = positive if positive.any() else finite
-    x, y = sampling_var[drawn], plate_var[drawn]
+    x, y = se2[drawn], var[drawn]
     if x.size:
         ax_scatter.scatter(x, y, s=6, alpha=0.35, color=_REAL_COLOR, edgecolors="none")
         low = float(np.minimum(x.min(), y.min()))
@@ -887,7 +922,7 @@ def fig_decompose(
             color="k",
             lw=1.0,
             linestyle="--",
-            label="identity: plate effects equal cell sampling",
+            label="identity: variance across plates equals sampling variance",
         )
     else:
         _note_empty(ax_scatter, "no decomposed gene-condition rows")
@@ -906,36 +941,33 @@ def fig_decompose(
     ax_scatter.set_xlabel(
         "within-plate sampling variance, mean(lfcSE^2)\n(squared log2 fold change)"
     )
-    ax_scatter.set_ylabel("between-plate variance, sigma^2_plate\n(squared log2 fold change)")
-    ax_scatter.set_title(
-        "(b) above the line, plate effects dominate;\nbelow it, cell sampling does", fontsize=9
+    ax_scatter.set_ylabel(
+        "variance across plates, var(log2 fold change)\n(squared log2 fold change)"
     )
+    ax_scatter.set_title("(b) above the line, more disagreement than sampling explains", fontsize=9)
     _legend(ax_scatter, fontsize=7)
 
+    strata = strata if strata is not None else pd.DataFrame()
     ax_expression = fig.add_subplot(grid[1, 0])
-    labels, means, sems, counts = _quartile_profile(fraction_by_row, _numeric(noise, "base_mean"))
-    _quartile_panel(
+    labels, shares, counts = _strata_share_by(strata, "expression_quartile")
+    _share_panel(
         ax_expression,
         labels,
-        means,
-        sems,
+        shares,
         counts,
         "expression quartile (DESeq2 base mean, normalised counts)",
-        "(c) between-plate share by expression",
+        "(c) pooled between-plate share by expression",
     )
 
     ax_response = fig.add_subplot(grid[1, 1])
-    labels, means, sems, counts = _quartile_profile(
-        fraction_by_row, np.abs(_numeric(noise, "mean_lfc"))
-    )
-    _quartile_panel(
+    labels, shares, counts = _strata_share_by(strata, "response_quartile")
+    _share_panel(
         ax_response,
         labels,
-        means,
-        sems,
+        shares,
         counts,
         "response-size quartile (absolute mean log2 fold change)",
-        "(d) between-plate share by response size",
+        "(d) pooled between-plate share by response size",
     )
 
     fig.suptitle("decompose: plate effects against cell sampling", fontsize=11)
@@ -1126,44 +1158,66 @@ def fig_permutation_vs_bootstrap(
 # --------------------------------------------------------------------------------------------
 
 
+_RANKING_STYLE = (
+    ("half0", _REAL_COLOR, "ranked by the FIRST half's magnitude"),
+    ("half1", _RESPONDER_COLOR, "ranked by the SECOND half's magnitude"),
+)
+
+
 def fig_terciles(terciles: pd.DataFrame, out: Path) -> Path:
     """The empirical in-run control: reproducibility has to rise where there is more signal.
 
-    Conditions are sorted by how large a response the drug produced and cut into thirds. If the
-    assay is working, the third with the largest responses reproduces best -- a strong, real
-    transcriptional change is easier to measure twice than a weak one. A flat or falling line
-    here would say the correlations are driven by something other than drug response, and would
-    invalidate both reliabilities regardless of how they compare to their nulls.
+    Conditions are sorted by how large a response ONE half measured and cut into thirds, and
+    the correlation of the pair is averaged within each third; then the halves swap roles. If
+    the assay is working, the third with the largest responses reproduces best. Ranking by one
+    half alone is what keeps the control honest: under no signal the other half is independent
+    of the ranking, so every tercile's expected correlation is zero, whereas ranking by the sum
+    of the two halves would select conditions whose halves happened to agree and pure noise
+    would rise. Both rankings are drawn; both must rise, and the gap between them is how
+    asymmetric the two halves are.
 
-    The confidence intervals are what say whether the rise is real or within noise; a rise
-    smaller than the intervals is not yet evidence of anything.
+    The confidence intervals are what say whether a rise is real or within noise.
     """
-    fig, ax = plt.subplots(1, 1, figsize=(6.6, 4.6), layout="constrained")
+    fig, ax = plt.subplots(1, 1, figsize=(6.8, 4.6), layout="constrained")
+    ranked_by = _labels(terciles, "ranked_by")
     tercile = _numeric(terciles, "tercile")
     mean_r = _numeric(terciles, "mean_r")
     ci_lo = _numeric(terciles, "ci_lo")
     ci_hi = _numeric(terciles, "ci_hi")
     counts = _numeric(terciles, "n")
-    keep = np.isfinite(tercile) & np.isfinite(mean_r)
-    if keep.any():
-        x, y = tercile[keep], mean_r[keep]
+    drawn = False
+    for offset, (key, color, label) in zip((-0.06, 0.06), _RANKING_STYLE, strict=True):
+        keep = (ranked_by == key) & np.isfinite(tercile) & np.isfinite(mean_r)
+        if not keep.any():
+            continue
+        drawn = True
+        x, y = tercile[keep] + offset, mean_r[keep]
         lower = np.nan_to_num(y - ci_lo[keep], nan=0.0)
         upper = np.nan_to_num(ci_hi[keep] - y, nan=0.0)
         yerr = np.vstack([np.clip(lower, 0.0, None), np.clip(upper, 0.0, None)])
-        ax.errorbar(x, y, yerr=yerr, fmt="o-", color=_REAL_COLOR, capsize=4, lw=1.4, ms=6)
-        ax.set_xticks(x)
+        ax.errorbar(x, y, yerr=yerr, fmt="o-", color=color, capsize=4, lw=1.4, ms=6, label=label)
+    if drawn:
+        first = ranked_by == _RANKING_STYLE[0][0]
+        ticks = np.unique(tercile[first & np.isfinite(tercile)])
+        ax.set_xticks(ticks)
         ax.set_xticklabels(
             [
-                f"{int(value)}\nn={int(count)}" if np.isfinite(count) else f"{int(value)}"
-                for value, count in zip(x.tolist(), counts[keep].tolist(), strict=False)
+                f"{int(value)}\nn={int(count)}"
+                for value, count in zip(
+                    ticks.tolist(),
+                    [counts[first & (tercile == value)][0] for value in ticks],
+                    strict=True,
+                )
             ],
             fontsize=8,
         )
+        ax.axhline(0.0, color="k", lw=0.8)
     else:
         _note_empty(ax, "no tercile summary")
-    ax.set_xlabel("tercile of response size (1 = weakest response, 3 = strongest)")
+    ax.set_xlabel("tercile of one half's response size (1 = weakest, 3 = strongest)")
     ax.set_ylabel("mean split-half Pearson r (95% confidence interval)")
     ax.set_title("empirical control: reproducibility must rise with effect size", fontsize=10)
+    _legend(ax, fontsize=8)
     return _finish(fig, out)
 
 
@@ -1209,4 +1263,141 @@ def fig_power(mde_curve: pd.DataFrame, out: Path) -> Path:
     ax.set_ylabel("minimum detectable mean split-half r\n(alpha = 0.05, power = 0.80)")
     ax.set_title("power: minimum detectable effect against screen size", fontsize=10)
     _legend(ax, fontsize=8)
+    return _finish(fig, out)
+
+
+# --------------------------------------------------------------------------------------------
+# dose -- how the reliabilities sit across the screen's three dose levels
+# --------------------------------------------------------------------------------------------
+
+#: Three dose levels, three hues, assigned low to high and never cycled. The trio is the
+#: Okabe-Ito blue, orange and green, which pass the colour-vision-deficiency separation checks.
+_DOSE_COLORS = ("#0072B2", "#E69F00", "#009E73")
+
+
+def dose_palette(doses: Sequence[str]) -> dict[str, str]:
+    """A fixed hue per dose level, low to high; a sequential ramp if there are more than three."""
+    ordered = sorted(set(doses), key=lambda d: (float(d) if _is_float(d) else float("inf"), d))
+    if len(ordered) <= len(_DOSE_COLORS):
+        return dict(zip(ordered, _DOSE_COLORS[: len(ordered)], strict=True))
+    ramp = plt.get_cmap("viridis")
+    return {d: mcolors.to_hex(ramp(i / max(len(ordered) - 1, 1))) for i, d in enumerate(ordered)}
+
+
+def _is_float(text: str) -> bool:
+    try:
+        float(text)
+    except ValueError:
+        return False
+    return True
+
+
+def fig_dose(per_pair: pd.DataFrame, dose_strata: pd.DataFrame, out: Path) -> Path:
+    """The split-half correlations by cell line and by dose level, for both gene sets.
+
+    Holding dose fixed made the scoreable unit a (line, drug, dose) triple, and the screen
+    replicated its top dose far more than the other two, so what one number over all triples
+    weights is a choice. This figure is where that choice is read off the data: each dot is
+    one triple's correlation, placed at its cell line and coloured by its dose level, with the
+    line's median marked; beside it, the distribution at each dose level with its mean and
+    count. The top row is the all-gene correlation, the bottom row the responder correlation.
+    """
+    doses = _labels(per_pair, "dose")
+    palette = dose_palette(list(doses))
+    lines = _labels(per_pair, "patient")
+    rows = [("all genes", "r"), ("responder genes", "r_responder")]
+    fig, axes = plt.subplots(2, 2, figsize=(15.0, 9.0), layout="constrained", width_ratios=[3, 1])
+    rng = np.random.default_rng(0)
+    for row_i, (title, column) in enumerate(rows):
+        r = _numeric(per_pair, column)
+        ax_line, ax_dose = axes[row_i, 0], axes[row_i, 1]
+        finite = np.isfinite(r)
+        if not finite.any():
+            _note_empty(ax_line, f"no {column} values")
+            _note_empty(ax_dose, f"no {column} values")
+            continue
+        by_line = cast(
+            Any,
+            pd.DataFrame({"line": lines[finite], "r": r[finite]})
+            .groupby("line", observed=True)["r"]
+            .median(),
+        ).sort_values()
+        line_names = [str(name) for name in by_line.index.tolist()]
+        line_medians = np.asarray(by_line.to_numpy(dtype=float), dtype=float)
+        order = {line: i for i, line in enumerate(line_names)}
+        x = np.array([order.get(line, -1) for line in lines], dtype=float)
+        for dose, color in palette.items():
+            sel = finite & (doses == dose) & (x >= 0)
+            if not sel.any():
+                continue
+            jitter = rng.uniform(-0.28, 0.28, size=int(sel.sum()))
+            ax_line.scatter(
+                x[sel] + jitter,
+                r[sel],
+                s=9,
+                color=color,
+                alpha=0.55,
+                edgecolors="none",
+                label=f"dose {dose} (n = {int(sel.sum()):,})",
+            )
+        ax_line.scatter(
+            np.arange(len(line_names)),
+            line_medians,
+            marker="_",
+            s=120,
+            color="k",
+            linewidths=1.6,
+            label="line median, all doses",
+            zorder=3,
+        )
+        ax_line.axhline(0.0, color="k", lw=0.6)
+        ax_line.set_xticks(np.arange(len(line_names)))
+        ax_line.set_xticklabels(line_names, rotation=90, fontsize=6)
+        ax_line.set_xlabel("cell line, ordered by its median correlation")
+        ax_line.set_ylabel("split-half Pearson r, one dot per (drug, dose) triple")
+        ax_line.set_title(
+            f"({'ab'[row_i]}) {title}: every triple, by line, coloured by dose", fontsize=9
+        )
+        _legend(ax_line, fontsize=7)
+
+        positions = np.arange(len(palette), dtype=float)
+        for pos, (dose, color) in zip(positions, palette.items(), strict=True):
+            vals = r[finite & (doses == dose)]
+            if not vals.size:
+                continue
+            parts = ax_dose.violinplot([vals], positions=[pos], widths=0.8, showextrema=False)
+            for body in parts["bodies"]:
+                body.set_facecolor(color)
+                body.set_alpha(0.45)
+                body.set_edgecolor("none")
+            ax_dose.scatter([pos], [float(np.mean(vals))], color="k", s=28, zorder=3)
+        gene_set = "all" if column == "r" else "responder"
+        pooled = (
+            (_labels(dose_strata, "gene_set") == gene_set)
+            & (_labels(dose_strata, "weighting") == "per_triple")
+            & (_labels(dose_strata, "dose") == "all")
+        )
+        if pooled.any():
+            mean_all = float(_numeric(dose_strata, "splithalf_mean_r")[pooled][0])
+            ax_dose.axhline(
+                mean_all,
+                color="k",
+                lw=1.2,
+                linestyle="--",
+                label=f"all triples, mean {mean_all:.3f}",
+            )
+        ax_dose.axhline(0.0, color="k", lw=0.6)
+        labels = []
+        for dose in palette:
+            vals = r[finite & (doses == dose)]
+            mean_text = f"{float(np.mean(vals)):.3f}" if vals.size else "n/a"
+            labels.append(f"{dose}\nmean {mean_text}\nn={vals.size:,}")
+        ax_dose.set_xticks(positions)
+        ax_dose.set_xticklabels(labels, fontsize=7)
+        ax_dose.set_xlabel("dose level")
+        ax_dose.set_ylabel("split-half Pearson r")
+        ax_dose.set_title(f"({'cd'[row_i]}) {title}: by dose level", fontsize=9)
+        _legend(ax_dose, fontsize=7)
+
+    fig.suptitle("dose: where the replicated triples sit, and how they reproduce", fontsize=11)
     return _finish(fig, out)

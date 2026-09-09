@@ -1,8 +1,8 @@
 """Delta reproducibility ceiling: how noisy is the real Tahoe delta itself?
 
 This is rung 0 of the ladder in docs/SPEC.md: a reference every other rung reads its score
-against. Split each (line, drug) pair's replicate plates into two halves, aggregate each
-half's delta, and correlate the two halves over the declared gene panel. That split-half
+against. Split each (line, drug, dose) triple's replicate plates into two halves, aggregate
+each half's delta, and correlate the two halves over every gene. That split-half
 correlation is the delta's own test-retest reliability -- the most any predictor at rung 1
 could score against the real delta. Spearman-Brown then lifts the half-data number to the
 full-data reliability rung 1 is read against.
@@ -31,10 +31,21 @@ import pandas as pd
 #: dose-to-dose correlation, not a test-retest reliability. See decisions.md, 2026-09-01.
 CONDITION_KEYS = ("patient", "drug", "dose")
 
-#: Bumped whenever the built frame's schema or grouping changes, so a cached frame from an
-#: earlier definition resolves to a different key instead of being silently reused. The
-#: dose-pooled frame and the dose-fixed frame have the same inputs and different meanings.
-FRAME_SCHEMA = "v2-dose-fixed"
+#: Bumped whenever the built frame's schema, grouping or split rule changes, so a cached frame
+#: from an earlier definition resolves to a different key instead of being silently reused.
+#: v2 held dose fixed but split plates by ``hash(plate) % 2``, which puts a two-plate triple on
+#: one side of the split about half the time; v3 alternates over the sorted plate ids, so every
+#: replicated triple has a plate on each side. Same inputs, different meaning, different key.
+FRAME_SCHEMA = "v3-dose-fixed-alternating"
+
+#: How plates are assigned to halves, in one sentence, recorded beside every artifact that
+#: depends on it. Within each (line, drug, dose) triple the distinct plate ids are sorted and
+#: assigned alternately -- first to half 0, second to half 1, third to half 0, and so on. This
+#: is deterministic, needs no random seed, gives every replicated triple a plate in each half,
+#: and makes "equal halves" exactly "an even plate count".
+SPLIT_RULE = "plates sorted by id within each (line, drug, dose) triple, assigned alternately"
+
+DOSE_CANDIDATES = ("dose", "Dose", "drug_dose", "concentration", "dose_uM")
 
 TAHOE = "tahoebio/Tahoe-100M"
 DE = "pseudobulk_differential_expression"
@@ -96,7 +107,7 @@ def _connect(tmp: Path, memory_limit: str = "36GB", threads: int | None = None):
     return con
 
 
-def _gene_partition(n_parts: int, part: int) -> str:
+def _gene_partition(n_parts: int, part: int, alias: str = "") -> str:
     """A SQL predicate selecting one slice of the genes, or nothing when there is one slice.
 
     Partitioning by ``hash(gene_name)`` rather than by file or by row is what makes the slices
@@ -105,7 +116,7 @@ def _gene_partition(n_parts: int, part: int) -> str:
     into the whole exactly. Splitting by shard would not have that property -- a gene's rows are
     spread across shards, and per-shard variances would each be computed on a fragment.
     """
-    return "" if n_parts <= 1 else f" AND hash(gene_name) % {int(n_parts)} = {int(part)}"
+    return "" if n_parts <= 1 else f" AND hash({alias}gene_name) % {int(n_parts)} = {int(part)}"
 
 
 KEY_COLUMNS = ("patient", "drug", "gene_name", "dose")
@@ -144,7 +155,7 @@ def _compact_df(result) -> pd.DataFrame:
     return pa.Table.from_arrays(cols, names=tbl.column_names).to_pandas()
 
 
-def _drug_predicate(target_names: list[str] | None) -> tuple[str, list[object]]:
+def _drug_predicate(target_names: list[str] | None, alias: str = "") -> tuple[str, list[object]]:
     """The drug filter, and the parameters it needs — empty when every drug is admitted.
 
     Rung 0 measures at the assay's full extent: every drug with plates enough to split. The
@@ -153,7 +164,245 @@ def _drug_predicate(target_names: list[str] | None) -> tuple[str, list[object]]:
     """
     if not target_names:
         return "", []
-    return " AND drug IN (SELECT unnest(?))", [list(target_names)]
+    return f" AND {alias}drug IN (SELECT unnest(?))", [list(target_names)]
+
+
+def _pool_columns(con, paths: list[str], repl_col: str | None) -> tuple[list[str], str, str]:
+    """The pool's column names, and the replicate and dose columns resolved against them."""
+    schema = con.execute("DESCRIBE SELECT * FROM read_parquet(?) LIMIT 0", [paths]).df()
+    cols = list(schema["column_name"])
+    candidates = ([repl_col] if repl_col else []) + list(REPL_CANDIDATES)
+    repl = next((c for c in candidates if c in cols), None)
+    if repl is None:
+        raise SystemExit(f"no replicate column in {cols}; pass --replicate-col")
+    dose = next((c for c in DOSE_CANDIDATES if c in cols), None)
+    if dose is None:
+        raise SystemExit(
+            f"no dose column in {cols}. Dose is part of the condition key: on this screen it is "
+            "confounded with plate, so pooling it would compare different doses across the two "
+            "halves. Pass a pool that carries one, or change the design."
+        )
+    return cols, repl, dose
+
+
+def split_assignment(
+    paths: list[str],
+    target_names: list[str] | None,
+    repl_col: str | None,
+    tmp: Path,
+    memory_limit: str = "36GB",
+    threads: int | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, str]:
+    """Which half every plate of every (line, drug, dose) triple belongs to, and the pool's shape.
+
+    One scan over the key columns alone -- about a quarter of an hour on the real screen -- and
+    the split is then an explicit, committed table rather than a hash function evaluated inside
+    the aggregations. ``SPLIT_RULE`` says how: plates sorted by id within a triple, assigned
+    alternately. Under that rule a triple with two plates always has one on each side, which
+    the hash split gave only when the two plate ids happened to hash to different parities.
+
+    Returns ``(assignment, pool, replicate_col)``. ``assignment`` has one row per (triple, plate)
+    with its ``half``; ``pool`` has one row per triple with the plate counts per half, the
+    equal-halves flag (``n_plates_half0 == n_plates_half1``, which is the exact condition
+    Spearman-Brown's correction assumes), and the share of rows DESeq2 could not test.
+    """
+    con = _connect(tmp, memory_limit, threads)
+    cols, repl, dose = _pool_columns(con, paths, repl_col)
+    untestable = (
+        "avg(CASE WHEN baseMean = 0 THEN 1.0 ELSE 0.0 END)" if "baseMean" in cols else "NULL"
+    )
+    where, drug_params = _drug_predicate(target_names)
+    con.execute(
+        f"""CREATE OR REPLACE TEMP TABLE plate_keys AS
+            SELECT Cell_ID_DepMap AS patient, drug, {dose} AS dose, {repl} AS plate,
+                   count(*) AS n_rows, {untestable} AS frac_untestable
+            FROM read_parquet(?)
+            WHERE {repl} IS NOT NULL{where}
+            GROUP BY 1, 2, 3, 4""",
+        [paths, *drug_params],
+    )
+    assignment = con.execute(
+        """SELECT patient, drug, dose, plate,
+                  (row_number() OVER (PARTITION BY patient, drug, dose ORDER BY plate) - 1) % 2
+                    AS half,
+                  n_rows, frac_untestable
+           FROM plate_keys ORDER BY patient, drug, dose, plate"""
+    ).df()
+    pool = con.execute(
+        """SELECT patient, drug, dose,
+                  sum(n_rows) AS n_rows,
+                  count(*) AS n_plates,
+                  count(*) FILTER (WHERE half = 0) AS n_plates_half0,
+                  count(*) FILTER (WHERE half = 1) AS n_plates_half1,
+                  count(*) FILTER (WHERE half = 0) = count(*) FILTER (WHERE half = 1)
+                    AS n_plates_even,
+                  sum(frac_untestable * n_rows) / sum(n_rows) AS frac_untestable
+           FROM (SELECT *,
+                        (row_number() OVER (PARTITION BY patient, drug, dose ORDER BY plate) - 1)
+                          % 2 AS half
+                 FROM plate_keys)
+           GROUP BY patient, drug, dose ORDER BY patient, drug, dose"""
+    ).df()
+    assignment["half"] = assignment["half"].astype(int)
+    pool["n_rows"] = pool["n_rows"].astype(int)
+    for c in ("n_plates", "n_plates_half0", "n_plates_half1"):
+        pool[c] = pool[c].astype(int)
+    pool["n_plates_even"] = pool["n_plates_even"].astype(bool)
+    return assignment, pool, repl
+
+
+ASSIGNMENT_FILE = "assignment.parquet"
+POOL_FILE = "pool.parquet"
+ASSIGNMENT_SIDECAR = "assignment.json"
+
+
+def write_assignment(
+    cache_dir: Path, assignment: pd.DataFrame, pool: pd.DataFrame, repl: str
+) -> Path:
+    """Cache the split so every slice joins against the same table."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    assignment.to_parquet(cache_dir / ASSIGNMENT_FILE, index=False)
+    pool.to_parquet(cache_dir / POOL_FILE, index=False)
+    (cache_dir / ASSIGNMENT_SIDECAR).write_text(
+        json.dumps({"replicate_col": repl, "split_rule": SPLIT_RULE, "schema": FRAME_SCHEMA}) + "\n"
+    )
+    return cache_dir / ASSIGNMENT_FILE
+
+
+def read_assignment(cache_dir: Path) -> tuple[Path, pd.DataFrame, str]:
+    """The cached split: its parquet path for joins, the pool table, and the replicate column."""
+    side = cache_dir / ASSIGNMENT_SIDECAR
+    if not (cache_dir / ASSIGNMENT_FILE).exists() or not side.exists():
+        raise SystemExit(
+            f"no split assignment in {cache_dir}: run the assign stage first "
+            "(--stage assign), so every slice joins the same split"
+        )
+    meta = json.loads(side.read_text())
+    if meta.get("schema") != FRAME_SCHEMA:
+        raise SystemExit(
+            f"the split in {cache_dir} was made under schema {meta.get('schema')!r}, this code "
+            f"is {FRAME_SCHEMA!r}; rerun the assign stage rather than mixing the two"
+        )
+    return (
+        cache_dir / ASSIGNMENT_FILE,
+        pd.read_parquet(cache_dir / POOL_FILE),
+        str(meta["replicate_col"]),
+    )
+
+
+def _ensure_assignment(
+    paths: list[str],
+    target_names: list[str] | None,
+    repl_col: str | None,
+    tmp: Path,
+    memory_limit: str,
+    threads: int | None,
+    assignment: Path | None,
+) -> Path:
+    """The assignment parquet to join against, building it under ``tmp`` when none is given."""
+    if assignment is not None:
+        return assignment
+    a, pool, repl = split_assignment(paths, target_names, repl_col, tmp, memory_limit, threads)
+    return write_assignment(tmp / "split", a, pool, repl)
+
+
+#: What one slice's aggregate carries, per (line, drug, dose, gene). The two consumers read
+#: different subsets: the reliabilities take the half means and the first group's p-values,
+#: the decomposition takes the variance across plates and the mean squared standard error.
+SLICE_FRAME_COLUMNS = ("patient", "drug", "dose", "gene_name", "lfc0", "lfc1", "padj0", "padj1")
+SLICE_NOISE_COLUMNS = (
+    "patient",
+    "drug",
+    "dose",
+    "gene_name",
+    "var_lfc",
+    "mean_se2",
+    "n_plates",
+    "base_mean",
+    "mean_lfc",
+    "padj0",
+)
+
+
+def slice_aggregate(
+    paths: list[str],
+    target_names: list[str] | None,
+    repl_col: str | None,
+    tmp: Path,
+    memory_limit: str = "36GB",
+    *,
+    assignment: Path,
+    n_parts: int = 1,
+    part: int = 0,
+    threads: int | None = None,
+) -> tuple[pd.DataFrame, str]:
+    """One slice of the genes, aggregated once for both the reliabilities and the decomposition.
+
+    Reading the table is the entire cost -- every slice scans all four billion rows and keeps
+    the genes whose hash lands in it -- so the split-half means and the across-plate variance
+    come out of ONE group-by rather than two scans. Both group by exactly (line, drug, dose,
+    gene), so nothing is lost by sharing the pass.
+
+    Plates reach their halves through the cached assignment (``split_assignment``), joined on
+    the full plate key. The join is against a table of a few tens of thousands of rows and costs
+    nothing against the scan.
+
+    ``padj0`` is the MINIMUM adjusted p-value over the FIRST half's rows -- the selection rule's
+    own aggregate, one-sided so that selecting on the half a correlation is scored against
+    cannot inflate it. ``padj1`` exists for the overlap diagnostic alone.
+
+    Groups are returned when they have a fold change in both halves (a scoreable gene) or at
+    least two distinct plates (a decomposable gene); the callers take their own subset with
+    ``frame_from_slice`` and ``noise_from_slice``.
+    """
+    con = _connect(tmp, memory_limit, threads)
+    cols, repl, dose = _pool_columns(con, paths, repl_col)
+    padj0 = "min(t.padj) FILTER (WHERE h.half = 0)" if "padj" in cols else "CAST(NULL AS DOUBLE)"
+    padj1 = "min(t.padj) FILTER (WHERE h.half = 1)" if "padj" in cols else "CAST(NULL AS DOUBLE)"
+    se2 = "avg(t.lfcSE * t.lfcSE)" if "lfcSE" in cols else "CAST(NULL AS DOUBLE)"
+    base = "avg(t.baseMean)" if "baseMean" in cols else "CAST(NULL AS DOUBLE)"
+    if "padj" not in cols:
+        print("no padj column in the pool: responder selection is unavailable for this run")
+    if "lfcSE" not in cols:
+        print("no lfcSE column in the pool: the noise decomposition is unavailable for this run")
+    where, drug_params = _drug_predicate(target_names, alias="t.")
+    agg = con.execute(
+        f"""SELECT t.Cell_ID_DepMap AS patient, t.drug, t.{dose} AS dose, t.gene_name,
+                   avg(t.log2FoldChange) FILTER (WHERE h.half = 0) AS lfc0,
+                   avg(t.log2FoldChange) FILTER (WHERE h.half = 1) AS lfc1,
+                   count(t.log2FoldChange) FILTER (WHERE h.half = 0) AS n0,
+                   count(t.log2FoldChange) FILTER (WHERE h.half = 1) AS n1,
+                   {padj0} AS padj0,
+                   {padj1} AS padj1,
+                   var_samp(t.log2FoldChange) AS var_lfc,
+                   {se2} AS mean_se2,
+                   count(DISTINCT t.{repl}) AS n_plates,
+                   {base} AS base_mean,
+                   avg(t.log2FoldChange) AS mean_lfc
+            FROM read_parquet(?) t
+            JOIN read_parquet(?) h
+              ON t.Cell_ID_DepMap = h.patient AND t.drug = h.drug
+             AND t.{dose} = h.dose AND t.{repl} = h.plate
+            WHERE t.{repl} IS NOT NULL{where}{_gene_partition(n_parts, part, alias="t.")}
+            GROUP BY 1, 2, 3, 4
+            HAVING (count(t.log2FoldChange) FILTER (WHERE h.half = 0) > 0
+                    AND count(t.log2FoldChange) FILTER (WHERE h.half = 1) > 0)
+                OR count(DISTINCT t.{repl}) >= 2""",
+        [paths, str(assignment), *drug_params],
+    )
+    return _compact_df(agg), repl
+
+
+def frame_from_slice(agg: pd.DataFrame) -> pd.DataFrame:
+    """The split-half frame: gene-conditions with a fold change in BOTH halves."""
+    both = (agg["n0"].to_numpy() > 0) & (agg["n1"].to_numpy() > 0)
+    return agg.loc[both, list(SLICE_FRAME_COLUMNS)].reset_index(drop=True)
+
+
+def noise_from_slice(agg: pd.DataFrame) -> pd.DataFrame:
+    """The decomposition's rows: gene-conditions with at least two plates, decomposed."""
+    two = agg["n_plates"].to_numpy() >= 2
+    return decompose_noise(agg.loc[two, list(SLICE_NOISE_COLUMNS)].reset_index(drop=True))
 
 
 def build_split_half_frame(
@@ -162,388 +411,41 @@ def build_split_half_frame(
     repl_col: str | None,
     tmp: Path,
     memory_limit: str = "36GB",
+    *,
+    assignment: Path | None = None,
+    n_parts: int = 1,
+    threads: int | None = None,
 ) -> tuple[pd.DataFrame, str]:
-    """Per (line, drug, gene), the mean log2FoldChange in each of two plate halves, via DuckDB.
+    """Per (line, drug, dose, gene), the mean log2FoldChange in each plate half, via DuckDB.
 
-    Splits plates by ``hash(repl_col) % 2`` (deterministic, no RNG) and aggregates each half
-    IN-ENGINE, so raw rows are never materialized. Returns the long frame plus the chosen
-    replicate column.
+    The in-process form: every slice is built here, one after another, and concatenated. The
+    cluster runs the slices as a job array and concatenates them in the combine stage; the
+    arithmetic is the same, which ``test_partitioned_frame_equals_one_pass`` pins.
 
-    ``target_names`` of ``None`` or empty admits every drug in the pool.
-
-    Only (line, drug, gene) groups with a fold change in BOTH halves are returned. That is
-    exactly what every caller's ``dropna(subset=["lfc0", "lfc1"])`` does next, moved into the
-    engine because it is not a small filter here: DESeq2 could not test 59 percent of this
-    screen's rows (``baseMean`` zero, so a null fold change), and doing the drop in pandas means
-    materialising 1.42 billion rows to keep a fraction of them. The semantics are unchanged --
-    a group kept by one is kept by the other.
-
-    The frame also carries ``padj0``: the MINIMUM Benjamini-Hochberg adjusted p-value over the
-    FIRST group's (plate, dose) rows. The minimum is what the selection rule asks for -- a gene
-    is a responder when the first group called it differentially expressed in at least one of
-    its rows -- and it is deliberately one-sided: nothing here aggregates the second group's
-    adjusted p-values, because selecting on the half a correlation is scored against inflates
-    that correlation by winner's curse. ``min`` skips nulls, so a gene DESeq2 could not test
-    comes back null and falls out by the same finiteness rule that governs the fold changes.
+    Only groups with a fold change in BOTH halves are returned. That is what every caller's
+    ``dropna(subset=["lfc0", "lfc1"])`` does next, moved into the engine because at full extent
+    it is not a small filter: DESeq2 could not test 59 percent of the screen's rows.
     """
-    con = _connect(tmp, memory_limit)
-    schema = con.execute("DESCRIBE SELECT * FROM read_parquet(?) LIMIT 0", [paths]).df()
-    cols = list(schema["column_name"])
-    print(f"DE columns: {cols}")
-    candidates = ([repl_col] if repl_col else []) + list(REPL_CANDIDATES)
-    chosen = next((c for c in candidates if c in cols), None)
-    if chosen is None:
-        raise SystemExit(f"no replicate column in {cols}; pass --replicate-col")
-    print(f"splitting plates by hash({chosen}) % 2")
-    where, drug_params = _drug_predicate(target_names)
-    # FILTER attaches only to an aggregate call, so the no-padj fallback has to replace the whole
-    # expression rather than just the function -- `CAST(NULL AS DOUBLE) FILTER (...)` is a parse
-    # error, not a null column.
-    if "padj" in cols:
-        padj = f"min(padj) FILTER (WHERE hash({chosen}) % 2 = 0)"
-        # padj1 is the SECOND group's minimum, and it exists for exactly one purpose: the
-        # overlap diagnostic the design's select step declares, which shows how much the two
-        # groups' responder sets agree. It is never an input to selection -- `responder_mask`
-        # takes only padj0 and has no parameter that could admit this column, and a control
-        # asserts that. Carrying it makes the diagnostic possible; using it for selection would
-        # be the winner's curse the one-sided rule exists to avoid.
-        padj1 = f"min(padj) FILTER (WHERE hash({chosen}) % 2 = 1)"
-    else:
-        padj = "CAST(NULL AS DOUBLE)"
-        padj1 = "CAST(NULL AS DOUBLE)"
-        print("no padj column in the pool: responder selection is unavailable for this run")
-    dose = next((c for c in DOSE_CANDIDATES if c in cols), None)
-    if dose is None:
-        raise SystemExit(
-            f"no dose column in {cols}. Dose is part of the condition key: on this screen it is "
-            "confounded with plate, so pooling it would compare different doses across the two "
-            "halves. Pass a pool that carries one, or change the design."
-        )
-    de = con.execute(
-        f"""SELECT Cell_ID_DepMap AS patient, drug, {dose} AS dose, gene_name,
-                   avg(log2FoldChange) FILTER (WHERE hash({chosen}) % 2 = 0) AS lfc0,
-                   avg(log2FoldChange) FILTER (WHERE hash({chosen}) % 2 = 1) AS lfc1,
-                   {padj} AS padj0,
-                   {padj1} AS padj1
-            FROM read_parquet(?)
-            WHERE {chosen} IS NOT NULL{where}
-            GROUP BY Cell_ID_DepMap, drug, {dose}, gene_name
-            HAVING count(log2FoldChange) FILTER (WHERE hash({chosen}) % 2 = 0) > 0
-               AND count(log2FoldChange) FILTER (WHERE hash({chosen}) % 2 = 1) > 0""",
-        [paths, *drug_params],
+    assignment = _ensure_assignment(
+        paths, target_names, repl_col, tmp, memory_limit, threads, assignment
     )
-    return _compact_df(de), chosen
-
-
-def _noise_select(repl: str, dose: str | None, base: str) -> tuple[str, str]:
-    """The per (line, drug, dose, gene) select list and GROUP BY the decomposition rests on."""
-    dose_sel = f"{dose} AS dose," if dose else "CAST(NULL AS DOUBLE) AS dose,"
-    dose_grp = f", {dose}" if dose else ""
-    sel = f"""SELECT Cell_ID_DepMap AS patient, drug, {dose_sel} gene_name,
-                   var_samp(log2FoldChange) AS var_lfc,
-                   avg(lfcSE * lfcSE) AS mean_se2,
-                   count(DISTINCT {repl}) AS n_plates,
-                   {base} AS base_mean,
-                   avg(log2FoldChange) AS mean_lfc,
-                   min(padj) FILTER (WHERE hash({repl}) % 2 = 0) AS padj0"""
-    grp = (
-        f"GROUP BY Cell_ID_DepMap, drug{dose_grp}, gene_name\n"
-        f"            HAVING count(DISTINCT {repl}) >= 2"
-    )
-    return sel, grp
-
-
-def _noise_setup(
-    paths: list[str], repl_col: str | None, tmp: Path, memory_limit: str, threads: int | None
-) -> tuple[object, str, str, str]:
-    """The connection and the SQL pieces every noise query shares."""
-    con = _connect(tmp, memory_limit, threads)
-    cols = list(
-        con.execute("DESCRIBE SELECT * FROM read_parquet(?) LIMIT 0", [paths]).df()["column_name"]
-    )
-    candidates = ([repl_col] if repl_col else []) + list(REPL_CANDIDATES)
-    repl = next((c for c in candidates if c in cols), None)
-    if repl is None:
-        raise SystemExit(f"no replicate column in {cols}; pass --replicate-col")
-    if "lfcSE" not in cols:
-        raise SystemExit("the pool carries no lfcSE column; the noise decomposition needs it")
-    dose = next((c for c in DOSE_CANDIDATES if c in cols), None)
-    if dose is None:
-        print(
-            "WARNING: no dose column in the pool. Grouping by (line, drug, gene) only, so a dose "
-            "effect would be charged to plate noise -- the decomposition is not interpretable."
-        )
-    base = "avg(baseMean)" if "baseMean" in cols else "CAST(NULL AS DOUBLE)"
-    sel, grp = _noise_select(repl, dose, base)
-    return con, repl, sel, grp
-
-
-def noise_slice(
-    paths: list[str],
-    target_names: list[str] | None,
-    repl_col: str | None,
-    tmp: Path,
-    memory_limit: str = "36GB",
-    n_parts: int = 1,
-    part: int = 0,
-    threads: int | None = None,
-) -> pd.DataFrame:
-    """One slice of the per (line, drug, dose, gene) noise table, decomposed.
-
-    Reading the table is what costs: a scan of the 83 GB pool takes about twenty minutes, and
-    the earlier design ran three separate aggregations over it -- overall figures, per-condition
-    figures, and a sample -- each re-scanning every slice. That is 48 scans, sixteen hours, and
-    it timed out at six. Every one of those aggregations is a summary of the SAME per
-    gene-condition rows, so this returns the rows for one slice and the caller computes all
-    three from them in memory. One scan per slice instead of three.
-
-    The slice is small even though the table is not: about 11 million rows at sixteen slices,
-    because the two-plate requirement drops 87% of the groups. It is the pre-filter group table,
-    not the result, that does not fit -- which is why the slicing is needed at all.
-    """
-    con, repl, sel, grp = _noise_setup(paths, repl_col, tmp, memory_limit, threads)
-    where, drug_params = _drug_predicate(target_names)
-    frame = _compact_df(
-        con.execute(
-            f"""{sel}
-            FROM read_parquet(?)
-            WHERE {repl} IS NOT NULL{where}{_gene_partition(n_parts, part)}
-            {grp}""",
-            [paths, *drug_params],
-        )
-    )
-    return decompose_noise(frame)
-
-
-def noise_partials(noise: pd.DataFrame, alpha: float) -> tuple[dict[str, float], pd.DataFrame]:
-    """Everything one slice contributes: overall sums, and per-condition sums.
-
-    Sums rather than means, because sums are what combine across slices. The slice key is part
-    of the group key, so the slices partition the gene-conditions exactly -- no overlap, no
-    omission -- and adding them gives the same answer a single pass would.
-    """
-    frac = noise["between_plate_fraction"].to_numpy(dtype=float)
-    ok = np.isfinite(frac)
-    d = noise.loc[ok].copy()
-    fr = frac[ok]
-    overall = {
-        "n": float(ok.sum()),
-        "frac": float(fr.sum()),
-        "sigma2": float(d["sigma2_plate"].to_numpy(dtype=float).sum()),
-        "se2": float(d["mean_se2"].to_numpy(dtype=float).sum()),
-        "dominated": float((fr > 0.5).sum()),
-    }
-    is_resp = np.isfinite(d["padj0"].to_numpy(dtype=float)) & (
-        d["padj0"].to_numpy(dtype=float) < alpha
-    )
-    var = d["var_lfc"].to_numpy(dtype=float)
-    per = (
-        pd.DataFrame(
-            {
-                "patient": d["patient"].to_numpy(),
-                "drug": d["drug"].to_numpy(),
-                "dose": d["dose"].to_numpy(),
-                "n_gene_doses": 1,
-                "s_frac": fr,
-                "s_var": var,
-                "s_sigma2": d["sigma2_plate"].to_numpy(dtype=float),
-                "s_se2": d["mean_se2"].to_numpy(dtype=float),
-                "s_var_resp": np.where(is_resp, var, np.nan),
-                "s_var_non": np.where(is_resp, np.nan, var),
-                "s_frac_resp": np.where(is_resp, fr, np.nan),
-                "n_responder_gene_doses": is_resp.astype(int),
-                "n_nonresponder_gene_doses": (~is_resp).astype(int),
-            }
-        )
-        .groupby(list(CONDITION_KEYS), observed=True, sort=True, dropna=False)
-        .sum(min_count=0)
-    )
-    return overall, per.reset_index()
-
-
-def combine_noise_partials(
-    totals: dict[str, float], per_condition: pd.DataFrame
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Turn accumulated sums into the reported means, once, at the end."""
-    n = max(totals["n"], 1.0)
-    overall = pd.DataFrame(
-        [
-            {
-                "n_gene_conditions": int(totals["n"]),
-                "between_plate_fraction_mean": totals["frac"] / n,
-                "sigma2_plate_mean": totals["sigma2"] / n,
-                "mean_se2_mean": totals["se2"] / n,
-                "frac_plate_dominated": totals["dominated"] / n,
-            }
-        ]
-    )
-    c = (
-        per_condition.groupby(list(CONDITION_KEYS), observed=True, sort=True, dropna=False)
-        .sum()
-        .reset_index()
-    )
-    n_c = c["n_gene_doses"].to_numpy(dtype=float)
-    n_r = c["n_responder_gene_doses"].to_numpy(dtype=float)
-    n_n = c["n_nonresponder_gene_doses"].to_numpy(dtype=float)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        by_condition = pd.DataFrame(
-            {
-                "patient": c["patient"],
-                "drug": c["drug"],
-                "dose": c["dose"],
-                "n_gene_doses": c["n_gene_doses"].astype(int),
-                "between_plate_fraction_mean": c["s_frac"].to_numpy(dtype=float) / n_c,
-                "var_lfc_mean": c["s_var"].to_numpy(dtype=float) / n_c,
-                "sigma2_plate_mean": c["s_sigma2"].to_numpy(dtype=float) / n_c,
-                "mean_se2_mean": c["s_se2"].to_numpy(dtype=float) / n_c,
-                "var_lfc_mean_responders": np.where(
-                    n_r > 0, c["s_var_resp"].to_numpy(dtype=float) / n_r, np.nan
-                ),
-                "var_lfc_mean_nonresponders": np.where(
-                    n_n > 0, c["s_var_non"].to_numpy(dtype=float) / n_n, np.nan
-                ),
-                "between_plate_fraction_mean_responders": np.where(
-                    n_r > 0, c["s_frac_resp"].to_numpy(dtype=float) / n_r, np.nan
-                ),
-                "n_responder_gene_doses": c["n_responder_gene_doses"].astype(int),
-            }
-        )
-    return overall, by_condition
-
-
-def noise_strata_from_sample(noise: pd.DataFrame) -> pd.DataFrame:
-    """The between-plate share by expression and response-size quartile, from the sample.
-
-    Computed on the bounded sample rather than on every gene-condition, and that is a deliberate
-    trade rather than a shortcut. Assigning quartiles over 1.4 billion rows means sorting them
-    twice, which is exactly what exhausted the engine's memory when this ran in SQL. A quartile
-    MEAN from a two-million-row sample has a standard error in the fourth decimal place -- far
-    inside the precision anyone reads a variance share to -- while the headline figures the
-    design promotes are still computed over every row.
-    """
-    if noise.empty:
-        return pd.DataFrame(
-            columns=[
-                "expression_quartile",
-                "response_quartile",
-                "n",
-                "between_plate_fraction_mean",
-                "base_mean_mean",
-                "abs_mean_lfc_mean",
-            ]
-        )
-    d = noise.dropna(subset=["between_plate_fraction"]).copy()
-    d["abs_lfc"] = d["mean_lfc"].abs()
-    d["expression_quartile"] = pd.qcut(
-        d["base_mean"].rank(method="first"), 4, labels=[1, 2, 3, 4]
-    ).astype(int)
-    d["response_quartile"] = pd.qcut(
-        d["abs_lfc"].rank(method="first"), 4, labels=[1, 2, 3, 4]
-    ).astype(int)
-    out = (
-        d.groupby(["expression_quartile", "response_quartile"], observed=True)
-        .agg(
-            n=("between_plate_fraction", "size"),
-            between_plate_fraction_mean=("between_plate_fraction", "mean"),
-            base_mean_mean=("base_mean", "mean"),
-            abs_mean_lfc_mean=("abs_lfc", "mean"),
-        )
-        .reset_index()
-    )
-    return out
-
-
-def noise_by_condition(
-    paths: list[str],
-    target_names: list[str] | None,
-    repl_col: str | None,
-    tmp: Path,
-    memory_limit: str = "36GB",
-    alpha: float = 0.05,
-    n_parts: int = 1,
-    threads: int | None = None,
-) -> pd.DataFrame:
-    """Per (line, drug), the noise in that condition -- and the same split by responder status.
-
-    Two of the design's four hypotheses are about noise per condition rather than noise overall:
-    that noise is higher where the correlations are lower, and that it is higher in the responder
-    genes than across all genes. Neither can be answered from a single screen-wide mean, so this
-    returns the per-condition aggregate a reader can join to the per-condition correlations, with
-    the responder split computed from the same first-half adjusted p-value the selection rule
-    uses.
-
-    Partitioned by gene like ``noise_aggregate``, and combined the same way: each slice returns
-    per-condition SUMS and counts, which add across slices to the whole. Means are taken once at
-    the end, so the result is identical to a single pass over everything.
-    """
-    con, repl, sel, grp = _noise_setup(paths, repl_col, tmp, memory_limit, threads)
-    where, drug_params = _drug_predicate(target_names)
-    partials: list[pd.DataFrame] = []
+    frames: list[pd.DataFrame] = []
+    repl = ""
     for part in range(max(1, n_parts)):
-        partials.append(
-            con.execute(
-                f"""
-                WITH g AS ({sel}
-                    FROM read_parquet(?)
-                    WHERE {repl} IS NOT NULL{where}{_gene_partition(n_parts, part)}
-                    {grp}),
-                d AS (SELECT patient, drug, dose, var_lfc, mean_se2,
-                             greatest(var_lfc - mean_se2, 0.0) AS sigma2_plate,
-                             CASE WHEN var_lfc > 0
-                                  THEN greatest(var_lfc - mean_se2, 0.0) / var_lfc END
-                               AS between_plate_fraction,
-                             (padj0 IS NOT NULL AND padj0 < {alpha}) AS is_responder
-                      FROM g)
-                SELECT patient, drug, dose,
-                       count(*) AS n_gene_doses,
-                       sum(between_plate_fraction) AS s_frac,
-                       sum(var_lfc) AS s_var,
-                       sum(sigma2_plate) AS s_sigma2,
-                       sum(mean_se2) AS s_se2,
-                       sum(CASE WHEN is_responder THEN var_lfc END) AS s_var_resp,
-                       sum(CASE WHEN NOT is_responder THEN var_lfc END) AS s_var_non,
-                       sum(CASE WHEN is_responder THEN between_plate_fraction END)
-                         AS s_frac_resp,
-                       count(*) FILTER (WHERE is_responder) AS n_responder_gene_doses,
-                       count(*) FILTER (WHERE NOT is_responder) AS n_nonresponder_gene_doses
-                FROM d WHERE between_plate_fraction IS NOT NULL
-                GROUP BY patient, drug, dose""",
-                [paths, *drug_params],
-            ).df()
+        agg, repl = slice_aggregate(
+            paths,
+            target_names,
+            repl_col,
+            tmp,
+            memory_limit,
+            assignment=assignment,
+            n_parts=n_parts,
+            part=part,
+            threads=threads,
         )
-    combined = (
-        pd.concat(partials, ignore_index=True)
-        .groupby(list(CONDITION_KEYS), observed=True, sort=True)
-        .sum()
-        .reset_index()
-    )
-    n = combined["n_gene_doses"].to_numpy(dtype=float)
-    n_resp = combined["n_responder_gene_doses"].to_numpy(dtype=float)
-    n_non = combined["n_nonresponder_gene_doses"].to_numpy(dtype=float)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        out = pd.DataFrame(
-            {
-                "patient": combined["patient"],
-                "drug": combined["drug"],
-                "dose": combined["dose"],
-                "n_gene_doses": combined["n_gene_doses"].astype(int),
-                "between_plate_fraction_mean": combined["s_frac"].to_numpy(dtype=float) / n,
-                "var_lfc_mean": combined["s_var"].to_numpy(dtype=float) / n,
-                "sigma2_plate_mean": combined["s_sigma2"].to_numpy(dtype=float) / n,
-                "mean_se2_mean": combined["s_se2"].to_numpy(dtype=float) / n,
-                "var_lfc_mean_responders": np.where(
-                    n_resp > 0, combined["s_var_resp"].to_numpy(dtype=float) / n_resp, np.nan
-                ),
-                "var_lfc_mean_nonresponders": np.where(
-                    n_non > 0, combined["s_var_non"].to_numpy(dtype=float) / n_non, np.nan
-                ),
-                "between_plate_fraction_mean_responders": np.where(
-                    n_resp > 0, combined["s_frac_resp"].to_numpy(dtype=float) / n_resp, np.nan
-                ),
-                "n_responder_gene_doses": combined["n_responder_gene_doses"].astype(int),
-            }
-        )
-    return out
+        frames.append(frame_from_slice(agg))
+    de = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
+    return _normalise_keys(de), repl
 
 
 def build_noise_frame(
@@ -555,72 +457,274 @@ def build_noise_frame(
     sample_rows: int | None = None,
     n_parts: int = 1,
     threads: int | None = None,
+    *,
+    assignment: Path | None = None,
+    seed: int = 0,
 ) -> pd.DataFrame:
-    """Per (line, drug, dose, gene) with at least two plates: the ingredients of the noise split.
+    """Per (line, drug, dose, gene) with at least two plates: the decomposition's rows.
 
     ``lfcSE`` is the standard error of ONE plate's treated-versus-control contrast -- cell
     sampling at that row's cell counts. It cannot see plate-to-plate variation, which is the
     noise a model trained on other material actually meets and the noise the split-half
     measures. Under plate offsets plus independent sampling error, the sample variance of
     ``log2FoldChange`` across a condition's plates has expectation ``sigma2_plate +
-    mean(lfcSE^2)`` -- exactly, for any set of per-plate standard errors -- so those two
-    quantities are what this returns and ``decompose_noise`` subtracts.
+    mean(lfcSE^2)`` exactly, for any set of per-plate standard errors.
 
-    **Dose is a grouping key here, not pooled.** The reliabilities pool over dose because a
-    condition means "this drug at this screen's dose design"; this aggregation cannot, because a
-    dose effect pooled into the across-plate variance would be reported as plate noise.
-
-    With ``sample_rows`` the result is a bounded sample: an equal share drawn from each gene
-    slice, which makes it a stratified sample by gene rather than a plain reservoir. That is the
-    right shape for what it feeds -- figures and per-gene checks -- and every promoted number is
-    computed over all rows by ``noise_aggregate`` regardless.
+    Dose is a grouping key, never pooled: a dose effect pooled into the across-plate variance
+    would be reported as plate noise. With ``sample_rows`` the result is a bounded sample, an
+    equal share from each gene slice.
     """
-    con, repl, sel, grp = _noise_setup(paths, repl_col, tmp, memory_limit, threads)
-    where, drug_params = _drug_predicate(target_names)
+    assignment = _ensure_assignment(
+        paths, target_names, repl_col, tmp, memory_limit, threads, assignment
+    )
     parts = max(1, n_parts)
     per_part = None if sample_rows is None else max(1, int(sample_rows) // parts)
     frames: list[pd.DataFrame] = []
     for part in range(parts):
-        limit = (
-            f"\n        USING SAMPLE reservoir({per_part} ROWS) REPEATABLE (0)" if per_part else ""
+        agg, _ = slice_aggregate(
+            paths,
+            target_names,
+            repl_col,
+            tmp,
+            memory_limit,
+            assignment=assignment,
+            n_parts=parts,
+            part=part,
+            threads=threads,
         )
-        frames.append(
-            _compact_df(
-                con.execute(
-                    f"""{sel}
-                    FROM read_parquet(?)
-                    WHERE {repl} IS NOT NULL{where}{_gene_partition(n_parts, part)}
-                    {grp}{limit}""",
-                    [paths, *drug_params],
-                )
-            )
-        )
+        noise = noise_from_slice(agg)
+        if per_part is not None and len(noise) > per_part:
+            noise = noise.sample(per_part, random_state=seed).reset_index(drop=True)
+        frames.append(noise)
     return pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
 
 
 def decompose_noise(noise: pd.DataFrame) -> pd.DataFrame:
-    """Split each delta's variance into its between-plate and within-plate parts.
+    """Each gene-condition's signed estimate of its between-plate variance.
 
-        sigma2_plate = var_samp(log2FoldChange across plates) - mean(lfcSE^2), floored at zero
+        sigma2_plate_signed = var_samp(log2FoldChange across plates) - mean(lfcSE^2)
 
-    The floor is what makes the result a variance rather than a difference: the estimator is
-    unbiased, so on data with no plate effect it lands either side of zero and half its values
-    would be negative unaided.
+    Signed, not floored. With two plates the variance across them has one degree of freedom,
+    so this per-gene difference is a very noisy estimate that lands either side of zero even
+    with no plate effect at all. Flooring each gene at zero before averaging turns that noise
+    into a positive bias: at two plates and no plate effect the floored mean is 0.48 of the
+    within-plate variance, and a third of genes report a plate component that is not there.
+    The estimate the run reports is therefore POOLED first and floored once
+    (``pooled_plate_variance``); the per-gene column is kept signed so the figures can show
+    the distribution honestly, straddling zero where there is nothing to find.
 
-    ``between_plate_fraction`` is ``sigma2_plate / var_lfc`` -- the share of a delta's
-    replicate variance that plate effects account for. Null where ``var_lfc`` is zero or
-    missing, rather than an arbitrary zero or one, since a delta with no variance at all has no
-    share to report.
+    ``between_plate_fraction_signed`` is the same difference as a share of the variance across
+    plates, null where that variance is zero or missing.
     """
     out = noise.copy()
     var = out["var_lfc"].to_numpy(dtype=float)
     se2 = out["mean_se2"].to_numpy(dtype=float)
-    sigma2 = np.maximum(var - se2, 0.0)
+    diff = var - se2
     with np.errstate(invalid="ignore", divide="ignore"):
-        frac = np.where(var > 0, sigma2 / var, np.nan)
-    out["sigma2_plate"] = sigma2
-    out["between_plate_fraction"] = frac
+        frac = np.where(var > 0, diff / var, np.nan)
+    out["sigma2_plate_signed"] = diff
+    out["between_plate_fraction_signed"] = frac
     return out
+
+
+def pooled_plate_variance(var_lfc: np.ndarray, mean_se2: np.ndarray) -> tuple[float, float, int]:
+    """The between-plate variance and its share, pooled over gene-conditions, floored ONCE.
+
+        sigma2_plate = max(mean(var_lfc) - mean(lfcSE^2), 0)
+        fraction     = sigma2_plate / mean(var_lfc)
+
+    The mean of the signed per-gene differences is an unbiased estimate of the mean plate
+    variance whatever the plate count, because expectation is linear and the floor has not
+    been applied yet. Flooring the pooled value is then a constraint on one well-estimated
+    number rather than on tens of millions of one-degree-of-freedom ones. Returns
+    ``(sigma2_plate, fraction, n)`` over the rows where both inputs are finite and the
+    variance across plates is positive; ``(nan, nan, 0)`` when there are none.
+    """
+    var = np.asarray(var_lfc, dtype=float)
+    se2 = np.asarray(mean_se2, dtype=float)
+    ok = np.isfinite(var) & (var > 0) & np.isfinite(se2)
+    if not ok.any():
+        return float("nan"), float("nan"), 0
+    mean_var = float(np.mean(var[ok]))
+    sigma2 = max(mean_var - float(np.mean(se2[ok])), 0.0)
+    return sigma2, sigma2 / mean_var, int(ok.sum())
+
+
+#: The per-condition sums one slice contributes. Sums, because sums add across slices; the
+#: means are taken once, at the end, in ``combine_noise_partials``. The responder and
+#: non-responder sums carry the squared standard errors too, so the pooled estimator can be
+#: formed for each gene set and not only for all genes together.
+NOISE_SUM_COLUMNS = (
+    "n_gene_doses",
+    "s_var",
+    "s_se2",
+    "n_responder_gene_doses",
+    "s_var_resp",
+    "s_se2_resp",
+    "n_nonresponder_gene_doses",
+    "s_var_non",
+    "s_se2_non",
+)
+
+
+def noise_partials(noise: pd.DataFrame, alpha: float) -> pd.DataFrame:
+    """Everything one slice contributes to the decomposition: per-condition sums.
+
+    The slice key is part of the group key, so the slices partition the gene-conditions
+    exactly -- no overlap, no omission -- and adding them gives the same answer a single pass
+    would. A gene-condition contributes when its variance across plates is positive and finite
+    and its squared standard error is finite; a responder is a gene the FIRST half called
+    differentially expressed, the selection rule's own reading.
+    """
+    var = noise["var_lfc"].to_numpy(dtype=float)
+    se2 = noise["mean_se2"].to_numpy(dtype=float)
+    ok = np.isfinite(var) & (var > 0) & np.isfinite(se2)
+    d = noise.loc[ok]
+    var, se2 = var[ok], se2[ok]
+    padj0 = d["padj0"].to_numpy(dtype=float)
+    is_resp = np.isfinite(padj0) & (padj0 < alpha)
+    per = (
+        pd.DataFrame(
+            {
+                "patient": d["patient"].to_numpy(),
+                "drug": d["drug"].to_numpy(),
+                "dose": d["dose"].to_numpy(),
+                "n_gene_doses": 1,
+                "s_var": var,
+                "s_se2": se2,
+                "n_responder_gene_doses": is_resp.astype(int),
+                "s_var_resp": np.where(is_resp, var, 0.0),
+                "s_se2_resp": np.where(is_resp, se2, 0.0),
+                "n_nonresponder_gene_doses": (~is_resp).astype(int),
+                "s_var_non": np.where(is_resp, 0.0, var),
+                "s_se2_non": np.where(is_resp, 0.0, se2),
+            }
+        )
+        .groupby(list(CONDITION_KEYS), observed=True, sort=True, dropna=False)
+        .sum(min_count=0)
+    )
+    return per.reset_index()
+
+
+def _pooled_from_sums(n: np.ndarray, s_var: np.ndarray, s_se2: np.ndarray):
+    """Pooled variance, plate component and share from sums, elementwise; nan where n is 0."""
+    with np.errstate(invalid="ignore", divide="ignore"):
+        var_mean = np.where(n > 0, s_var / n, np.nan)
+        se2_mean = np.where(n > 0, s_se2 / n, np.nan)
+        sigma2 = np.maximum(var_mean - se2_mean, 0.0)
+        frac = np.where(var_mean > 0, sigma2 / var_mean, np.nan)
+    return var_mean, se2_mean, sigma2, frac
+
+
+def combine_noise_partials(per_condition: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Turn accumulated sums into the reported decomposition, once, at the end.
+
+    Two weightings are reported, as the design asks: pooled over every gene-condition (a
+    condition weighs as many of its genes as DESeq2 could test), and the mean over conditions
+    of each condition's own pooled share (every condition weighs one). Where the two differ, the
+    gap is uneven gene coverage rather than anything about plates.
+    """
+    c = (
+        per_condition.groupby(list(CONDITION_KEYS), observed=True, sort=True, dropna=False)
+        .sum()
+        .reset_index()
+    )
+    by_condition = pd.DataFrame({k: c[k] for k in CONDITION_KEYS})
+    by_condition["n_gene_doses"] = c["n_gene_doses"].astype(int)
+    for suffix, n_col, v_col, s_col in (
+        ("", "n_gene_doses", "s_var", "s_se2"),
+        ("_responders", "n_responder_gene_doses", "s_var_resp", "s_se2_resp"),
+        ("_nonresponders", "n_nonresponder_gene_doses", "s_var_non", "s_se2_non"),
+    ):
+        n = c[n_col].to_numpy(dtype=float)
+        var_mean, se2_mean, sigma2, frac = _pooled_from_sums(
+            n, c[v_col].to_numpy(dtype=float), c[s_col].to_numpy(dtype=float)
+        )
+        if suffix:
+            by_condition[n_col] = c[n_col].astype(int)
+        by_condition[f"var_lfc_mean{suffix}"] = var_mean
+        by_condition[f"mean_se2_mean{suffix}"] = se2_mean
+        by_condition[f"sigma2_plate_pooled{suffix}"] = sigma2
+        by_condition[f"between_plate_fraction_pooled{suffix}"] = frac
+
+    totals = {k: float(c[k].sum()) for k in NOISE_SUM_COLUMNS}
+    overall: dict[str, float | int] = {"n_gene_conditions": int(totals["n_gene_doses"])}
+    for suffix, n_key, v_key, s_key in (
+        ("", "n_gene_doses", "s_var", "s_se2"),
+        ("_responders", "n_responder_gene_doses", "s_var_resp", "s_se2_resp"),
+        ("_nonresponders", "n_nonresponder_gene_doses", "s_var_non", "s_se2_non"),
+    ):
+        n = np.array([totals[n_key]])
+        var_mean, se2_mean, sigma2, frac = _pooled_from_sums(
+            n, np.array([totals[v_key]]), np.array([totals[s_key]])
+        )
+        if suffix:
+            overall[f"n_gene_conditions{suffix}"] = int(totals[n_key])
+        overall[f"var_lfc_mean{suffix}"] = float(var_mean[0])
+        overall[f"mean_se2_mean{suffix}"] = float(se2_mean[0])
+        overall[f"sigma2_plate_pooled{suffix}"] = float(sigma2[0])
+        overall[f"between_plate_fraction_pooled{suffix}"] = float(frac[0])
+    per_cond = by_condition["between_plate_fraction_pooled"].to_numpy(dtype=float)
+    per_cond = per_cond[np.isfinite(per_cond)]
+    overall["n_conditions_decomposed"] = int(per_cond.size)
+    overall["between_plate_fraction_pooled_over_conditions"] = (
+        float(np.mean(per_cond)) if per_cond.size else float("nan")
+    )
+    overall["frac_conditions_plate_dominated"] = (
+        float(np.mean(per_cond > 0.5)) if per_cond.size else float("nan")
+    )
+    return pd.DataFrame([overall]), by_condition
+
+
+NOISE_STRATA_COLUMNS = (
+    "expression_quartile",
+    "response_quartile",
+    "n",
+    "var_lfc_mean",
+    "mean_se2_mean",
+    "between_plate_fraction_pooled",
+    "base_mean_mean",
+    "abs_mean_lfc_mean",
+)
+
+
+def noise_strata_from_sample(noise: pd.DataFrame) -> pd.DataFrame:
+    """The between-plate share by expression and response-size quartile, from the sample.
+
+    Each stratum's share is the POOLED estimate over its rows -- the same estimator the run
+    reports overall, applied within the stratum -- not a mean of per-gene shares, which would
+    carry the per-gene truncation bias into every cell. Computed on the bounded sample rather
+    than on every gene-condition: assigning quartiles over 175 million rows means sorting them
+    twice, and a pooled share from a two-million-row sample is precise well past the third
+    decimal anyone reads it to.
+    """
+    if noise.empty:
+        return pd.DataFrame(columns=list(NOISE_STRATA_COLUMNS))
+    var = noise["var_lfc"].to_numpy(dtype=float)
+    se2 = noise["mean_se2"].to_numpy(dtype=float)
+    ok = np.isfinite(var) & (var > 0) & np.isfinite(se2)
+    d = noise.loc[ok].copy()
+    d["abs_lfc"] = d["mean_lfc"].abs()
+    d["expression_quartile"] = pd.qcut(
+        d["base_mean"].rank(method="first"), 4, labels=[1, 2, 3, 4]
+    ).astype(int)
+    d["response_quartile"] = pd.qcut(
+        d["abs_lfc"].rank(method="first"), 4, labels=[1, 2, 3, 4]
+    ).astype(int)
+    g = d.groupby(["expression_quartile", "response_quartile"], observed=True)
+    out = g.agg(
+        n=("var_lfc", "size"),
+        var_lfc_mean=("var_lfc", "mean"),
+        mean_se2_mean=("mean_se2", "mean"),
+        base_mean_mean=("base_mean", "mean"),
+        abs_mean_lfc_mean=("abs_lfc", "mean"),
+    ).reset_index()
+    sigma2 = np.maximum(
+        out["var_lfc_mean"].to_numpy(dtype=float) - out["mean_se2_mean"].to_numpy(dtype=float),
+        0.0,
+    )
+    out["between_plate_fraction_pooled"] = sigma2 / out["var_lfc_mean"].to_numpy(dtype=float)
+    return out[list(NOISE_STRATA_COLUMNS)]
 
 
 def masked_rowwise_pearson(
@@ -830,27 +934,34 @@ def per_pair_table(
     r_responder: np.ndarray | None = None,
     select: np.ndarray | None = None,
 ) -> pd.DataFrame:
-    """The result's own data: one row per candidate (line, drug) condition.
+    """The result's own data: one row per candidate (line, drug, dose) condition.
 
-    The headline row summarizes these values; committing them makes the summary re-derivable
-    anywhere -- mean, median, quartiles, positive fraction, and the effect-size terciles all
-    recompute from this table without cluster access. Columns: the split-half r whose mean is
-    the declared statistic, the pair's effect size (mean |delta| over genes finite in both
-    halves -- the same quantity ``effect_size_terciles`` stratifies on), and the shared
-    finite-gene count. Rows scored NaN (fewer than ``min_genes`` shared genes) are kept,
-    honestly NaN.
+    The summary row summarizes these values; committing them makes the summary re-derivable
+    anywhere -- mean, median, quartiles, positive fraction, the dose strata and the effect-size
+    terciles all recompute from this table without cluster access. Columns: the split-half r
+    whose mean is the declared statistic, each HALF's own mean absolute delta over the genes
+    finite in both halves, and the shared finite-gene count. Rows scored NaN (fewer than
+    ``min_genes`` shared genes) are kept, honestly NaN.
+
+    The two half magnitudes are kept separate on purpose. The effect-size control ranks
+    conditions by one half's magnitude and reads the correlation of the pair, then swaps
+    halves; ranking by the magnitude of the two halves' SUM would select conditions whose
+    halves happened to agree and make pure noise rise across the terciles.
     """
     a, b = piv0.to_numpy(dtype=float), piv1.to_numpy(dtype=float)
     ok = np.isfinite(a) & np.isfinite(b)
     n = ok.sum(axis=1)
-    mean_abs = np.where(ok, np.abs(a + b) / 2.0, 0.0).sum(axis=1) / np.maximum(n, 1)
+    denom = np.maximum(n, 1)
+    mean_abs0 = np.where(ok, np.abs(a), 0.0).sum(axis=1) / denom
+    mean_abs1 = np.where(ok, np.abs(b), 0.0).sum(axis=1) / denom
     out = pd.DataFrame(
         {
             "patient": piv0.index.get_level_values(0),
             "drug": piv0.index.get_level_values(1),
             "dose": piv0.index.get_level_values(2),
             "n_genes_scored": n,
-            "mean_abs_delta": np.round(mean_abs, 4),
+            "mean_abs_half0": np.round(mean_abs0, 4),
+            "mean_abs_half1": np.round(mean_abs1, 4),
             "r": np.round(r, 4),
         }
     )
@@ -864,6 +975,63 @@ def per_pair_table(
     return out
 
 
+def dose_strata_table(per_pair: pd.DataFrame) -> pd.DataFrame:
+    """Every candidate ceiling that can be formed from the per-condition table, side by side.
+
+    Holding dose fixed made the scoreable unit a (line, drug, dose) triple, and the screen did
+    not replicate its doses evenly, so what "the" reliability weights is a declared choice rather
+    than an arithmetic fact. This table carries the candidates so the choice is read off
+    committed numbers: each dose level on its own; all triples with equal weight (the summary
+    row's statistic); and each (line, drug) pair weighted once, its triples averaged first.
+    Within one dose level the last two coincide, so the per-pair weighting appears only for the
+    pooled row. Both gene sets, each with its count, mean, median and Spearman-Brown value.
+    """
+    rows: list[dict[str, object]] = []
+
+    def _row(dose: str, weighting: str, gene_set: str, r: np.ndarray) -> None:
+        r = r[np.isfinite(r)]
+        mean = float(np.mean(r)) if r.size else float("nan")
+        rows.append(
+            {
+                "dose": dose,
+                "weighting": weighting,
+                "gene_set": gene_set,
+                "n_pairs": int(r.size),
+                "splithalf_mean_r": round(mean, 4),
+                "splithalf_median_r": round(float(np.median(r)), 4) if r.size else float("nan"),
+                "spearman_brown_full": round(spearman_brown_or_nan(mean), 4),
+            }
+        )
+
+    gene_sets = [("all", "r")] + (
+        [("responder", "r_responder")] if "r_responder" in per_pair else []
+    )
+    for gene_set, col in gene_sets:
+        r = per_pair[col].to_numpy(dtype=float)
+        doses = per_pair["dose"].astype(str).to_numpy()
+        for dose in sorted(set(doses), key=lambda d: float(d) if _is_number(d) else d):
+            _row(dose, "per_triple", gene_set, r[doses == dose])
+        _row("all", "per_triple", gene_set, r)
+        finite = np.isfinite(r)
+        pair_means = (
+            pd.DataFrame({"patient": per_pair["patient"], "drug": per_pair["drug"], "r": r})
+            .loc[finite]
+            .groupby(["patient", "drug"], observed=True)["r"]
+            .mean()
+            .to_numpy(dtype=float)
+        )
+        _row("all", "per_line_drug", gene_set, pair_means)
+    return pd.DataFrame(rows)
+
+
+def _is_number(text: str) -> bool:
+    try:
+        float(text)
+    except ValueError:
+        return False
+    return True
+
+
 def stratified_null_draws(
     piv0: pd.DataFrame,
     piv1: pd.DataFrame,
@@ -875,9 +1043,12 @@ def stratified_null_draws(
 ) -> dict[str, np.ndarray]:
     """Mismatched-pair null correlations per stratum.
 
-    any_pair: two different pairs (continuity with the archived lineage's first run).
+    any_pair: two different conditions (continuity with the archived lineage's first run).
     diff_drug: different line AND drug -- the generic-structure floor the ceiling clears.
-    same_drug: same drug, different line -- the line-specificity floor.
+    same_drug: same drug AT THE SAME DOSE, different line -- the line-specificity floor. Dose
+    is held fixed here for the same reason it is held fixed in the condition: a same-drug pair
+    at different doses is partly a dose contrast, and the floor would then be lower than the
+    line-specificity it is meant to measure.
 
     With ``select``, a draw pairing condition *i*'s first group against condition *j*'s second
     group scores over **row i's** selected genes -- the row whose first group is used, which is
@@ -888,16 +1059,18 @@ def stratified_null_draws(
     """
     lines = piv0.index.get_level_values(0).to_numpy(dtype=str)
     drugs = piv0.index.get_level_values(1).to_numpy(dtype=str)
+    doses = piv0.index.get_level_values(2).to_numpy(dtype=str)
     n = len(piv0)
     ii, jj = np.divmod(np.arange(n * n), n)
     off = ii != jj
     ii, jj = ii[off], jj[off]
     same_drug = drugs[ii] == drugs[jj]
+    same_dose = doses[ii] == doses[jj]
     same_line = lines[ii] == lines[jj]
     strata = {
         "any_pair": np.ones(ii.size, dtype=bool),
         "diff_drug": ~same_drug & ~same_line,
-        "same_drug": same_drug & ~same_line,
+        "same_drug": same_drug & same_dose & ~same_line,
     }
     rng = np.random.default_rng(seed)
     a, b = piv0.to_numpy(dtype=float), piv1.to_numpy(dtype=float)
@@ -987,7 +1160,10 @@ def example_pair_profiles(
     ]
     anchor = _at(0.5)
     for kind, mask in (
-        ("same_drug_mismatch", (drugs == drugs[anchor]) & (lines != lines[anchor])),
+        (
+            "same_drug_mismatch",
+            (drugs == drugs[anchor]) & (doses == doses[anchor]) & (lines != lines[anchor]),
+        ),
         ("diff_drug_mismatch", (drugs != drugs[anchor]) & (lines != lines[anchor])),
     ):
         candidates = np.flatnonzero(mask)
@@ -1050,24 +1226,41 @@ def example_pair_profiles(
     return pd.concat(frames, ignore_index=True), pd.DataFrame(rows)
 
 
-def effect_size_terciles(piv0: pd.DataFrame, piv1: pd.DataFrame, r: np.ndarray) -> dict[str, float]:
-    """Split-half mean r within terciles of per-pair effect size (mean |delta|).
-
-    The empirical positive control: an assay that cannot find more reproducibility where
-    there is more signal is broken. Tercile 1 = smallest effects.
-    """
-    a, b = piv0.to_numpy(dtype=float), piv1.to_numpy(dtype=float)
-    ok = np.isfinite(a) & np.isfinite(b)
-    mean_abs = np.where(ok, np.abs(a + b) / 2.0, 0.0).sum(axis=1) / np.maximum(ok.sum(axis=1), 1)
-    finite = np.isfinite(r)
-    edges = np.quantile(mean_abs[finite], [1 / 3, 2 / 3])
-    out: dict[str, float] = {}
+def _tercile_masks(magnitude: np.ndarray, r: np.ndarray) -> list[np.ndarray]:
+    """Three boolean masks cutting the finite conditions into thirds of ``magnitude``."""
+    finite = np.isfinite(r) & np.isfinite(magnitude)
+    if not finite.any():
+        return [finite, finite, finite]
+    edges = np.quantile(magnitude[finite], [1 / 3, 2 / 3])
+    masks = []
     for t in (1, 2, 3):
         lo = -np.inf if t == 1 else edges[t - 2]
         hi = np.inf if t == 3 else edges[t - 1]
-        sel = finite & (mean_abs > lo) & (mean_abs <= hi)
-        out[f"splithalf_mean_r_tercile{t}"] = round(float(np.mean(r[sel])), 3)
-    return out
+        masks.append(finite & (magnitude > lo) & (magnitude <= hi))
+    return masks
+
+
+def effect_size_terciles(
+    per_pair: pd.DataFrame, ranked_by: str = "half0", r_col: str = "r"
+) -> dict[str, float]:
+    """Split-half mean r within terciles of ONE half's effect size (mean |delta|).
+
+    The empirical positive control: an assay that cannot find more reproducibility where there
+    is more signal is broken. Tercile 1 = smallest effects. Ranked by ``mean_abs_{ranked_by}``,
+    one half's magnitude alone. Under no signal the second half is independent of the first, so
+    conditioning on the first half's magnitude leaves the expected correlation at zero in every
+    tercile; ranking by the magnitude of the two halves' SUM does not have that property, since
+    a large sum is reached most easily when the halves agree, and pure noise would rise.
+    """
+    masks = _tercile_masks(
+        per_pair[f"mean_abs_{ranked_by}"].to_numpy(dtype=float),
+        per_pair[r_col].to_numpy(dtype=float),
+    )
+    r = per_pair[r_col].to_numpy(dtype=float)
+    return {
+        f"splithalf_mean_r_tercile{t}": round(float(np.mean(r[m])), 3) if m.any() else float("nan")
+        for t, m in zip((1, 2, 3), masks, strict=True)
+    }
 
 
 def per_gene_reliability(
@@ -1162,51 +1355,6 @@ def summarize(
     return {f"{label}_{k}" if label else k: v for k, v in out.items()}
 
 
-DOSE_CANDIDATES = ("dose", "Dose", "drug_dose", "concentration", "dose_uM")
-
-
-def pool_description(
-    paths: list[str], target_names: list[str] | None, repl: str, tmp: Path
-) -> pd.DataFrame:
-    """Measured composition of the consumed pool (design: 'measured not asserted'):
-    per (line, drug) the replicate-row count, distinct plates per half, and dose levels
-    when a dose column exists.
-
-    ``n_plates_even`` marks the conditions whose plate count splits into two equal groups.
-    Spearman-Brown assumes equal halves, and three quarters of this screen's conditions split
-    one plate against two; the corrected value is reported again over these conditions, where
-    the correction is exact, and the gap between the two is the size of the assumption.
-    """
-    con = _connect(tmp)
-    cols = list(
-        con.execute("DESCRIBE SELECT * FROM read_parquet(?) LIMIT 0", [paths]).df()["column_name"]
-    )
-    dose = next((c for c in DOSE_CANDIDATES if c in cols), None)
-    # The share of this condition's rows DESeq2 could not test (baseMean zero, so a null fold
-    # change). Measured per condition because it is large and uneven here -- 59 percent of the
-    # screen's rows overall -- and a reader comparing gene counts across conditions needs to
-    # see it rather than infer it.
-    untestable = (
-        "avg(CASE WHEN baseMean = 0 THEN 1.0 ELSE 0.0 END)" if "baseMean" in cols else "NULL"
-    )
-    where, drug_params = _drug_predicate(target_names)
-    if dose is None:
-        raise SystemExit("no dose column in the pool; dose is part of the condition key")
-    return con.execute(
-        f"""SELECT Cell_ID_DepMap AS patient, drug, {dose} AS dose,
-                   count(*) AS n_rows,
-                   count(DISTINCT {repl}) AS n_plates,
-                   count(DISTINCT {repl}) % 2 = 0 AS n_plates_even,
-                   count(DISTINCT {repl}) FILTER (WHERE hash({repl}) % 2 = 0) AS n_plates_half0,
-                   count(DISTINCT {repl}) FILTER (WHERE hash({repl}) % 2 = 1) AS n_plates_half1,
-                   {untestable} AS frac_untestable
-            FROM read_parquet(?)
-            WHERE {repl} IS NOT NULL{where}
-            GROUP BY Cell_ID_DepMap, drug, {dose} ORDER BY patient, drug, dose""",
-        [paths, *drug_params],
-    ).df()
-
-
 def write_per_gene_figure(per_gene: pd.DataFrame, out_png: Path) -> None:
     """Histogram of the per-gene split-half diagnostic (design.md, 'per-gene reliability').
 
@@ -1271,14 +1419,26 @@ def _write_params_sidecar(result_path, args_ns, extra=None) -> None:
 def frame_cache_key(paths: list[str], names: list[str] | None, replicate_col: str | None) -> str:
     """Content key for a built split-half frame: the inputs that determine it, hashed.
 
-    Naming the cache after its inputs is what makes it safe -- a different pool, drug set or
-    replicate column resolves to a different file rather than silently reusing the wrong frame.
+    Naming the cache after its inputs is what makes it safe -- a different pool, drug set,
+    replicate column or split rule resolves to a different file rather than silently reusing
+    the wrong frame. ``FRAME_SCHEMA`` is part of the payload for exactly that reason.
     """
     drug_key = ["<all drugs>"] if not names else sorted(names)
     payload = "\n".join(
         [*sorted(paths), "--", *drug_key, "--", str(replicate_col), "--", FRAME_SCHEMA]
     )
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
+def slice_paths(cache_dir: Path, key: str, n_parts: int, part: int) -> dict[str, Path]:
+    """Where one slice's three products and its completion record live in the cache."""
+    tag = f"{key}_{n_parts}_{part}"
+    return {
+        "frame": cache_dir / f"frame_{tag}.parquet",
+        "noise": cache_dir / f"noise_{tag}.parquet",
+        "sample": cache_dir / f"noise_sample_{tag}.parquet",
+        "done": cache_dir / f"slice_{tag}.json",
+    }
 
 
 def _normalise_keys(de: pd.DataFrame) -> pd.DataFrame:
@@ -1295,80 +1455,102 @@ def _normalise_keys(de: pd.DataFrame) -> pd.DataFrame:
     return de
 
 
+def _cache_dir_for(args: argparse.Namespace) -> Path:
+    """The slice cache: the one given, else ``cache/`` under the output directory."""
+    given = getattr(args, "cache_dir", None)
+    return Path(given) if given else Path(args.out_dir) / "cache"
+
+
 def _build_or_load_frame(
     paths: list[str], names: list[str] | None, args: argparse.Namespace, local: Path
 ) -> tuple[pd.DataFrame, str]:
-    """The split-half frame, from cache when one matches these inputs.
+    """The split-half frame, from the slice cache when every slice is there, else built.
 
-    Building it scans every DE shard through DuckDB and dominates the run (~40 minutes on the
-    real pool); everything after it takes about a minute. Adding an output or changing a figure
-    therefore does not need the scan repeated, so ``--frame-cache`` keeps the built frame beside
-    the data and reuses it when the inputs hash the same.
+    Building it scans every DE shard through DuckDB and dominates the run; everything after it
+    takes minutes. The cluster builds the slices as a job array (``--stage slice``) and this
+    reads them back; a local run with no slices cached builds them here, one after another, and
+    caches each, so a second local run -- adding an output, changing a figure -- skips the scan.
     """
-    cache_dir = Path(args.frame_cache) if args.frame_cache else None
-    cache = None
-    if cache_dir is not None:
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        key = frame_cache_key(paths, names, args.replicate_col)
-        cache = cache_dir / f"split_half_{key}.parquet"
-        sidecar = cache.with_suffix(".json")
-        if cache.exists() and sidecar.exists():
-            de = _normalise_keys(pd.read_parquet(cache))
-            repl = str(json.loads(sidecar.read_text())["replicate_col"])
-            print(f"loaded the split-half frame from {cache} ({len(de):,} rows, replicate {repl})")
-            return de, repl
-
-    # getattr, not attribute access: the frame-cache control constructs a minimal Namespace to
-    # exercise the cache key, and a helper that demands every CLI flag makes that test carry the
-    # whole argument list rather than the two fields it is about.
-    de, repl = build_split_half_frame(
-        paths,
-        names,
-        args.replicate_col,
-        local.parent / "duckdb_tmp",
-        getattr(args, "duckdb_memory", "36GB"),
-    )
-    if cache is not None:
-        de.to_parquet(cache, index=False)
-        cache.with_suffix(".json").write_text(json.dumps({"replicate_col": repl}) + "\n")
-        print(f"cached the split-half frame at {cache}")
+    cache_dir = _cache_dir_for(args)
+    n_parts = max(1, int(getattr(args, "slices", 1)))
+    key = frame_cache_key(paths, names, getattr(args, "replicate_col", None))
+    missing = [
+        p for p in range(n_parts) if not slice_paths(cache_dir, key, n_parts, p)["done"].exists()
+    ]
+    if not missing and (cache_dir / ASSIGNMENT_SIDECAR).exists():
+        de, _, _, repl = load_slices(cache_dir, key, n_parts)
+        print(f"loaded the split-half frame from {n_parts} cached slice(s) in {cache_dir}")
+        return de, repl
+    assignment = _ensure_cached_assignment(paths, names, args, local, cache_dir)
+    for part in range(n_parts):
+        run_slice(paths, names, args, local, cache_dir, assignment, part)
+    de, _, _, repl = load_slices(cache_dir, key, n_parts)
     return de, repl
 
 
-def effect_size_tercile_table(
-    piv0: pd.DataFrame, piv1: pd.DataFrame, r: np.ndarray, n_boot: int = 2000, seed: int = 0
-) -> pd.DataFrame:
-    """The empirical control as a table, with an interval on each tercile mean.
+def _ensure_cached_assignment(
+    paths: list[str],
+    names: list[str] | None,
+    args: argparse.Namespace,
+    local: Path,
+    cache_dir: Path,
+) -> Path:
+    """The split assignment in the cache, computed if it is not there yet."""
+    if (cache_dir / ASSIGNMENT_SIDECAR).exists():
+        path, _, _ = read_assignment(cache_dir)
+        return path
+    assignment, pool, repl = split_assignment(
+        paths,
+        names,
+        getattr(args, "replicate_col", None),
+        local.parent / "duckdb_tmp",
+        getattr(args, "duckdb_memory", "36GB"),
+        getattr(args, "duckdb_threads", None),
+    )
+    print(
+        f"split assignment: {len(pool):,} (line, drug, dose) triples, "
+        f"{int((pool['n_plates'] >= 2).sum()):,} with two or more plates; {SPLIT_RULE}"
+    )
+    return write_assignment(cache_dir, assignment, pool, repl)
 
-    ``effect_size_terciles`` returns three bare numbers, which cannot say whether a rise across
-    them is real or within noise. This carries the same three means with a bootstrap interval
-    and a count, so the figure can show the rise with its uncertainty and a reader can tell the
-    two cases apart.
+
+def effect_size_tercile_table(
+    per_pair: pd.DataFrame, n_boot: int = 2000, seed: int = 0, r_col: str = "r"
+) -> pd.DataFrame:
+    """The empirical control as a table, cross-fit, with an interval on each tercile mean.
+
+    Two rankings, one per half: conditions in thirds by the first half's magnitude, scored by
+    the correlation of the pair; then by the second half's magnitude. Both are reported and both
+    must rise. Reading either half's magnitude alone keeps the control clean under no signal
+    (see ``effect_size_terciles``); reporting both makes the asymmetry of the halves visible
+    rather than a choice. Recomputable from the committed per-condition table alone, which is
+    what lets the verification battery re-derive it.
     """
-    a, b = piv0.to_numpy(dtype=float), piv1.to_numpy(dtype=float)
-    ok = np.isfinite(a) & np.isfinite(b)
-    mean_abs = np.where(ok, np.abs(a + b) / 2.0, 0.0).sum(axis=1) / np.maximum(ok.sum(axis=1), 1)
-    finite = np.isfinite(r)
-    edges = np.quantile(mean_abs[finite], [1 / 3, 2 / 3])
     rng = np.random.default_rng(seed)
+    r = per_pair[r_col].to_numpy(dtype=float)
     rows = []
-    for t in (1, 2, 3):
-        lo = -np.inf if t == 1 else edges[t - 2]
-        hi = np.inf if t == 3 else edges[t - 1]
-        sel = finite & (mean_abs > lo) & (mean_abs <= hi)
-        vals = r[sel]
-        boot = np.array(
-            [np.mean(rng.choice(vals, size=vals.size, replace=True)) for _ in range(n_boot)]
-        )
-        rows.append(
-            {
-                "tercile": t,
-                "n": int(vals.size),
-                "mean_r": round(float(np.mean(vals)), 4),
-                "ci_lo": round(float(np.quantile(boot, 0.025)), 4),
-                "ci_hi": round(float(np.quantile(boot, 0.975)), 4),
-            }
-        )
+    for ranked_by in ("half0", "half1"):
+        masks = _tercile_masks(per_pair[f"mean_abs_{ranked_by}"].to_numpy(dtype=float), r)
+        for t, sel in zip((1, 2, 3), masks, strict=True):
+            vals = r[sel]
+            if vals.size:
+                boot = np.array(
+                    [np.mean(rng.choice(vals, size=vals.size, replace=True)) for _ in range(n_boot)]
+                )
+                lo, hi = float(np.quantile(boot, 0.025)), float(np.quantile(boot, 0.975))
+                mean = float(np.mean(vals))
+            else:
+                lo = hi = mean = float("nan")
+            rows.append(
+                {
+                    "ranked_by": ranked_by,
+                    "tercile": t,
+                    "n": int(vals.size),
+                    "mean_r": round(mean, 4),
+                    "ci_lo": round(lo, 4),
+                    "ci_hi": round(hi, 4),
+                }
+            )
     return pd.DataFrame(rows)
 
 
@@ -1471,104 +1653,133 @@ def write_audit_checksums(out_dir: Path) -> Path:
     return path
 
 
-def run_noise(
-    paths: list[str], names: list[str] | None, args: argparse.Namespace, local: Path, out_dir: Path
-) -> pd.DataFrame:
-    """The whole noise decomposition, written to ``out_dir``, returning the figure sample.
+def run_slice(
+    paths: list[str],
+    names: list[str] | None,
+    args: argparse.Namespace,
+    local: Path,
+    cache_dir: Path,
+    assignment: Path,
+    part: int,
+) -> None:
+    """One slice of the genes: aggregate once, cache the frame, the noise sums and a sample.
 
-    One scan of the pool per slice, not three. Reading the table is the entire cost -- about
-    twenty minutes for 83 GB -- and the three things reported (overall figures, per-condition
-    figures, a sample for the figures) are three summaries of the same per gene-condition rows.
-    An earlier version ran them as three separate aggregations, which meant 48 scans and a
-    six-hour timeout after finishing only the first sixteen.
-
-    Each slice's contribution is cached as it completes. A slice is twenty minutes of work whose
-    result is a few megabytes; losing all of them because the job ran out of wall clock is a bad
-    trade, and with the cache a rerun continues instead of restarting.
+    The cluster runs this as one task of a job array, sixteen at a time on sixteen nodes, so
+    the wall clock is one scan rather than sixteen in a row and each task holds a sixteenth of
+    the group table. A finished slice is recorded by its completion file, written last, so a
+    task killed mid-write leaves no half-slice that a later combine could mistake for a whole
+    one; a rerun skips the slices that finished.
     """
-    tmp = local.parent / "duckdb_tmp"
-    parts = max(1, args.noise_partitions)
-    cache_dir = Path(args.noise_cache) if args.noise_cache else out_dir / "noise_slices"
+    n_parts = max(1, int(getattr(args, "slices", 1)))
+    key = frame_cache_key(paths, names, getattr(args, "replicate_col", None))
+    files = slice_paths(cache_dir, key, n_parts, part)
+    if files["done"].exists():
+        print(f"  slice {part + 1}/{n_parts}: already cached, skipping")
+        return
+    agg, repl = slice_aggregate(
+        paths,
+        names,
+        getattr(args, "replicate_col", None),
+        local.parent / "duckdb_tmp",
+        getattr(args, "duckdb_memory", "36GB"),
+        assignment=assignment,
+        n_parts=n_parts,
+        part=part,
+        threads=getattr(args, "duckdb_threads", None),
+    )
+    frame = frame_from_slice(agg)
+    noise = noise_from_slice(agg)
+    del agg
+    per = noise_partials(noise, float(getattr(args, "padj_threshold", 0.05)))
+    per_slice_sample = max(1, int(getattr(args, "noise_sample_rows", 2_000_000)) // n_parts)
+    seed = int(getattr(args, "seed", 0))
+    sample = noise.sample(min(per_slice_sample, len(noise)), random_state=seed).reset_index(
+        drop=True
+    )
     cache_dir.mkdir(parents=True, exist_ok=True)
-    per_slice_sample = max(1, args.noise_sample_rows // parts)
-
-    totals = {"n": 0.0, "frac": 0.0, "sigma2": 0.0, "se2": 0.0, "dominated": 0.0}
-    per_frames: list[pd.DataFrame] = []
-    samples: list[pd.DataFrame] = []
-    for part in range(parts):
-        tag = f"{FRAME_SCHEMA}_{parts}_{part}"
-        o_path = cache_dir / f"overall_{tag}.json"
-        c_path = cache_dir / f"per_condition_{tag}.parquet"
-        s_path = cache_dir / f"sample_{tag}.parquet"
-        if o_path.exists() and c_path.exists() and s_path.exists():
-            overall_part = json.loads(o_path.read_text())
-            per_frames.append(pd.read_parquet(c_path))
-            samples.append(pd.read_parquet(s_path))
-            print(f"  noise slice {part + 1}/{parts}: reused cached partial")
-        else:
-            noise = noise_slice(
-                paths,
-                names,
-                args.replicate_col,
-                tmp,
-                args.duckdb_memory,
-                n_parts=parts,
-                part=part,
-                threads=args.duckdb_threads,
-            )
-            overall_part, per = noise_partials(noise, args.padj_threshold)
-            sample = noise.sample(
-                min(per_slice_sample, len(noise)), random_state=args.seed
-            ).reset_index(drop=True)
-            o_path.write_text(json.dumps(overall_part) + "\n")
-            per.to_parquet(c_path, index=False)
-            sample.to_parquet(s_path, index=False)
-            per_frames.append(per)
-            samples.append(sample)
-            print(f"  noise slice {part + 1}/{parts}: {int(overall_part['n']):,} gene-conditions")
-        for key in totals:
-            totals[key] += float(overall_part[key])
-
-    overall, by_condition = combine_noise_partials(totals, pd.concat(per_frames, ignore_index=True))
-    noise_summary = {k: float(v) for k, v in overall.iloc[0].items()}
-    by_condition.round(6).to_csv(out_dir / "rung0_noise_by_condition.csv", index=False)
-    print(f"per-condition noise: {len(by_condition):,} dose-conditions")
-
-    # The design says the between-plate share is aggregated "over genes within a condition and
-    # over conditions". The figure above is a flat mean over gene-conditions, which weights a
-    # condition by how many of its genes were testable -- and testability varies a lot here,
-    # since DESeq2 could not test most rows. Both are reported; where they disagree, the gap is
-    # uneven gene coverage rather than anything about plates.
-    per_cond = by_condition["between_plate_fraction_mean"].to_numpy(dtype=float)
-    per_cond = per_cond[np.isfinite(per_cond)]
-    noise_summary["between_plate_fraction_mean_over_conditions"] = round(
-        float(np.mean(per_cond)), 5
-    )
-    noise_summary["n_conditions_decomposed"] = int(per_cond.size)
-
-    noise = pd.concat(samples, ignore_index=True)
-    noise.to_csv(out_dir / "rung0_noise_per_gene.csv.gz", index=False)
-    noise_strata_from_sample(noise).round(5).to_csv(out_dir / "rung0_noise_strata.csv", index=False)
-
-    # The median comes from the stratified sample. An exact median over 175 million values means
-    # sorting them; a median from a sample stratified by gene is precise well past the third
-    # decimal it is reported to. The mean beside it is exact over every row.
-    frac_sample = noise["between_plate_fraction"].to_numpy(dtype=float)
-    frac_sample = frac_sample[np.isfinite(frac_sample)]
-    noise_summary["between_plate_fraction_median_sampled"] = (
-        round(float(np.median(frac_sample)), 5) if frac_sample.size else float("nan")
-    )
-
-    noise_path = out_dir / "rung0_noise_decomposition.csv"
-    pd.DataFrame([noise_summary]).round(5).to_csv(noise_path, index=False)
-    _write_params_sidecar(noise_path, args, extra=noise_summary)
+    frame.to_parquet(files["frame"], index=False)
+    per.to_parquet(files["noise"], index=False)
+    sample.to_parquet(files["sample"], index=False)
+    record = {
+        "part": part,
+        "n_parts": n_parts,
+        "replicate_col": repl,
+        "schema": FRAME_SCHEMA,
+        "n_frame_rows": len(frame),
+        "n_noise_rows": len(noise),
+        "n_sample_rows": len(sample),
+    }
+    files["done"].write_text(json.dumps(record) + "\n")
     print(
-        "between-plate share: "
-        f"{noise_summary['between_plate_fraction_mean']:.4f} over gene-conditions, "
-        f"{noise_summary['between_plate_fraction_mean_over_conditions']:.4f} over conditions"
+        f"  slice {part + 1}/{n_parts}: {len(frame):,} scoreable gene-conditions, "
+        f"{len(noise):,} decomposable, cached in {cache_dir}"
     )
-    print(f"noise sample for figures: {len(noise):,} gene-conditions")
-    return noise
+
+
+def load_slices(
+    cache_dir: Path, key: str, n_parts: int
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
+    """Every slice's products, concatenated: frame, noise sums, sample, and the replicate column."""
+    missing = [
+        p for p in range(n_parts) if not slice_paths(cache_dir, key, n_parts, p)["done"].exists()
+    ]
+    if missing:
+        raise SystemExit(
+            f"{len(missing)} of {n_parts} slices are not in {cache_dir}: parts {missing}. "
+            "Every slice must finish before the combine stage; rerun those array indices"
+        )
+    frames, noises, samples, repl = [], [], [], ""
+    for part in range(n_parts):
+        files = slice_paths(cache_dir, key, n_parts, part)
+        repl = str(json.loads(files["done"].read_text())["replicate_col"])
+        frames.append(pd.read_parquet(files["frame"]))
+        noises.append(pd.read_parquet(files["noise"]))
+        samples.append(pd.read_parquet(files["sample"]))
+    de = _normalise_keys(pd.concat(frames, ignore_index=True))
+    return (
+        de,
+        pd.concat(noises, ignore_index=True),
+        pd.concat(samples, ignore_index=True),
+        repl,
+    )
+
+
+def write_noise_outputs(
+    per_condition: pd.DataFrame, sample: pd.DataFrame, args: argparse.Namespace, out_dir: Path
+) -> pd.DataFrame:
+    """The decomposition's tables, from the slices' sums, and the figure sample it returns.
+
+    Every promoted number here is pooled over ALL gene-conditions from the per-condition sums
+    the slices wrote; the sample is what the figures and the row-wise identity check are drawn
+    from, and no promoted claim is read from it.
+    """
+    overall, by_condition = combine_noise_partials(per_condition)
+    by_condition.round(6).to_csv(out_dir / "rung0_noise_by_condition.csv", index=False)
+    sample.to_csv(out_dir / "rung0_noise_per_gene.csv.gz", index=False)
+    noise_strata_from_sample(sample).round(5).to_csv(
+        out_dir / "rung0_noise_strata.csv", index=False
+    )
+    noise_summary = {k: (v.item() if hasattr(v, "item") else v) for k, v in overall.iloc[0].items()}
+    noise_summary["n_sample_rows"] = len(sample)
+    noise_path = out_dir / "rung0_noise_decomposition.csv"
+    pd.DataFrame([noise_summary]).round(6).to_csv(noise_path, index=False)
+    _write_params_sidecar(
+        noise_path,
+        args,
+        extra={
+            **noise_summary,
+            "estimator": "pooled: max(mean(var_lfc) - mean(lfcSE^2), 0), floored once after "
+            "averaging over gene-conditions, never per gene",
+            "split_rule": SPLIT_RULE,
+        },
+    )
+    print(
+        f"per-condition noise: {len(by_condition):,} dose-conditions; between-plate share "
+        f"{noise_summary['between_plate_fraction_pooled']:.4f} pooled over gene-conditions, "
+        f"{noise_summary['between_plate_fraction_pooled_over_conditions']:.4f} over conditions, "
+        f"responders {noise_summary['between_plate_fraction_pooled_responders']:.4f}"
+    )
+    return sample
 
 
 def main() -> None:
@@ -1599,11 +1810,30 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out-dir", default="rung0_outputs")
     ap.add_argument(
-        "--frame-cache",
+        "--stage",
+        choices=("all", "assign", "slice", "combine"),
+        default="all",
+        help="which part of the run to do. The scan over the table is the whole cost, so on "
+        "the cluster it is split three ways: `assign` scans the key columns once and writes the "
+        "plate-to-half assignment; `slice` (one job-array task per --slice-index) scans the "
+        "table once for its slice of the genes and caches that slice's frame and noise sums; "
+        "`combine` reads every cached slice and does everything that needs the whole frame at "
+        "once. `all` does the three in one process, which is how the fixture runs go.",
+    )
+    ap.add_argument(
+        "--slices",
+        type=int,
+        default=1,
+        help="how many slices of the GENES the scan is split into. The combination is exact: "
+        "gene is part of every group key, so each gene-condition lands in exactly one slice "
+        "and per-slice frames concatenate and per-slice sums add.",
+    )
+    ap.add_argument("--slice-index", type=int, default=None, help="which slice, for --stage slice")
+    ap.add_argument(
+        "--cache-dir",
         default=None,
-        help="directory holding the built split-half frame, keyed by a hash of the inputs. "
-        "The build scans every DE shard and dominates the run; with a cache, adding an output "
-        "or changing a figure reruns in about a minute instead of repeating the scan.",
+        help="directory holding the split assignment and every slice's cached products, keyed "
+        "by a hash of the inputs. Default: cache/ under --out-dir.",
     )
     ap.add_argument(
         "--duckdb-memory",
@@ -1611,36 +1841,6 @@ def main() -> None:
         help="DuckDB's memory_limit. The engine spills to --local-dir's parent when it runs "
         "out, so a value below the job's allocation trades speed for safety; set it well under "
         "the SBATCH --mem so the returned pandas frames still have room.",
-    )
-    ap.add_argument(
-        "--noise-sample-rows",
-        type=int,
-        default=2_000_000,
-        help="rows of the per-gene noise table to keep for the figures and the row-wise "
-        "identity check. Every reported number is aggregated over all rows in the engine; this "
-        "only bounds what comes back.",
-    )
-    ap.add_argument(
-        "--skip-noise",
-        action="store_true",
-        help="do not compute the noise decomposition; read what an earlier --only-noise pass "
-        "wrote into --out-dir, so the figures still show it",
-    )
-    ap.add_argument(
-        "--noise-cache",
-        default=None,
-        help="directory holding each noise slice's partial result. A slice is about twenty "
-        "minutes of work and a few megabytes of output; caching them means a rerun continues "
-        "rather than restarting, and a job that runs out of wall clock loses one slice.",
-    )
-    ap.add_argument(
-        "--noise-partitions",
-        type=int,
-        default=1,
-        help="split the noise decomposition into this many slices of the GENES and combine the "
-        "slices. The combination is exact -- the slice key is part of the group key, so every "
-        "gene-condition lands in exactly one slice and per-slice sums add. Needed at full "
-        "extent, where the single-slice group table did not fit at 140 GB.",
     )
     ap.add_argument(
         "--duckdb-threads",
@@ -1651,11 +1851,12 @@ def main() -> None:
         "group-bys.",
     )
     ap.add_argument(
-        "--only-noise",
-        action="store_true",
-        help="compute ONLY the noise decomposition and exit. It groups four billion rows into "
-        "roughly one and a half billion and needs most of the machine to do it; sharing an "
-        "allocation with the reliability pass exhausted memory twice, once on each side.",
+        "--noise-sample-rows",
+        type=int,
+        default=2_000_000,
+        help="rows of the per-gene noise table to keep for the figures and the row-wise "
+        "identity check, spread equally over the slices. Every reported number is pooled over "
+        "all rows from the slices' sums; this only bounds what is committed.",
     )
     args = ap.parse_args()
     repo = Path(__file__).resolve().parent.parent
@@ -1670,19 +1871,39 @@ def main() -> None:
     print(f"{scope}; reading {len(paths)} DE parquet files ...")
 
     out_dir = Path(args.out_dir) if Path(args.out_dir).is_absolute() else repo / args.out_dir
+    args.out_dir = str(out_dir)
     fig_dir = out_dir / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir = _cache_dir_for(args)
+    n_parts = max(1, int(args.slices))
+    key = frame_cache_key(paths, names, args.replicate_col)
 
-    if args.only_noise:
-        run_noise(paths, names, args, local, out_dir)
+    # --- assign: the split, as a table ------------------------------------------------------
+    if args.stage in ("assign", "all"):
+        _ensure_cached_assignment(paths, names, args, local, cache_dir)
+        _write_split_tables(cache_dir, out_dir)
+        if args.stage == "assign":
+            return
+
+    # --- slice: one job-array task ------------------------------------------------------------
+    if args.stage == "slice":
+        if args.slice_index is None:
+            raise SystemExit("--stage slice needs --slice-index (the job array's task id)")
+        assignment, _, _ = read_assignment(cache_dir)
+        run_slice(paths, names, args, local, cache_dir, assignment, int(args.slice_index))
         return
+    if args.stage == "all":
+        assignment, _, _ = read_assignment(cache_dir)
+        for part in range(n_parts):
+            run_slice(paths, names, args, local, cache_dir, assignment, part)
 
-    de, repl = _build_or_load_frame(paths, names, args, local)
-    n_rows_built = len(de)
-    de = de.dropna(subset=["lfc0", "lfc1"])
+    # --- combine: everything that needs the whole frame ---------------------------------------
+    _, pool, _ = read_assignment(cache_dir)
+    _write_split_tables(cache_dir, out_dir)
+    de, per_condition, noise_sample, repl = load_slices(cache_dir, key, n_parts)
     if de.empty:
-        raise SystemExit("no (line, drug, gene) had both plate halves -- too few plates per pair?")
-    print(f"built {n_rows_built:,} rows; {len(de):,} have both plate halves")
+        raise SystemExit("no (line, drug, dose, gene) had both plate halves -- too few plates?")
+    print(f"{len(de):,} gene-conditions have both plate halves")
 
     # Rung 0 scores every gene the table carries. --panel-file exists for a later rung asking
     # for a restriction of this ceiling; it is not passed here, and there is deliberately no
@@ -1701,15 +1922,13 @@ def main() -> None:
     # --- score, both gene sets -------------------------------------------------------------
     r_all, piv0, piv1 = score_split_half(de, panel, min_genes=args.min_genes)
     if not np.any(np.isfinite(r_all)):
-        raise SystemExit("no (line, drug) pair had enough shared genes to score")
+        raise SystemExit("no (line, drug, dose) condition had enough shared genes to score")
     padj = padj_pivot(de, panel).reindex(columns=piv0.columns).loc[piv0.index]
     select = responder_mask(padj, alpha=args.padj_threshold)
 
     # Everything that still needs the long frame is done HERE, before the null draws, and then
-    # the frame is released. At this screen's size it is 451 million rows and the null step
-    # allocates arrays quadratic in the condition count on top of it -- holding both put the
-    # first attempt at 178 GB of a 200 GB allocation. Nothing about the numbers changes; the
-    # frame is simply not alive during the step that needs the room.
+    # the frame is released. At this screen's size it is hundreds of millions of rows and the
+    # null step allocates arrays quadratic in the condition count on top of it.
     overlap = responder_overlap_table(de, panel, alpha=args.padj_threshold)
     overlap.to_csv(out_dir / "rung0_responder_overlap.csv", index=False)
     stride = max(1, len(de) // 200_000)
@@ -1735,9 +1954,8 @@ def main() -> None:
     )
 
     # --- pool composition, and the equal-halves subset ---------------------------------------
-    pool = pool_description(paths, names, repl, local.parent / "duckdb_tmp")
-    # Joined on the full condition key, dose included. The pool description is keyed the same
-    # way, so a stale two-part key here would silently mark the wrong conditions as equal-half.
+    # Joined on the full condition key, dose included. The pool table is keyed the same way, so
+    # a stale two-part key here would silently mark the wrong conditions as equal-half.
     even_by_key = {
         (str(p), str(d), str(x)): bool(v)
         for p, d, x, v in zip(
@@ -1778,8 +1996,12 @@ def main() -> None:
             "responder_n_pairs": summary["responder_n_pairs"],
             "selection_rule": "padj < threshold in at least one of the first plate group's rows",
             "gene_inclusion": "every gene the table carries",
-            "drug_inclusion": "every drug with at least two distinct plates",
-            "dose_handling": "pooled for the reliabilities, held fixed for the decomposition",
+            "drug_inclusion": "every drug with a (line, drug, dose) triple on two or more plates",
+            "dose_handling": "held fixed: a condition is a (line, drug, dose) triple and the "
+            "split is between that triple's plates",
+            "split_rule": SPLIT_RULE,
+            "weighting": "every scored triple weighs one; the dose strata and the per-pair "
+            "weighting are in rung0_dose_strata.csv",
         },
     )
 
@@ -1787,6 +2009,8 @@ def main() -> None:
     per_pair = per_pair_table(piv0, piv1, r_all, r_responder=r_resp, select=select)
     per_pair["n_plates_even"] = even_mask
     per_pair.to_csv(out_dir / "rung0_per_pair_r.csv", index=False)
+    dose_strata = dose_strata_table(per_pair)
+    dose_strata.to_csv(out_dir / "rung0_dose_strata.csv", index=False)
 
     null_rows = [
         null_draw_table(nulls_all).assign(gene_set="all"),
@@ -1798,7 +2022,7 @@ def main() -> None:
     profiles.to_csv(out_dir / "rung0_example_pair_profiles.csv.gz", index=False)
     profile_index.to_csv(out_dir / "rung0_example_pair_index.csv", index=False)
 
-    terciles = effect_size_tercile_table(piv0, piv1, r_all, seed=args.seed)
+    terciles = effect_size_tercile_table(per_pair, seed=args.seed)
     terciles.to_csv(out_dir / "rung0_effect_terciles.csv", index=False)
 
     mde_curve = mde_curve_table(r_all, r_resp, nulls_all, nulls_resp, seed=args.seed)
@@ -1810,20 +2034,9 @@ def main() -> None:
 
     per_gene = per_gene_reliability(piv0, piv1)
     per_gene.to_csv(out_dir / "rung0_per_gene_reliability.csv", index=False)
-    pool.to_csv(out_dir / "rung0_pool_description.csv", index=False)
 
-    # --- the noise decomposition -------------------------------------------------------------
-    sample_path = out_dir / "rung0_noise_per_gene.csv.gz"
-    if args.skip_noise:
-        # The noise phase runs as its own process; read what it wrote, so the figures below are
-        # drawn from the same tables a reader opens rather than from a second computation.
-        noise = pd.read_csv(sample_path) if sample_path.exists() else pd.DataFrame()
-        if noise.empty:
-            print("no noise tables present: the decompose figure will be skipped")
-        else:
-            print(f"read the noise sample written by the --only-noise pass: {len(noise):,} rows")
-    else:
-        noise = run_noise(paths, names, args, local, out_dir)
+    # --- the noise decomposition, from the slices' sums --------------------------------------
+    noise = write_noise_outputs(per_condition, noise_sample, args, out_dir)
 
     # --- figures -------------------------------------------------------------------------------
     from fmharness import figures as fg
@@ -1854,13 +2067,19 @@ def main() -> None:
         profiles, profile_index, per_pair, control_per_pair, summary, fig_dir / "04_score.png"
     )
     if not noise.empty:
-        control_noise = decompose_noise(planted_noise_frame(seed=args.seed))
+        # The control pool plants a plate component of variance 0.25 on sampling variance
+        # 0.25 at two plates -- the real screen's regime -- so the pooled estimator has a
+        # known answer of 0.5 to recover, and the per-gene panel shows what the one-degree-of-
+        # freedom spread looks like when the truth is known.
+        control_noise = decompose_noise(planted_noise_frame(n_plates=2, seed=args.seed))
         control_noise.to_csv(out_dir / "rung0_control_noise.csv.gz", index=False)
-        fg.fig_decompose(noise, control_noise, fig_dir / "05_decompose.png")
+        strata = pd.read_csv(out_dir / "rung0_noise_strata.csv")
+        fg.fig_decompose(noise, control_noise, strata, fig_dir / "05_decompose.png")
     fg.fig_null(per_pair, pd.concat(null_rows, ignore_index=True), fig_dir / "06_null.png")
     fg.fig_terciles(terciles, fig_dir / "07_terciles.png")
     fg.fig_power(mde_curve, fig_dir / "08_power.png")
     write_per_gene_figure(per_gene, fig_dir / "09_per_gene_reliability.png")
+    fg.fig_dose(per_pair, dose_strata, fig_dir / "10_dose.png")
 
     write_audit_checksums(out_dir)
 
@@ -1876,6 +2095,16 @@ def main() -> None:
         f"over {summary['responder_n_pairs']} conditions"
         f"\nwrote {summary_path}"
     )
+
+
+def _write_split_tables(cache_dir: Path, out_dir: Path) -> None:
+    """The split assignment and the pool description, as the committed CSVs."""
+    _, pool, _ = read_assignment(cache_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pd.read_parquet(cache_dir / ASSIGNMENT_FILE).to_csv(
+        out_dir / "rung0_split_assignment.csv", index=False
+    )
+    pool.to_csv(out_dir / "rung0_pool_description.csv", index=False)
 
 
 if __name__ == "__main__":

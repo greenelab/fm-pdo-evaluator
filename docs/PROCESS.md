@@ -123,6 +123,12 @@ A result without a `.provenance.json` provenance record is not citable in a writ
 - **Deployment is git-only**: `git push` → `ralpine update` (git pull --ff-only on the Alpine checkout) → `ralpine submit`.
   Never copy a file to Alpine directly — if Alpine needs a file that isn't code, that's a sign it belongs in `data/` with a download/build script, not a one-off transfer.
 - **Chained jobs**: pass `--dependency=afterok:<jobid>` etc. to `ralpine submit`; the wrapper reorders args correctly, but *verify* with `ralpine jobinfo <id> | grep Dependency` after submitting — a chain that silently drops its dependency runs immediately and out of order.
+- **Parallelize a scan-bound job as a job array, never as a loop in one process.**
+  When the cost of a job is reading a large table (rung 0's four billion rows), find a key that is part of every group the job aggregates over — for rung 0, the gene — and split the work by a hash of that key into slices, so every group lands in exactly one slice and per-slice results concatenate or add back to the whole exactly.
+  Run the slices as one Slurm job array (`#SBATCH --array=0-N`), one task per slice, each with the memory a slice needs rather than the memory the whole needs; then one combine job, submitted with `--dependency=afterok:<array id>`, that reads the cached slices and does only what needs the whole.
+  Wall clock is one scan instead of N in a row; a task that finds its slice already cached skips, so a failed index is resubmitted alone (`--array=<index>`); and a slice count is a parameter both the array and the combine must agree on, so it lives in one place (`scripts/alpine/rung0_env.sh`).
+  Prove the slicing is arithmetic with a test that runs the same fixture in one slice and in several and compares them exactly (`test_partitioned_frame_equals_one_pass`, `test_partitioned_noise_equals_one_pass`), and test the staged path against the one-process path on a fixture before submitting (`test_the_staged_run_produces_the_same_artifacts_as_one_process`).
+  More slices than nodes the scheduler will give at once buys nothing: every task still reads the whole table, so past that point extra slices only lower per-task memory.
 - **Verify inputs exist before submitting.**
   `ralpine ls`/`ralpine du` the files a job needs first.
 - **Pull the job's log into `results/<task-slug>/` when it finishes.**

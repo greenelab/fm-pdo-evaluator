@@ -200,18 +200,9 @@ def test_build_carries_the_first_groups_minimum_padj(tmp_path: Path) -> None:
     A mean would let one strongly significant row be averaged away by its neighbours."""
     path = _write_fixture_pool(tmp_path)
     df = pd.read_parquet(path)
-    # Which plates land in the first group is DuckDB's hash, so read it off the engine rather
-    # than assuming: plant into whichever plates the build itself calls group 0.
-    import duckdb
-
-    half0 = {
-        str(p)
-        for p in duckdb.connect()
-        .execute(
-            "SELECT DISTINCT plate FROM read_parquet(?) WHERE hash(plate) % 2 = 0", [str(path)]
-        )
-        .df()["plate"]
-    }
+    # Which plates land in the first group is the split rule -- sorted plate ids, alternating --
+    # read off the assignment the build itself uses rather than re-derived here.
+    half0 = _first_group_plates(path, tmp_path)
     assert half0 and half0 != set(df["plate"].unique()), "fixture must split across both groups"
     first = sorted(half0)[0]
     key = (df["Cell_ID_DepMap"] == "L0") & (df["drug"] == "D0") & (df["gene_name"] == "G0")
@@ -252,23 +243,83 @@ def test_build_leaves_untestable_genes_null(tmp_path: Path) -> None:
     )
 
 
-def _first_group_plates(path: Path) -> set[str]:
-    """Which plates the build's own ``hash(plate) % 2`` puts in the first group.
+def _first_group_plates(path: Path, tmp: Path) -> set[str]:
+    """Which plates the build's own split puts in the first group, for the fixture's one dose.
 
-    Read off DuckDB rather than reimplemented: Python's ``hash`` is salted per process and is
-    not DuckDB's hash, so a test that computed the split itself would be testing a different
-    split from the one the measurement uses.
+    Read off ``split_assignment`` rather than reimplemented, so the test exercises the split the
+    measurement uses. The fixture gives every triple the same plate set, so the first group is
+    the same set of plates for every triple.
     """
-    import duckdb
+    assignment, _, _ = dr.split_assignment([str(path)], None, None, tmp / "assign", "2GB")
+    return {str(p) for p in assignment.loc[assignment["half"] == 0, "plate"].unique()}
 
-    rows = (
-        duckdb.connect()
-        .execute(
-            "SELECT DISTINCT plate FROM read_parquet(?) WHERE hash(plate) % 2 = 0", [str(path)]
-        )
-        .df()["plate"]
+
+@pytest.mark.step_split
+def test_split_alternates_over_sorted_plates_so_every_replicated_triple_splits(
+    tmp_path: Path,
+) -> None:
+    """The split rule, pinned: plates sorted by id within a triple, assigned alternately.
+
+    Two plates always land one on each side; three land two against one; four land two
+    against two, and only then is the equal-halves flag set. Under the earlier hash split a
+    two-plate triple sat on one side whenever its two ids hashed to the same parity, and the
+    design's claim that most triples split one plate against one was never counted.
+    """
+    path = _write_fixture_pool(tmp_path, n_lines=1, n_drugs=1, n_genes=20, plates=("P2", "P1"))
+    df = pd.read_parquet(path)
+    two = df.copy()
+    three = df.copy()
+    three["Cell_ID_DepMap"] = "L1"
+    three = pd.concat([three, three[three["plate"] == "P1"].assign(plate="P3")], ignore_index=True)
+    four = pd.concat(
+        [two.assign(Cell_ID_DepMap="L2"), two.assign(Cell_ID_DepMap="L2", plate="P9")],
+        ignore_index=True,
     )
-    return {str(p) for p in rows}
+    four = pd.concat(
+        [four, four[four["plate"] == "P1"].assign(plate="P5")], ignore_index=True
+    ).drop_duplicates(subset=["Cell_ID_DepMap", "drug", "gene_name", "plate", "concentration"])
+    pd.concat([two, three, four], ignore_index=True).to_parquet(path, index=False)
+
+    assignment, pool, repl = dr.split_assignment([str(path)], None, None, tmp_path / "a", "2GB")
+    assert repl == "plate"
+    halves = {
+        (row.patient, row.plate): int(row.half)
+        for row in assignment.itertuples(index=False)  # type: ignore[attr-defined]
+    }
+    assert halves[("L0", "P1")] == 0 and halves[("L0", "P2")] == 1, "sorted, then alternating"
+    assert [halves[("L1", p)] for p in ("P1", "P2", "P3")] == [0, 1, 0]
+    assert [halves[("L2", p)] for p in ("P1", "P2", "P5", "P9")] == [0, 1, 0, 1]
+    by_line = pool.set_index("patient")
+    assert list(by_line.loc["L0", ["n_plates_half0", "n_plates_half1"]]) == [1, 1]
+    assert list(by_line.loc["L1", ["n_plates_half0", "n_plates_half1"]]) == [2, 1]
+    assert list(by_line.loc["L2", ["n_plates_half0", "n_plates_half1"]]) == [2, 2]
+    assert list(by_line["n_plates_even"]) == [True, False, True], (
+        "equal halves means exactly an even plate count under the alternating rule"
+    )
+
+    de, _ = dr.build_split_half_frame([str(path)], None, None, tmp_path / "duck", "2GB")
+    assert set(de["patient"].unique()) == {"L0", "L1", "L2"}, "every replicated triple splits"
+
+
+@pytest.mark.step_build
+def test_partitioned_frame_equals_one_pass(tmp_path: Path) -> None:
+    """Slicing the genes must be arithmetic for the frame as it is for the noise sums: the same
+    rows, in the same values, whether built in one pass or in five."""
+    path = _write_fixture_pool(tmp_path, n_genes=200, doses=(0.01, 0.1), seed=23)
+    one, _ = dr.build_split_half_frame([str(path)], None, None, tmp_path / "d1", "2GB")
+    five, _ = dr.build_split_half_frame([str(path)], None, None, tmp_path / "d5", "2GB", n_parts=5)
+    keys = list(dr.KEY_COLUMNS)
+    # sorted as strings: the key columns are Categorical, and a Categorical sorts by its
+    # category codes -- order of first appearance -- which differs between one pass and five
+    one = one.astype({k: str for k in keys}).sort_values(keys).reset_index(drop=True)
+    five = five.astype({k: str for k in keys}).sort_values(keys).reset_index(drop=True)
+    assert len(one) == len(five) == 200 * 12 * 2
+    for col in keys:
+        assert list(one[col].astype(str)) == list(five[col].astype(str)), col
+    for col in ("lfc0", "lfc1", "padj0", "padj1"):
+        np.testing.assert_allclose(
+            one[col].to_numpy(dtype=float), five[col].to_numpy(dtype=float), equal_nan=True
+        )
 
 
 def _scored(path: Path, tmp: Path, min_genes: int = 50):
@@ -345,7 +396,7 @@ def test_selection_admits_no_more_than_the_nominal_rate_on_signal_free_data(
     path = _write_fixture_pool(
         tmp_path, n_genes=2000, signal_sd=0.0, noise_sd=1.0, n_responders=None, seed=5
     )
-    n_first_group_rows = len(_first_group_plates(path))  # one dose in this fixture
+    n_first_group_rows = len(_first_group_plates(path, tmp_path))  # one dose in this fixture
     expected = 1.0 - (1.0 - 0.05) ** n_first_group_rows
     _, r_resp, _, _, mask = _scored(path, tmp_path, min_genes=10)
     rate = float(mask.mean())
@@ -442,7 +493,9 @@ def test_decompose_recovers_a_planted_plate_variance(tmp_path: Path) -> None:
         seed=13,
     )
     d = _decomposed(path, tmp_path)
-    got = float(np.mean(d["sigma2_plate"].to_numpy(dtype=float)))
+    got, frac, _ = dr.pooled_plate_variance(
+        d["var_lfc"].to_numpy(dtype=float), d["mean_se2"].to_numpy(dtype=float)
+    )
     # The planted offsets are one draw of 24 values at sd 0.6, so the realised variance is not
     # exactly 0.36; compare against what was actually drawn, recovered from the pool itself.
     raw = pd.read_parquet(path)
@@ -453,7 +506,6 @@ def test_decompose_recovers_a_planted_plate_variance(tmp_path: Path) -> None:
     assert got == pytest.approx(realised, abs=0.05), (
         f"recovered plate variance {got:.3f} against the realised planted {realised:.3f}"
     )
-    frac = float(np.nanmean(d["between_plate_fraction"].to_numpy(dtype=float)))
     expected_frac = realised / (realised + noise_sd**2)
     assert frac == pytest.approx(expected_frac, abs=0.06), (
         f"between-plate fraction {frac:.3f} against planted {expected_frac:.3f}"
@@ -461,25 +513,101 @@ def test_decompose_recovers_a_planted_plate_variance(tmp_path: Path) -> None:
 
 
 @pytest.mark.step_decompose
-def test_decompose_floors_at_zero_without_going_negative(tmp_path: Path) -> None:
-    """Negative control for decompose: plates differing only by the planted sampling noise
-    carry no plate effect. The estimator is a difference of two noisy quantities, so it would
-    go negative about half the time unaided; the floor is what makes it a variance, and this
-    test is what keeps the floor from being quietly removed."""
+def test_decompose_pooled_estimate_is_zero_at_two_plates_with_no_plate_effect(
+    tmp_path: Path,
+) -> None:
+    """Negative control for decompose, in the regime the real screen is in: two plates.
+
+    With no plate effect planted, the variance across two plates has one degree of freedom and
+    its per-gene difference from the squared standard error lands either side of zero. Flooring
+    each gene before averaging would report a plate component of 0.48 of the within-plate
+    variance that is not there (a third of genes positive, expectation
+    0.25 * E[max(chi2_1 - 1, 0)]); pooling first and flooring once must report zero, and the
+    signed per-gene column must show the spread that pooling averages out.
+    """
+    noise_sd = 0.5
     path = _write_fixture_pool(
         tmp_path,
+        n_lines=6,
+        n_drugs=4,
         n_genes=400,
         signal_sd=0.0,
-        noise_sd=0.5,
+        noise_sd=noise_sd,
         plate_offset_sd=0.0,
-        plates=tuple(f"P{i}" for i in range(24)),
+        plates=("P1", "P2"),
         seed=17,
     )
     d = _decomposed(path, tmp_path)
-    sigma2 = d["sigma2_plate"].to_numpy(dtype=float)
-    assert (sigma2 >= 0).all(), "the plate component is a variance and cannot be negative"
-    assert float(np.mean(sigma2)) < 0.03, (
-        f"no plate effect was planted; recovered {float(np.mean(sigma2)):.4f}"
+    assert int(d["n_plates"].to_numpy(dtype=int).max()) == 2
+    signed = d["sigma2_plate_signed"].to_numpy(dtype=float)
+    assert (signed < 0).mean() > 0.5, "one-degree-of-freedom estimates land below zero often"
+    floored_per_gene = float(np.mean(np.maximum(signed, 0.0)))
+    assert floored_per_gene > 0.35 * noise_sd**2, (
+        f"the per-gene floor would have reported {floored_per_gene:.4f} with nothing planted"
+    )
+    sigma2, frac, n = dr.pooled_plate_variance(
+        d["var_lfc"].to_numpy(dtype=float), d["mean_se2"].to_numpy(dtype=float)
+    )
+    assert n == len(d)
+    assert sigma2 < 0.02 * noise_sd**2 and frac < 0.02, (
+        f"no plate effect was planted; pooled estimate {sigma2:.4f}, share {frac:.4f}"
+    )
+
+
+@pytest.mark.step_decompose
+def test_decompose_pooled_estimate_recovers_a_planted_plate_effect_at_two_plates(
+    tmp_path: Path,
+) -> None:
+    """Positive control at two plates: the pooled estimator must recover a planted component
+    from one-degree-of-freedom per-gene estimates, because expectation is linear."""
+    plate_sd, noise_sd = 0.5, 0.5
+    path = _write_fixture_pool(
+        tmp_path,
+        n_lines=8,
+        n_drugs=4,
+        n_genes=400,
+        signal_sd=0.0,
+        noise_sd=noise_sd,
+        plate_offset_sd=plate_sd,
+        plates=("P1", "P2"),
+        seed=29,
+    )
+    d = _decomposed(path, tmp_path)
+    raw = pd.read_parquet(path)
+    codes, _ = pd.factorize(raw["plate"])
+    lfc = raw["log2FoldChange"].to_numpy(dtype=float)
+    plate_means = np.bincount(codes, weights=lfc) / np.bincount(codes)
+    realised = float(np.var(plate_means, ddof=1))
+    sigma2, frac, _ = dr.pooled_plate_variance(
+        d["var_lfc"].to_numpy(dtype=float), d["mean_se2"].to_numpy(dtype=float)
+    )
+    assert sigma2 == pytest.approx(realised, abs=0.06), f"pooled {sigma2:.3f} vs {realised:.3f}"
+    assert frac == pytest.approx(realised / (realised + noise_sd**2), abs=0.08)
+
+
+@pytest.mark.step_decompose
+def test_noise_partials_pool_the_responder_sums_too(tmp_path: Path) -> None:
+    """The responder share needs the responders' squared standard errors summed as well as
+    their variances; the earlier partials carried only the variances, so the responder share
+    could not be corrected without a rescan."""
+    path = _write_fixture_pool(
+        tmp_path, n_genes=200, n_responders=60, plates=("P1", "P2"), plate_offset_sd=0.4, seed=31
+    )
+    d = _decomposed(path, tmp_path)
+    per = dr.noise_partials(d, 0.05)
+    assert set(dr.NOISE_SUM_COLUMNS) <= set(per.columns)
+    overall, by_condition = dr.combine_noise_partials(per)
+    row = overall.iloc[0]
+    assert row["n_gene_conditions_responders"] == 60 * 12, "the planted responders, every triple"
+    for col in ("between_plate_fraction_pooled", "between_plate_fraction_pooled_responders"):
+        assert 0.0 <= float(row[col]) <= 1.0
+        assert np.isfinite(by_condition[col].to_numpy(dtype=float)).all()
+    # the responder and non-responder sums partition the whole
+    assert np.isclose(
+        per["s_var_resp"].sum() + per["s_var_non"].sum(), per["s_var"].sum(), rtol=1e-12
+    )
+    assert np.isclose(
+        per["s_se2_resp"].sum() + per["s_se2_non"].sum(), per["s_se2"].sum(), rtol=1e-12
     )
 
 
@@ -510,7 +638,7 @@ def test_decompose_does_not_charge_a_dose_effect_to_plate_noise(tmp_path: Path) 
     df.to_parquet(path, index=False)
 
     d = _decomposed(path, tmp_path)
-    worst = float(np.max(d["sigma2_plate"].to_numpy(dtype=float)))
+    worst = float(np.max(d["sigma2_plate_signed"].to_numpy(dtype=float)))
     assert worst < 1e-9, f"a dose effect must not appear as plate variance; recovered {worst:.4f}"
 
 
@@ -600,6 +728,47 @@ def test_null_positive_planted_components_recover_the_stratum_ordering(tmp_path:
     assert same_d > diff_d + 0.05, f"same_drug {same_d:.3f} !> diff_drug {diff_d:.3f}"
 
 
+def test_same_drug_null_pairs_only_conditions_at_the_same_dose(tmp_path: Path) -> None:
+    """The line-specificity floor holds dose fixed as the condition does. Plant a response that
+    is shared across lines within a dose but differs between doses: the same-drug stratum then
+    sits high if it pairs same-dose conditions and is dragged down if it mixes doses."""
+    rng = np.random.default_rng(5)
+    lines = [f"L{i}" for i in range(6)]
+    genes = [f"G{k}" for k in range(300)]
+    plates = ("P1", "P2", "P3", "P4")
+    dose_effect = {0.01: rng.normal(0.0, 1.0, len(genes)), 1.0: rng.normal(0.0, 1.0, len(genes))}
+    rows = []
+    for li in lines:
+        for dose, effect in dose_effect.items():
+            for p in plates:
+                rows.append(
+                    pd.DataFrame(
+                        {
+                            "Cell_ID_DepMap": li,
+                            "drug": "D0",
+                            "gene_name": genes,
+                            "log2FoldChange": effect + rng.normal(0.0, 0.3, len(genes)),
+                            "concentration": dose,
+                            "plate": p,
+                        }
+                    )
+                )
+    pool_dir = tmp_path / "pseudobulk_differential_expression"
+    pool_dir.mkdir(parents=True)
+    pd.concat(rows, ignore_index=True).to_parquet(pool_dir / "part.parquet", index=False)
+    de, _ = dr.build_split_half_frame(
+        [str(pool_dir / "part.parquet")], None, None, tmp_path / "d", "2GB"
+    )
+    _, piv0, piv1 = dr.score_split_half(de, set(genes), min_genes=20)
+    nulls = dr.stratified_null_draws(piv0, piv1, n_perm=200, seed=0, min_genes=20)
+    same = float(np.mean(nulls["same_drug"]))
+    assert same > 0.8, f"same drug at the same dose shares the planted response: {same:.3f}"
+    # every same-drug draw is between conditions at one dose: none can carry the cross-dose
+    # correlation, which is near zero here, so the minimum draw is far above it
+    assert float(np.min(nulls["same_drug"])) > 0.5
+    assert nulls["diff_drug"].size == 0, "one drug in the pool: no different-drug pairs exist"
+
+
 def test_null_negative_signal_free_strata_sit_at_their_floors(tmp_path: Path) -> None:
     path = _write_fixture_pool(tmp_path, signal_sd=0.0, drug_sd=0.0, noise_sd=1.0)
     de, _ = dr.build_split_half_frame(
@@ -650,12 +819,49 @@ def test_tercile_control_rises_monotonically_with_planted_effect_size(tmp_path: 
     )
     de = de.dropna(subset=["lfc0", "lfc1"])
     r, piv0, piv1 = dr.score_split_half(de, set(de["gene_name"].unique()))
-    terc = dr.effect_size_terciles(piv0, piv1, r)
-    assert (
-        terc["splithalf_mean_r_tercile1"]
-        < terc["splithalf_mean_r_tercile2"]
-        < terc["splithalf_mean_r_tercile3"]
-    ), f"terciles not monotone: {terc}"
+    per_pair = dr.per_pair_table(piv0, piv1, r)
+    for ranked_by in ("half0", "half1"):
+        terc = dr.effect_size_terciles(per_pair, ranked_by=ranked_by)
+        assert (
+            terc["splithalf_mean_r_tercile1"]
+            < terc["splithalf_mean_r_tercile2"]
+            < terc["splithalf_mean_r_tercile3"]
+        ), f"terciles ranked by {ranked_by} not monotone: {terc}"
+    table = dr.effect_size_tercile_table(per_pair, n_boot=200)
+    assert set(table["ranked_by"]) == {"half0", "half1"} and len(table) == 6
+
+
+def test_tercile_control_is_flat_on_pure_noise(tmp_path: Path) -> None:
+    """Negative control for the effect-size terciles. Ranking by one half's magnitude leaves
+    the other half independent of the ranking, so with no signal every tercile's mean sits at
+    zero. Ranking by the magnitude of the two halves' sum -- the earlier definition -- selects
+    conditions whose halves happened to agree, and pure noise rises monotonically through the
+    terciles; that is demonstrated here beside the shipped control so the reason is pinned."""
+    rng = np.random.default_rng(11)
+    n_cond, n_genes = 600, 400
+    a = rng.normal(0.0, 1.0, (n_cond, n_genes))
+    b = rng.normal(0.0, 1.0, (n_cond, n_genes))
+    index = pd.MultiIndex.from_tuples(
+        [(f"L{i % 30}", f"D{i // 30}", 0.05) for i in range(n_cond)],
+        names=["patient", "drug", "dose"],
+    )
+    piv0 = pd.DataFrame(a, index=index)
+    piv1 = pd.DataFrame(b, index=index)
+    r = dr.masked_rowwise_pearson(a, b, 10)
+    per_pair = dr.per_pair_table(piv0, piv1, r)
+    for ranked_by in ("half0", "half1"):
+        terc = dr.effect_size_terciles(per_pair, ranked_by=ranked_by)
+        means = np.array([terc[f"splithalf_mean_r_tercile{t}"] for t in (1, 2, 3)])
+        assert np.all(np.abs(means) < 0.02), (
+            f"noise must stay at zero, ranked by {ranked_by}: {means}"
+        )
+    # the sum-based ranking is what the reviewer showed passes pure noise
+    summed = per_pair.assign(mean_abs_sum=np.abs(a + b).mean(axis=1) / 2.0)
+    masks = dr._tercile_masks(summed["mean_abs_sum"].to_numpy(dtype=float), r)
+    by_sum = [float(np.mean(r[m])) for m in masks]
+    assert by_sum[0] < by_sum[1] < by_sum[2] and by_sum[2] - by_sum[0] > 0.03, (
+        f"the sum-based ranking must be shown to rise on noise, got {by_sum}"
+    )
 
 
 def test_per_pair_table_rows_are_keyed_to_their_own_scores(tmp_path: Path) -> None:
@@ -706,10 +912,11 @@ def test_per_pair_table_rows_are_keyed_to_their_own_scores(tmp_path: Path) -> No
     assert list(table["drug"]) == list(piv0.index.get_level_values(1))
 
     # row keying: planted per-drug ordering recovered in both exported quantities
-    by_drug_effect = table.groupby("drug")["mean_abs_delta"].mean()
-    assert by_drug_effect["D0"] < by_drug_effect["D1"] < by_drug_effect["D2"], (
-        f"effect sizes misordered: {dict(by_drug_effect)}"
-    )
+    for half in ("mean_abs_half0", "mean_abs_half1"):
+        by_drug_effect = table.groupby("drug")[half].mean()
+        assert by_drug_effect["D0"] < by_drug_effect["D1"] < by_drug_effect["D2"], (
+            f"{half} misordered: {dict(by_drug_effect)}"
+        )
     by_drug_r = table.groupby("drug")["r"].mean()
     assert by_drug_r["D0"] < by_drug_r["D1"] < by_drug_r["D2"], (
         f"reliabilities misordered: {dict(by_drug_r)}"
@@ -799,7 +1006,12 @@ def test_frame_cache_returns_the_built_frame_and_never_the_wrong_one(tmp_path: P
 
     path = _write_fixture_pool(tmp_path)
     paths, names = [str(path)], ["D0", "D1", "D2"]
-    args = argparse.Namespace(replicate_col=None, frame_cache=str(tmp_path / "cache"))
+    args = argparse.Namespace(
+        replicate_col=None,
+        cache_dir=str(tmp_path / "cache"),
+        out_dir=str(tmp_path / "out"),
+        slices=2,
+    )
 
     built, repl = dr._build_or_load_frame(paths, names, args, tmp_path / "pool")
     cached, repl_again = dr._build_or_load_frame(paths, names, args, tmp_path / "pool")
@@ -954,8 +1166,12 @@ def test_a_mismatched_responder_draw_uses_the_first_conditions_mask() -> None:
     n_cond, n_genes = 6, 400
     rng = np.random.default_rng(37)
     idx = pd.MultiIndex.from_arrays(
-        [[f"L{i}" for i in range(n_cond)], [f"D{i % 2}" for i in range(n_cond)]],
-        names=["patient", "drug"],
+        [
+            [f"L{i}" for i in range(n_cond)],
+            [f"D{i % 2}" for i in range(n_cond)],
+            [0.05] * n_cond,
+        ],
+        names=["patient", "drug", "dose"],
     )
     cols = pd.Index([f"G{k}" for k in range(n_genes)], name="gene_name")
     piv0 = pd.DataFrame(rng.normal(size=(n_cond, n_genes)), index=idx, columns=cols)
@@ -1093,6 +1309,8 @@ def test_main_writes_every_declared_artifact_on_a_synthetic_pool(
         "rung0_noise_by_condition.csv",
         "rung0_control_per_pair.csv",
         "rung0_control_noise.csv.gz",
+        "rung0_split_assignment.csv",
+        "rung0_dose_strata.csv",
         "audit_checksums.json",
     }
     got = {p.name for p in out.glob("*") if p.is_file()}
@@ -1109,6 +1327,7 @@ def test_main_writes_every_declared_artifact_on_a_synthetic_pool(
         "07_terciles.png",
         "08_power.png",
         "09_per_gene_reliability.png",
+        "10_dose.png",
     }
     assert expected_figures <= figures, f"missing figures: {sorted(expected_figures - figures)}"
 
@@ -1190,16 +1409,17 @@ def test_dense_pivots_match_pivot_table_exactly(tmp_path: Path) -> None:
 
 
 @pytest.mark.step_decompose
-def test_the_two_pass_run_produces_the_same_artifacts_as_one(
+def test_the_staged_run_produces_the_same_artifacts_as_one_process(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The cluster runs this as two processes; a local run does it in one. Both must land the
-    same set of artifacts, or the job is exercising a path no test covers.
+    """The cluster runs assign, then one job-array task per slice, then combine, as separate
+    processes; a local run does all three in one. Both must land the same artifacts with the
+    same numbers, or the job is exercising a path no test covers.
 
-    The split exists because the two phases each need most of the machine and exhausted memory
-    when they shared it. The risk it introduces is the second pass silently not finding what the
-    first wrote -- so this asserts the decompose figure, which only the second pass can draw and
-    only from the first pass's table, is actually there.
+    The staged form exists because the scan over the table is the whole cost and slices of the
+    genes can run on separate nodes at once. The risk it introduces is a stage silently not
+    finding what the previous one wrote, or a slice missing from the combine -- so the combine
+    is also required to refuse when a slice is absent.
     """
     path = _write_fixture_pool(
         tmp_path,
@@ -1212,32 +1432,53 @@ def test_the_two_pass_run_produces_the_same_artifacts_as_one(
         plate_offset_sd=0.3,
         seed=91,
     )
-    out = tmp_path / "out"
-    common = [
-        "--local-dir",
-        str(path.parent.parent),
-        "--out-dir",
-        str(out),
-        "--min-genes",
-        "20",
-        "--n-perm",
-        "30",
-    ]
-    monkeypatch.setattr(sys, "argv", ["x", *common, "--only-noise"])
+    common = ["--local-dir", str(path.parent.parent), "--min-genes", "20", "--n-perm", "30"]
+    one = tmp_path / "one"
+    monkeypatch.setattr(sys, "argv", ["x", *common, "--out-dir", str(one), "--slices", "3"])
     dr.main()
-    noise_only = {p.name for p in out.glob("*") if p.is_file()}
-    assert "rung0_noise_decomposition.csv" in noise_only
-    assert "rung0_reliability.csv" not in noise_only, "--only-noise must do only the noise"
 
-    monkeypatch.setattr(sys, "argv", ["x", *common, "--skip-noise"])
+    staged = tmp_path / "staged"
+    cache = tmp_path / "cache"
+    stage_common = [*common, "--out-dir", str(staged), "--slices", "3", "--cache-dir", str(cache)]
+    monkeypatch.setattr(sys, "argv", ["x", *stage_common, "--stage", "assign"])
     dr.main()
-    files = {p.name for p in out.glob("*") if p.is_file()}
-    figures = {p.name for p in (out / "figures").glob("*.png")}
-    assert "rung0_reliability.csv" in files
-    assert "rung0_noise_strata.csv" in files
-    assert "05_decompose.png" in figures, (
-        "the second pass must draw the decompose figure from the first pass's table"
-    )
+    assert (staged / "rung0_split_assignment.csv").exists()
+    assert not (staged / "rung0_reliability.csv").exists(), "assign must do only the assignment"
+    for part in (0, 2):
+        monkeypatch.setattr(
+            sys, "argv", ["x", *stage_common, "--stage", "slice", "--slice-index", str(part)]
+        )
+        dr.main()
+    monkeypatch.setattr(sys, "argv", ["x", *stage_common, "--stage", "combine"])
+    with pytest.raises(SystemExit, match="1 of 3 slices"):
+        dr.main()
+    monkeypatch.setattr(sys, "argv", ["x", *stage_common, "--stage", "slice", "--slice-index", "1"])
+    dr.main()
+    monkeypatch.setattr(sys, "argv", ["x", *stage_common, "--stage", "combine"])
+    dr.main()
+
+    for name in (
+        "rung0_reliability.csv",
+        "rung0_per_pair_r.csv",
+        "rung0_noise_decomposition.csv",
+        "rung0_noise_by_condition.csv",
+        "rung0_dose_strata.csv",
+        "rung0_pool_description.csv",
+    ):
+        a = pd.read_csv(one / name)
+        b = pd.read_csv(staged / name)
+        assert list(a.columns) == list(b.columns), name
+        for col in a.columns:
+            if a[col].dtype.kind in "fi":
+                np.testing.assert_allclose(
+                    a[col].to_numpy(dtype=float),
+                    b[col].to_numpy(dtype=float),
+                    equal_nan=True,
+                    err_msg=f"{name}:{col}",
+                )
+            else:
+                assert list(a[col].astype(str)) == list(b[col].astype(str)), f"{name}:{col}"
+    assert (staged / "figures" / "05_decompose.png").exists()
 
 
 @pytest.mark.step_decompose
@@ -1263,17 +1504,22 @@ def test_partitioned_noise_equals_one_pass(tmp_path: Path) -> None:
     )
 
     def run(n_parts: int, tag: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-        totals = {"n": 0.0, "frac": 0.0, "sigma2": 0.0, "se2": 0.0, "dominated": 0.0}
+        assignment, pool, _ = dr.split_assignment([str(path)], None, None, tmp_path / tag, "2GB")
+        a_path = dr.write_assignment(tmp_path / tag / "split", assignment, pool, "plate")
         pers = []
         for part in range(n_parts):
-            sl = dr.noise_slice(
-                [str(path)], None, None, tmp_path / tag, "2GB", n_parts=n_parts, part=part
+            agg, _ = dr.slice_aggregate(
+                [str(path)],
+                None,
+                None,
+                tmp_path / tag,
+                "2GB",
+                assignment=a_path,
+                n_parts=n_parts,
+                part=part,
             )
-            o, per = dr.noise_partials(sl, 0.05)
-            pers.append(per)
-            for k in totals:
-                totals[k] += o[k]
-        return dr.combine_noise_partials(totals, pd.concat(pers, ignore_index=True))
+            pers.append(dr.noise_partials(dr.noise_from_slice(agg), 0.05))
+        return dr.combine_noise_partials(pd.concat(pers, ignore_index=True))
 
     one, c1 = run(1, "d1")
     many, c7 = run(7, "d2")

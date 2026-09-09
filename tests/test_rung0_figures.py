@@ -59,12 +59,12 @@ def _pool(n: int = 12) -> pd.DataFrame:
         {
             "patient": [f"line{i % 4}" for i in range(n)],
             "drug": [f"drug{i % 3}" for i in range(n)],
+            "dose": [(0.05, 0.5, 5.0)[i % 3] for i in range(n)],
             "n_rows": rng.integers(500, 1500, size=n),
             "n_plates": n_plates,
-            "n_plates_even": n_plates % 2 == 0,
+            "n_plates_even": half0 == n_plates - half0,
             "n_plates_half0": half0,
             "n_plates_half1": n_plates - half0,
-            "n_dose_levels": rng.integers(1, 4, size=n),
             "frac_untestable": rng.uniform(0.0, 0.4, size=n),
         }
     )
@@ -81,8 +81,10 @@ def _per_pair(n: int = 12) -> pd.DataFrame:
         {
             "patient": [f"line{i % 4}" for i in range(n)],
             "drug": [f"drug{i % 3}" for i in range(n)],
+            "dose": [(0.05, 0.5, 5.0)[i % 3] for i in range(n)],
             "n_genes_scored": rng.integers(60, 900, size=n),
-            "mean_abs_delta": rng.uniform(0.1, 1.2, size=n),
+            "mean_abs_half0": rng.uniform(0.1, 1.2, size=n),
+            "mean_abs_half1": rng.uniform(0.1, 1.2, size=n),
             "r": rng.uniform(0.05, 0.45, size=n),
             "r_responder": rng.uniform(0.25, 0.75, size=n),
             "n_responders": rng.integers(20, 400, size=n),
@@ -156,13 +158,32 @@ def _noise(n: int = 300) -> pd.DataFrame:
             "gene_name": [f"G{i:04d}" for i in range(n)],
             "var_lfc": sigma2_plate + mean_se2,
             "mean_se2": mean_se2,
-            "n_plates": rng.integers(3, 7, size=n),
+            "n_plates": 2,
             "base_mean": rng.lognormal(3.0, 1.5, size=n),
             "mean_lfc": rng.normal(0.0, 0.8, size=n),
-            "sigma2_plate": sigma2_plate,
-            "between_plate_fraction": sigma2_plate / (sigma2_plate + mean_se2),
+            "sigma2_plate_signed": sigma2_plate,
+            "between_plate_fraction_signed": sigma2_plate / (sigma2_plate + mean_se2),
         }
     )
+
+
+def _strata() -> pd.DataFrame:
+    rows = []
+    for e in (1, 2, 3, 4):
+        for q in (1, 2, 3, 4):
+            rows.append(
+                {
+                    "expression_quartile": e,
+                    "response_quartile": q,
+                    "n": 40,
+                    "var_lfc_mean": 0.3 + 0.05 * e,
+                    "mean_se2_mean": 0.2,
+                    "between_plate_fraction_pooled": 1.0 - 0.2 / (0.3 + 0.05 * e),
+                    "base_mean_mean": 10.0 * e,
+                    "abs_mean_lfc_mean": 0.2 * q,
+                }
+            )
+    return pd.DataFrame(rows)
 
 
 def _null_draws(n: int = 200) -> pd.DataFrame:
@@ -381,32 +402,33 @@ def test_fig_score_tolerates_a_single_example_and_no_scored_conditions(tmp_path:
 
 
 def test_fig_decompose_writes_a_png_with_its_control_panel(tmp_path: Path) -> None:
-    out = figures.fig_decompose(_noise(), _noise(n=150), tmp_path / "decompose.png")
+    out = figures.fig_decompose(_noise(), _noise(n=150), _strata(), tmp_path / "decompose.png")
     _assert_is_a_png(out)
 
 
-def test_fig_decompose_tolerates_no_control_pool(tmp_path: Path) -> None:
-    out = figures.fig_decompose(_noise(), None, tmp_path / "decompose_no_control.png")
+def test_fig_decompose_tolerates_no_control_pool_and_no_strata(tmp_path: Path) -> None:
+    out = figures.fig_decompose(_noise(), None, None, tmp_path / "decompose_no_control.png")
     _assert_is_a_png(out)
 
 
 def test_fig_decompose_tolerates_too_few_rows_to_stratify(tmp_path: Path) -> None:
-    out = figures.fig_decompose(_noise(n=2), None, tmp_path / "decompose_thin.png")
+    out = figures.fig_decompose(_noise(n=2), None, _strata().iloc[0:0], tmp_path / "thin.png")
     _assert_is_a_png(out)
 
 
-def test_fig_decompose_tolerates_a_floored_plate_component(tmp_path: Path) -> None:
-    """The decompose step's negative control shape: plate variance at its floor of zero.
-
-    Zero cannot be drawn on a log axis, so the panel has to survive it rather than raise.
-    """
-    noise = _noise().assign(sigma2_plate=0.0, between_plate_fraction=0.0)
-    out = figures.fig_decompose(noise, None, tmp_path / "decompose_floor.png")
+def test_fig_decompose_tolerates_a_negative_signed_component(tmp_path: Path) -> None:
+    """The per-gene estimate is signed and lands below zero for many genes at two plates; the
+    histogram clips it and the log-axis scatter drops non-positive rows rather than raising."""
+    noise = _noise()
+    noise["var_lfc"] = noise["mean_se2"] * 0.5
+    noise["sigma2_plate_signed"] = noise["var_lfc"] - noise["mean_se2"]
+    noise["between_plate_fraction_signed"] = noise["sigma2_plate_signed"] / noise["var_lfc"]
+    out = figures.fig_decompose(noise, None, _strata(), tmp_path / "decompose_negative.png")
     _assert_is_a_png(out)
 
 
 def test_fig_decompose_tolerates_an_empty_table(tmp_path: Path) -> None:
-    out = figures.fig_decompose(_noise().iloc[0:0], None, tmp_path / "decompose_empty.png")
+    out = figures.fig_decompose(_noise().iloc[0:0], None, None, tmp_path / "decompose_empty.png")
     _assert_is_a_png(out)
 
 
@@ -484,16 +506,46 @@ def test_fig_permutation_vs_bootstrap_tolerates_empty_inputs(tmp_path: Path) -> 
 
 
 def _terciles() -> pd.DataFrame:
-    """The known answer: the mean rises across the thirds, as a working assay requires."""
+    """The known answer: the mean rises across the thirds under both rankings."""
     return pd.DataFrame(
         {
-            "tercile": [1, 2, 3],
-            "mean_r": [0.11, 0.24, 0.41],
-            "ci_lo": [0.05, 0.18, 0.33],
-            "ci_hi": [0.17, 0.30, 0.49],
-            "n": [12, 12, 11],
+            "ranked_by": ["half0"] * 3 + ["half1"] * 3,
+            "tercile": [1, 2, 3, 1, 2, 3],
+            "mean_r": [0.11, 0.24, 0.41, 0.10, 0.22, 0.39],
+            "ci_lo": [0.05, 0.18, 0.33, 0.04, 0.16, 0.31],
+            "ci_hi": [0.17, 0.30, 0.49, 0.16, 0.28, 0.47],
+            "n": [12, 12, 11, 12, 12, 11],
         }
     )
+
+
+def _dose_strata() -> pd.DataFrame:
+    rows = []
+    for gene_set, base in (("all", 0.12), ("responder", 0.45)):
+        for dose, shift in (("0.05", -0.02), ("0.5", 0.0), ("5.0", 0.03), ("all", 0.01)):
+            rows.append(
+                {
+                    "dose": dose,
+                    "weighting": "per_triple",
+                    "gene_set": gene_set,
+                    "n_pairs": 4,
+                    "splithalf_mean_r": base + shift,
+                    "splithalf_median_r": base + shift,
+                    "spearman_brown_full": 2 * (base + shift) / (1 + base + shift),
+                }
+            )
+        rows.append(
+            {
+                "dose": "all",
+                "weighting": "per_line_drug",
+                "gene_set": gene_set,
+                "n_pairs": 4,
+                "splithalf_mean_r": base,
+                "splithalf_median_r": base,
+                "spearman_brown_full": 2 * base / (1 + base),
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def test_fig_terciles_writes_a_png(tmp_path: Path) -> None:
@@ -538,6 +590,34 @@ def test_fig_power_tolerates_a_curve_with_no_observed_row(tmp_path: Path) -> Non
     curve = _mde_curve().assign(observed=False)
     out = figures.fig_power(curve, tmp_path / "power_unmarked.png")
     _assert_is_a_png(out)
+
+
+# --------------------------------------------------------------------------------------------
+# dose
+# --------------------------------------------------------------------------------------------
+
+
+def test_fig_dose_writes_a_png(tmp_path: Path) -> None:
+    out = figures.fig_dose(_per_pair(), _dose_strata(), tmp_path / "dose.png")
+    _assert_is_a_png(out)
+
+
+def test_fig_dose_tolerates_one_dose_level_and_no_strata(tmp_path: Path) -> None:
+    per_pair = _per_pair().assign(dose=5.0)
+    out = figures.fig_dose(per_pair, pd.DataFrame(), tmp_path / "dose_one.png")
+    _assert_is_a_png(out)
+
+
+def test_fig_dose_tolerates_empty_tables_and_no_responder_column(tmp_path: Path) -> None:
+    _assert_is_a_png(figures.fig_dose(_per_pair().iloc[0:0], _dose_strata(), tmp_path / "e.png"))
+    bare = _per_pair().drop(columns=["r_responder"])
+    _assert_is_a_png(figures.fig_dose(bare, _dose_strata(), tmp_path / "dose_bare.png"))
+
+
+def test_fig_dose_uses_one_fixed_hue_per_dose_level_low_to_high() -> None:
+    palette = figures.dose_palette(["5.0", "0.05", "0.5", "0.05"])
+    assert list(palette) == ["0.05", "0.5", "5.0"], "sorted by dose, not by appearance"
+    assert len(set(palette.values())) == 3
 
 
 def test_fig_power_tolerates_an_empty_curve(tmp_path: Path) -> None:

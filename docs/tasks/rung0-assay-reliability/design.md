@@ -3,7 +3,7 @@
 **Task** `rung0-assay-reliability` · **Status** OPEN · **Branch** `rung0-assay-reliability`
 **Steps** build, split, select, score, decompose, null, document, promote.
 **Spec** [docs/SPEC.md](../../SPEC.md), rung 0 · **State** [docs/STATE.md](../../STATE.md)
-**As of** 2026-09-01. Decision lineage in [`decisions.md`](decisions.md).
+**As of** 2026-09-09. Decision lineage in [`decisions.md`](decisions.md).
 
 ## What this rung establishes
 
@@ -28,9 +28,21 @@ not read.
 
 ## What is measured
 
-**The quantity.** For each (cell line, drug) condition, the replicate plates are split into two
-groups, each group's per-gene log2 fold change is averaged, and the two averaged profiles are
-correlated across genes (Pearson and Spearman-Brown corrected, `2r/(1+r)`). Statistics are read against stratified mismatched-condition nulls.
+**The quantity.** For each (cell line, drug, dose) condition, the replicate plates are split into
+two groups, each group's per-gene log2 fold change is averaged, and the two averaged profiles are
+correlated across genes (Pearson and Spearman-Brown corrected, `2r/(1+r)`). Statistics are read
+against stratified mismatched-condition nulls.
+
+**The unit, and its weighting.** The scoreable unit is the (line, drug, dose) triple, and the
+statistic the summary row reports is the mean over every scored triple, each weighing one. The
+screen did not replicate its doses evenly — 71% of the replicated triples are at 5.0 uM — so that
+mean is mostly a statement about the top dose, and which aggregate later rungs divide by is a
+declared choice rather than an arithmetic fact. The run therefore commits the per-triple table as
+the primary artifact, and beside it a dose-strata table carrying every candidate: each dose level
+on its own, all triples with equal weight, and each (line, drug) pair weighted once with its
+triples averaged first. The candidate declared as the ceiling is recorded in `decisions.md` with
+the dose figure as its evidence, and a later rung's restriction is to a subset of the promoted
+triples under the same weighting.
 
 **Two gene sets** That correlation is computed twice from the same split:
 
@@ -52,12 +64,20 @@ of one plate's treated-versus-control contrast: cell-sampling error at that row'
 and `n_cells_ctrl`. It cannot see plate-to-plate variation — culture day, handling, position. For each (line, drug, dose, gene) with at least two plates, the variance of
 `log2FoldChange` across plates has expectation `sigma^2_plate + mean(lfcSE^2)`, so
 
-    sigma^2_plate = var_across_plates(log2FoldChange) - mean(lfcSE^2), floored at zero
+    sigma^2_plate = mean over genes of var_across_plates(log2FoldChange)
+                    - mean over genes of lfcSE^2,  floored at zero ONCE, after averaging
 
-estimates the plate component alone. Dose is held fixed here, so a dose effect cannot masquerade
-as plate noise. Reported as the fraction of delta variance that is between-plate, aggregated over
-genes within a condition and over conditions, stratified by expression (`baseMean`) and by
-response size.
+estimates the plate component alone. The order of operations is the estimator. With two plates the
+variance across them has one degree of freedom, so each gene's difference lands either side of
+zero even with no plate effect; flooring each gene before averaging turns that spread into a
+positive bias of 0.48 of the within-plate variance at two plates, with a third of genes reporting
+a component that is not there. Averaging first is unbiased whatever the plate count, because
+expectation is linear, and the floor then constrains one well-estimated number. The per-gene
+differences are kept signed for the figures. Dose is held fixed here, so a dose effect cannot
+masquerade as plate noise. Reported as the fraction of delta variance that is between-plate,
+pooled over every gene-condition and, separately, as the mean over conditions of each condition's
+own pooled fraction; for all genes, for each condition's responders, and for its non-responders;
+and stratified by expression (`baseMean`) and by response size, each stratum pooled the same way.
 
 
 **Inclusion rules — defined from the table, not inherited.**
@@ -67,10 +87,9 @@ response size.
   genes qualify.
 - *Responder Genes* in addition to having a finite value in each group, the first group also called it differentially expressed (padj < .05). A condition is scored when at least 50
   genes qualify. 
-- *Drugs.* Every drug for which a condition has a plate in **each** hash group, which is what
-  makes a split exist. Two distinct plates are necessary but not sufficient — both can hash to
-  the same group — so the rule is stated as the engine applies it, not as the count it is often
-  mistaken for.
+- *Drugs.* Every drug with a (line, drug, dose) triple on two or more distinct plates. Under the
+  split rule below, two plates is exactly what makes a split exist — the two land one on each
+  side — so the reliabilities and the noise decomposition share this one inclusion rule.
 - *Cell lines.* Every key in the table, including the one whose DepMap identifier is missing
   and appears as the literal string `NA` — it is a real line's data and carries a consistent key
   throughout. Fifty keys, counted exactly (`count(DISTINCT ...)`, job 31996456). An earlier
@@ -85,12 +104,16 @@ response size.
   plates, against 18,350 splittable conditions when dose was pooled — and buys the quantity the
   rung is named for. It also gives the reliabilities and the noise decomposition one inclusion
   rule instead of two.
-- *Replicate unit and split.* The plate, within one dose. Plates are assigned to groups by
-  `hash(plate) % 2`, one fixed split per dose-condition. Most replicated dose-conditions have
-  exactly two plates (7,441 of 7,641), so their groups are one plate against one — equal, which
-  is the case Spearman-Brown's correction is exactly right for. Under the earlier dose-pooled
-  rule the halves were unequal for 70% of conditions; that assumption now holds for nearly all
-  of them.
+- *Replicate unit and split.* The plate, within one dose. Within each (line, drug, dose) triple
+  the distinct plate ids are sorted and assigned alternately — first to group 0, second to group
+  1, third to group 0 — one fixed, seedless split per triple, written out as a committed table
+  (`rung0_split_assignment.csv`) rather than evaluated as a hash inside the aggregations. Every
+  replicated triple therefore has a plate on each side, and "equal halves" is exactly "an even
+  plate count", which is the case Spearman-Brown's correction is exactly right for. Most
+  replicated dose-conditions have exactly two plates (7,441 of 7,641), so nearly all split one
+  plate against one. The earlier rule, `hash(plate) % 2`, put a two-plate triple on one side of
+  the split whenever its two ids hashed to the same parity, and how many it lost was never
+  counted; see `decisions.md`, 2026-09-09.
 
 
 ## Figures, controls and power (project rule 4)
@@ -150,16 +173,18 @@ the machinery reads it correctly. Figures are produced by the run, not drawn by 
     marked alongside, so the equal-halves assumption is read off the figure.
 - **decompose** — what kind of noise the ceiling is made of.
   - *positive*: a pool with plate offsets of known variance planted on top of sampling noise of
-    known `lfcSE` recovers `sigma^2_plate` within tolerance, and recovers the planted
-    between-plate fraction.
-  - *negative*: a pool whose plates differ only by the planted sampling noise returns a plate
-    component at its floor of zero, and does not go negative.
-  - *figures*: histogram of the between-plate fraction of delta variance. Scatter of
-    `sigma^2_plate` against `mean(lfcSE^2)` per gene with the identity line drawn, which is where
-    a reader sees directly whether plate effects or cell sampling dominates. The same fraction
-    stratified by expression (`baseMean`) and by response size. Each with its control pool beside
-    it, since a decomposition that cannot recover a planted split is not evidence about the real
-    one.
+    known `lfcSE` recovers `sigma^2_plate` within tolerance and the planted between-plate
+    fraction, at two plates — the regime the screen is in — as well as at many.
+  - *negative*: a pool whose plates differ only by the planted sampling noise, at two plates,
+    returns a pooled plate component at zero; and the test shows what flooring each gene first
+    would have reported on the same pool, so the reason for the order of operations is pinned.
+  - *figures*: histogram of the per-gene signed between-plate share with the pooled share marked,
+    and the same for a control pool planting a share of 0.5 at two plates, on shared axes, so a
+    reader sees both the one-degree-of-freedom spread and that the estimator recovers a known
+    answer from it. Scatter of the variance across plates against `mean(lfcSE^2)` per gene with
+    the identity line drawn: mass above the line is disagreement that sampling error alone does
+    not explain. The pooled share stratified by expression (`baseMean`) and by response size,
+    read from the committed strata table.
 - **null** — what the reliabilities are read against.
   - *positive*: planting separate drug-shared and line-specific components recovers the ordering
     matched > same-drug null > different-drug null.
@@ -168,6 +193,16 @@ the machinery reads it correctly. Figures are produced by the run, not drawn by 
     panel per gene set, with each stratum's mean marked — the whole significance claim in one
     picture. The permutation check's null distribution drawn on the same axes as the bootstrap's,
     which is the design effect made visible rather than asserted.
+- **dose** — where the replicated triples sit, and how they reproduce, before an aggregate is
+  chosen.
+  - *positive*: the dose-strata table recomputes from the per-triple table, every candidate
+    aggregate, both gene sets.
+  - *negative*: none of its own; the figure is descriptive and the candidates it shows are all
+    read against the same nulls as the summary row.
+  - *figures*: one dot per scored triple placed at its cell line, lines ordered by their median,
+    coloured by dose level with a fixed hue per level, the line's median marked; beside it the
+    distribution of the correlations at each dose level with its mean and count, and the
+    all-triples mean drawn across. Both gene sets, one row each.
 - **document** — the reviewer's path, and the last step before anything is committed as evidence.
   - *positive*: the verification battery recomputes every claim from the run's artifacts alone and
     reports pass.
@@ -190,10 +225,17 @@ Three checks span the steps rather than belonging to one:
   mean; each example profile reproduces its own correlation from its exported points, over both
   its full gene set and its marked responders; the build cache returns the frame that was built
   and never a frame built from different inputs.
-- **Empirical in-run control** — conditions stratified into thirds by response size; the
-  split-half mean must rise across the thirds. An assay that cannot find more reproducibility
-  where there is more signal is broken. Its figure is the tercile means with their confidence
-  intervals, which shows whether the rise is real or within noise.
+- **Empirical in-run control** — conditions stratified into thirds by the response size ONE half
+  measured, and the correlation of the pair averaged within each third; then the halves swap
+  roles. Both rankings must rise. An assay that cannot find more reproducibility where there is
+  more signal is broken. Ranking by one half alone is what makes the control a control: under no
+  signal the other half is independent of the ranking, so every tercile's expected correlation
+  is zero, whereas ranking by the magnitude of the two halves' sum selects conditions whose halves
+  happened to agree and pure noise rises through the thirds (the mechanism the select step's
+  leakage check demonstrates, applied to the same quantity). A signal-free pool must therefore
+  come out flat under the shipped ranking, and that is its negative control. Recomputable from
+  the per-triple table, which carries each half's magnitude. Its figure is both rankings' tercile
+  means with their confidence intervals.
 - **Power** — every promoted comparison reports its minimum detectable effect (MDE) at α =
   0.05, power = 0.80, from the same null bootstrap as its p-value, and each of the two
   reliabilities reports its own at its own condition count. Its figure is MDE against condition
@@ -211,8 +253,11 @@ corrected to full length, applied to both correlations). Each has known-answer t
 
 Three mismatched-condition nulls, each a set of correlations between one condition's first group
 and a different condition's second group: *any pair*; *different drug and line* (the generic-
-structure floor); *same drug, different line* (the line-specificity floor — the stricter one,
-since two lines given one drug share that drug's generic response). The reported p-values read
+structure floor); *same drug at the same dose, different line* (the line-specificity floor — the
+stricter one, since two lines given one drug at one dose share that drug's generic response;
+dose is held fixed in the stratum for the same reason it is held fixed in the condition, since a
+same-drug pair at different doses is partly a dose contrast and would sit below the specificity
+it is meant to measure). The reported p-values read
 each reliability against the second and third. A mismatched draw for the responder reliability
 uses the genes the *first* condition's first group selected, intersected with the genes finite in
 the second condition's second group: the same selection rule as the matched pair. Because mismatched draws reuse the same half-profiles,
@@ -221,17 +266,26 @@ stratum — measures the dependence the bootstrap ignores and reports it as a de
 
 ## Run and promotion
 
-One cluster job (`scripts/alpine/delta_reproducibility.sbatch`) with the build cache enabled and
-no gene or drug file: `scripts/delta_reproducibility.py` over the tranche on scratch, then
-`scripts/permutation_null.py` for the permutation check. Outputs land in the task folder. Three
+A chain of three cluster jobs, no gene or drug file (`scripts/alpine/submit_rung0_chain.sh`):
+`rung0_assign.sbatch` scans the key columns once and writes the split assignment;
+`rung0_slice.sbatch`, a sixteen-task job array, has each task scan the table once for its slice
+of the genes and aggregate that slice by (line, drug, dose, gene) in one pass that serves both
+the reliabilities and the noise decomposition, caching its slice on scratch; `rung0_combine.sbatch`
+reads every slice and does everything that needs the whole frame at once. The scan is the whole
+cost, so sixteen slices on sixteen nodes make the wall clock one scan rather than sixteen, and
+each task holds a sixteenth of the group table. Slicing by gene is exact because gene is in every
+group key. Then `scripts/permutation_null.py` reads the same cache for the permutation check.
+Outputs land in the task folder. Three
 results are promoted with `scripts/promote_result.py` — the all-gene reliability and the
 responder reliability, each raw and Spearman-Brown corrected, with its own condition count, null
 p-values and MDE, and the even-plate-count corrected value beside it; and the noise
 decomposition, whose between-plate fraction is a finding about the assay in its own right and is
 cited as one. Each provenance record's inputs are the tranche content hash and nothing else —
 none of the three has a panel to pin — and its arguments record the inclusion choices (all genes;
-all splittable drugs; doses pooled) and, for the responder row, the selection rule and its `padj`
-threshold.
+every drug with a replicated triple; dose held fixed; the split rule; the declared weighting) and,
+for the responder row, the selection rule and its `padj` threshold. The record's code commit is
+the commit the RUN was made at, read from the run's own parameter sidecar, not the commit
+promotion happens at; the two are recorded separately.
 
 The reviewer's path through all of it is `summary.ipynb` (PROCESS §1, Summarise): the hypotheses
 above, then each step's figures beside the table they were drawn from, then the conclusions. The
@@ -263,5 +317,5 @@ that exercise it.
 
 ## Out of scope
 
-A dose-resolved reliability; sensitivity of either
-reliability (all or responders) to the choice of split; an external deposit of the half-profile matrix. 
+Sensitivity of either reliability (all or responders) to the choice of split; an external deposit
+of the half-profile matrix. 

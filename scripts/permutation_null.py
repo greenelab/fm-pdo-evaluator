@@ -438,12 +438,21 @@ def main() -> None:
         "--panel-file", default=None, help="one gene per line; same panel the ceiling was scored on"
     )
     ap.add_argument(
-        "--frame-cache",
+        "--cache-dir",
         default=None,
-        help="directory holding the built split-half frame, keyed by a hash of its inputs -- the "
-        "same cache scripts/delta_reproducibility.py writes. Without it this job repeats that "
-        "job's full scan of every shard, once per gene set.",
+        help="directory holding the split assignment and the cached slices -- the same cache "
+        "scripts/delta_reproducibility.py writes. With every slice present this job reads the "
+        "frame back in minutes; without it, it repeats that job's full scan of every shard.",
     )
+    ap.add_argument(
+        "--slices",
+        type=int,
+        default=1,
+        help="how many gene slices the cached frame was built in; must match the run that "
+        "wrote the cache, or the slices will not be found.",
+    )
+    ap.add_argument("--duckdb-memory", default="36GB", help="DuckDB's memory_limit for a rebuild")
+    ap.add_argument("--duckdb-threads", type=int, default=None, help="DuckDB thread count")
     ap.add_argument("--replicate-col", default=None, help="plate/replicate column (auto-detected)")
     ap.add_argument("--min-genes", type=int, default=50, help="min shared genes to score a pair")
     ap.add_argument("--n-perm", type=int, default=500, help="permutation null draws")
@@ -472,11 +481,12 @@ def main() -> None:
 
     out_dir = Path(args.out_dir) if Path(args.out_dir).is_absolute() else repo / args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
+    args.out_dir = str(out_dir)
 
     de, repl = dr._build_or_load_frame(paths, names, args, local)
     de = de.dropna(subset=["lfc0", "lfc1"])
     if de.empty:
-        raise SystemExit("no (line, drug, gene) had both plate halves -- too few plates per pair?")
+        raise SystemExit("no (line, drug, dose, gene) had both plate halves -- too few plates?")
 
     if args.panel_file:
         panel_all = {
@@ -498,7 +508,7 @@ def main() -> None:
             f"responder gene set: {int(select.sum(axis=1).mean())} genes per condition on average"
         )
     if not np.any(np.isfinite(r)):
-        raise SystemExit("no (line, drug) pair had enough shared panel genes to score")
+        raise SystemExit("no (line, drug, dose) condition had enough shared genes to score")
 
     # Computed once and shared with both nulls below: `permutation_null` and
     # `stratified_permutation_null` each independently call `stratified_null_draws` on the same
