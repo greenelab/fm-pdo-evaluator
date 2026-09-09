@@ -228,3 +228,7 @@ containers/*.sif      # built Apptainer images
 # Local agent configuration and worktrees. Never publishable: settings.json holds
 # machine-specific permission rules, and worktrees/ contains entire other branches.
 .claude/
+
+# Untracked run outputs ralpine update moved aside on Alpine so a fast-forward could land
+# a commit that adds the same paths. Never committed; the committed copies are the record.
+_moved_aside/

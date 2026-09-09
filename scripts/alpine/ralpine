@@ -173,11 +173,24 @@ case "$sub" in
     #
     # --ff-only is the safety property, not a style choice: it refuses rather than merging,
     # rebasing, or discarding anything. Alpine's working tree carries large untracked data
-    # (generated_*/, *.gctx, logs/), and a fast-forward never touches untracked files. If this
-    # refuses, the Alpine checkout has diverged and a human should look before anything else.
-    remote_fixed "git -C $(printf '%q' "$REMOTE_ROOT") fetch --quiet origin && \
-                  git -C $(printf '%q' "$REMOTE_ROOT") merge --ff-only @{u} && \
-                  git -C $(printf '%q' "$REMOTE_ROOT") rev-parse --short HEAD"
+    # (generated_*/, *.gctx, logs/), and a fast-forward never touches untracked files EXCEPT
+    # one case, which the workflow produces by design: a run writes its outputs into the task
+    # folder on Alpine, those outputs are pulled to the local tree and committed at promotion
+    # (PROCESS section 1), and the next fast-forward then finds untracked files on Alpine at
+    # paths the incoming commits add, and refuses ("would be overwritten by merge"). Those files
+    # are the run's own copies of what is being committed. They are moved aside -- never
+    # deleted -- into _moved_aside/<UTC time>/ under the checkout with their paths preserved,
+    # each one listed, and only files that are BOTH untracked AND added by the incoming commits
+    # are touched (2026-09-09, first hit after the dose-pooled run's evidence commit). If the
+    # merge still refuses, the checkout has diverged and a human should look before anything.
+    remote_fixed "cd $(printf '%q' "$REMOTE_ROOT") && git fetch --quiet origin && \
+                  aside=_moved_aside/\$(date -u +%Y%m%dT%H%M%SZ) && \
+                  git diff --name-only --diff-filter=A HEAD..@{u} | while IFS= read -r f; do \
+                    if [ -e \"\$f\" ] && ! git ls-files --error-unmatch -- \"\$f\" >/dev/null 2>&1; then \
+                      mkdir -p \"\$aside/\$(dirname -- \"\$f\")\" && mv -- \"\$f\" \"\$aside/\$f\" && \
+                      echo \"moved aside (untracked, incoming commit adds it): \$f -> \$aside/\$f\"; \
+                    fi; done && \
+                  git merge --ff-only @{u} && git rev-parse --short HEAD"
     ;;
   rev)
     # Which commit produced the results we are about to pull, and is the tree dirty?
